@@ -14,7 +14,7 @@ type RecvError = RmcpIpmiReceiveError;
 
 pub const MAX_DATAGRAM: usize = 4096;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
-const MAX_UNRELATED: usize = 32;
+pub(crate) const MAX_UNRELATED: usize = 32;
 
 /// Shared, sticky cancellation signal. Create a new token for a new operation.
 #[derive(Debug, Clone, Default)]
@@ -133,7 +133,16 @@ impl RmcpIpmiSocket {
     }
 
     pub fn recv_until(&mut self, deadline: Instant) -> Result<&mut [u8], RmcpIpmiReceiveError> {
-        for _ in 0..MAX_UNRELATED {
+        let mut unrelated = 0;
+        self.recv_until_with_budget(deadline, &mut unrelated)
+    }
+
+    pub fn recv_until_with_budget(
+        &mut self,
+        deadline: Instant,
+        unrelated: &mut usize,
+    ) -> Result<&mut [u8], RmcpIpmiReceiveError> {
+        loop {
             let received = recv_datagram(&self.socket, &mut self.buffer, deadline, &self.policy)?;
 
             let is_ipmi = {
@@ -144,8 +153,11 @@ impl RmcpIpmiSocket {
             if is_ipmi {
                 return Ok(&mut self.buffer[4..received]);
             }
+            *unrelated += 1;
+            if *unrelated >= MAX_UNRELATED {
+                return Err(RecvError::TooManyUnrelatedPackets);
+            }
         }
-        Err(RecvError::TooManyUnrelatedPackets)
     }
 
     pub fn send<F, E>(&mut self, deadline: Instant, data: F) -> Result<(), E>

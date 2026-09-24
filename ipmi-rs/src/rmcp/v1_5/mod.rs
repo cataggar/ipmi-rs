@@ -22,6 +22,8 @@ mod md2;
 #[cfg(feature = "md5")]
 mod md5;
 mod message;
+#[cfg(test)]
+mod tests;
 
 #[derive(Debug)]
 pub enum ActivationError {
@@ -249,25 +251,60 @@ impl IpmiConnection for State {
             .ok_or(RmcpIpmiReceiveError::NoPendingRequest)?
             .deadline;
         let result = (|| {
-            let data = self.socket.recv_until(deadline)?;
-            let message = Message::from_data(self.password.as_ref(), data)
-                .map_err(|e| RmcpIpmiReceiveError::Session(super::UnwrapSessionError::V1_5(e)))?;
-            if let Some(session_id) = self.session_id {
-                if message.session_id != session_id.get() || message.auth_type != self.auth_type {
-                    return Err(RmcpIpmiReceiveError::SessionIdMismatch);
-                }
-                if self.activated {
-                    if message.session_sequence_number == 0
-                        || self
-                            .last_inbound_sequence
-                            .is_some_and(|last| message.session_sequence_number <= last)
-                    {
-                        return Err(RmcpIpmiReceiveError::InvalidSessionSequence);
+            let mut unrelated = 0;
+            let mut first_mismatch = None;
+            loop {
+                let data = match self.socket.recv_until_with_budget(deadline, &mut unrelated) {
+                    Ok(data) => data,
+                    Err(RmcpIpmiReceiveError::Timeout) => {
+                        return Err(first_mismatch.unwrap_or(RmcpIpmiReceiveError::Timeout));
                     }
-                    self.last_inbound_sequence = Some(message.session_sequence_number);
+                    Err(error) => return Err(error),
+                };
+                let message = Message::from_data(self.password.as_ref(), data).map_err(|e| {
+                    RmcpIpmiReceiveError::Session(super::UnwrapSessionError::V1_5(e))
+                })?;
+                if let Some(session_id) = self.session_id {
+                    if message.session_id != session_id.get() || message.auth_type != self.auth_type
+                    {
+                        super::internal::record_unrelated(
+                            RmcpIpmiReceiveError::SessionIdMismatch,
+                            &mut first_mismatch,
+                            &mut unrelated,
+                        )?;
+                        continue;
+                    }
+                    if self.activated
+                        && (message.session_sequence_number == 0
+                            || self
+                                .last_inbound_sequence
+                                .is_some_and(|last| message.session_sequence_number <= last))
+                    {
+                        super::internal::record_unrelated(
+                            RmcpIpmiReceiveError::InvalidSessionSequence,
+                            &mut first_mismatch,
+                            &mut unrelated,
+                        )?;
+                        continue;
+                    }
+                }
+                match self.ipmb_state.receive(&message.payload) {
+                    Err(RmcpIpmiReceiveError::IpmbResponseMismatch) => {
+                        super::internal::record_unrelated(
+                            RmcpIpmiReceiveError::IpmbResponseMismatch,
+                            &mut first_mismatch,
+                            &mut unrelated,
+                        )?;
+                    }
+                    Ok(response) => {
+                        if self.activated {
+                            self.last_inbound_sequence = Some(message.session_sequence_number);
+                        }
+                        return Ok(response);
+                    }
+                    Err(error) => return Err(error),
                 }
             }
-            self.ipmb_state.receive(&message.payload)
         })();
         self.ipmb_state.retire_pending();
         result

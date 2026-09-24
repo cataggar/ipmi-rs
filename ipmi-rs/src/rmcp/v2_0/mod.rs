@@ -602,26 +602,52 @@ impl State {
             .ok_or(RmcpIpmiReceiveError::NoPendingRequest)?
             .deadline;
         let result = (|| {
-            let data = self.socket.recv_until(deadline)?;
-            let message = self
-                .state
-                .read_payload(data)
-                .map_err(|e| RmcpIpmiReceiveError::Session(UnwrapSessionError::V2_0(e)))?;
-            if message.ty != PayloadType::IpmiMessage {
-                return Err(RmcpIpmiReceiveError::UnexpectedPayloadType);
+            let mut unrelated = 0;
+            let mut first_mismatch = None;
+            loop {
+                let data = match self.socket.recv_until_with_budget(deadline, &mut unrelated) {
+                    Ok(data) => data,
+                    Err(RmcpIpmiReceiveError::Timeout) => {
+                        return Err(first_mismatch.unwrap_or(RmcpIpmiReceiveError::Timeout));
+                    }
+                    Err(error) => return Err(error),
+                };
+                let message = self
+                    .state
+                    .read_payload(data)
+                    .map_err(|e| RmcpIpmiReceiveError::Session(UnwrapSessionError::V2_0(e)))?;
+                let mismatch = if message.ty != PayloadType::IpmiMessage {
+                    Some(RmcpIpmiReceiveError::UnexpectedPayloadType)
+                } else if message.session_id != self.console_session_id.get() {
+                    Some(RmcpIpmiReceiveError::SessionIdMismatch)
+                } else if message.session_sequence_number == 0
+                    || self
+                        .last_inbound_sequence
+                        .is_some_and(|last| message.session_sequence_number <= last)
+                {
+                    Some(RmcpIpmiReceiveError::InvalidSessionSequence)
+                } else {
+                    None
+                };
+                if let Some(error) = mismatch {
+                    super::internal::record_unrelated(error, &mut first_mismatch, &mut unrelated)?;
+                    continue;
+                }
+                match self.ipmb_state.receive(&message.payload) {
+                    Err(RmcpIpmiReceiveError::IpmbResponseMismatch) => {
+                        super::internal::record_unrelated(
+                            RmcpIpmiReceiveError::IpmbResponseMismatch,
+                            &mut first_mismatch,
+                            &mut unrelated,
+                        )?;
+                    }
+                    Ok(response) => {
+                        self.last_inbound_sequence = Some(message.session_sequence_number);
+                        return Ok(response);
+                    }
+                    Err(error) => return Err(error),
+                }
             }
-            if message.session_id != self.console_session_id.get() {
-                return Err(RmcpIpmiReceiveError::SessionIdMismatch);
-            }
-            if message.session_sequence_number == 0
-                || self
-                    .last_inbound_sequence
-                    .is_some_and(|last| message.session_sequence_number <= last)
-            {
-                return Err(RmcpIpmiReceiveError::InvalidSessionSequence);
-            }
-            self.last_inbound_sequence = Some(message.session_sequence_number);
-            self.ipmb_state.receive(&message.payload)
         })();
         self.ipmb_state.retire_pending();
         result

@@ -213,6 +213,12 @@ both valid checksums. Bridged IPMB targets are not supported (explicit local BMC
 addresses on the primary/current channel are accepted). Datagram payloads
 over 4,096 bytes are rejected rather than silently truncated.
 
+Late or unrelated, well-formed replies are drained while awaiting the current
+request, with a shared cap of 32 unrelated datagrams per receive and the original
+absolute deadline. If no correlated reply arrives, the first mismatch is
+reported rather than silently accepted or replayed. Malformed packets still
+fail explicitly.
+
 There are no implicit retransmissions. In particular, `send_recv` can return
 `RmcpIpmiError::OutcomeUnknown` after a request was sent but its response was
 lost, invalid, cancelled or timed out. Do **not** automatically retry a power,

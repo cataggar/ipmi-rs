@@ -14,7 +14,7 @@ use crate::{
 
 use super::{
     checksum::Checksum,
-    socket::{recv_datagram, TransportPolicy},
+    socket::{recv_datagram, TransportPolicy, MAX_UNRELATED},
     v1_5::State as V1_5State,
     v2_0::State as V2_0State,
     ASFMessage, ASFMessageType, ActivationError, RmcpHeader, RmcpIpmiError, RmcpIpmiReceiveError,
@@ -317,6 +317,22 @@ pub fn validate_ipmb_checksums(data: &[u8]) -> bool {
     second_checksum == data[data.len() - 1]
 }
 
+pub(super) fn record_unrelated(
+    error: RmcpIpmiReceiveError,
+    first_mismatch: &mut Option<RmcpIpmiReceiveError>,
+    unrelated: &mut usize,
+) -> Result<(), RmcpIpmiReceiveError> {
+    if first_mismatch.is_none() {
+        *first_mismatch = Some(error);
+    }
+    *unrelated += 1;
+    if *unrelated >= MAX_UNRELATED {
+        Err(RmcpIpmiReceiveError::TooManyUnrelatedPackets)
+    } else {
+        Ok(())
+    }
+}
+
 // TODO: `ExactSizeIterator` to avoid/postpone allocation?
 pub fn next_ipmb_message(
     request: &Request,
@@ -407,9 +423,7 @@ impl IpmbState {
     pub fn receive(&mut self, data: &[u8]) -> Result<Response, RmcpIpmiReceiveError> {
         let pending = self.pending.ok_or(RmcpIpmiReceiveError::NoPendingRequest)?;
         let result = self.correlate(data, pending);
-        if result.is_err() {
-            self.retire_pending();
-        } else {
+        if result.is_ok() {
             self.pending = None;
         }
         result
@@ -510,6 +524,7 @@ mod tests {
                 ),
                 "index {index}"
             );
+            state.retire_pending();
         }
         for index in [2, 7] {
             state.begin(&req, deadline).unwrap();
@@ -519,6 +534,7 @@ mod tests {
                 state.receive(&bad),
                 Err(RmcpIpmiReceiveError::IpmbChecksumFailed)
             ));
+            state.retire_pending();
         }
         state.begin(&req, deadline).unwrap();
         let short = &reply((state.ipmb_sequence.wrapping_sub(1)) & 0x3f)[..7];
@@ -526,6 +542,7 @@ mod tests {
             state.receive(short),
             Err(RmcpIpmiReceiveError::NotEnoughData)
         ));
+        state.retire_pending();
         let failed_sequence = (state.ipmb_sequence - 1) & 0x3f;
         state.ipmb_sequence = failed_sequence;
         assert!(matches!(

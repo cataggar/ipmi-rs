@@ -256,6 +256,98 @@ fn cancellation_retires_request_and_late_reply_cannot_satisfy_next() {
 }
 
 #[test]
+fn late_reply_is_drained_before_valid_reply_without_poisoning_next_request() {
+    let (mut state, peer, mut crypto) = pair(Duration::from_millis(70));
+    let mut req = request();
+    let mut wire = [0; 4096];
+    state.send(&mut req).unwrap();
+    peer.recv(&mut wire).unwrap();
+    assert!(matches!(state.recv(), Err(RmcpIpmiReceiveError::Timeout)));
+
+    state.send(&mut req).unwrap();
+    peer.recv(&mut wire).unwrap();
+    for (session_sequence_number, ipmb_sequence) in [(10, 0), (9, 1)] {
+        send_answer(
+            &peer,
+            &mut crypto,
+            Message {
+                ty: PayloadType::IpmiMessage,
+                session_id: state.console_session_id.get(),
+                session_sequence_number,
+                payload: response(ipmb_sequence),
+            },
+        );
+    }
+    assert_eq!(state.recv().unwrap().seq(), 1);
+
+    state.send(&mut req).unwrap();
+    peer.recv(&mut wire).unwrap();
+    for (session_sequence_number, ipmb_sequence) in [(10, 0), (9, 1), (11, 2)] {
+        send_answer(
+            &peer,
+            &mut crypto,
+            Message {
+                ty: PayloadType::IpmiMessage,
+                session_id: state.console_session_id.get(),
+                session_sequence_number,
+                payload: response(ipmb_sequence),
+            },
+        );
+    }
+    assert_eq!(state.recv().unwrap().seq(), 2);
+}
+
+#[test]
+fn mismatched_reply_flood_is_bounded_and_pending_is_retired() {
+    let (mut state, peer, mut crypto) = pair(Duration::from_millis(350));
+    let mut req = request();
+    let mut wire = [0; 4096];
+    state.send(&mut req).unwrap();
+    peer.recv(&mut wire).unwrap();
+    for session_sequence_number in 1..=super::super::socket::MAX_UNRELATED as u32 {
+        send_answer(
+            &peer,
+            &mut crypto,
+            Message {
+                ty: PayloadType::IpmiMessage,
+                session_id: state.console_session_id.get(),
+                session_sequence_number,
+                payload: response(63),
+            },
+        );
+    }
+    send_answer(
+        &peer,
+        &mut crypto,
+        Message {
+            ty: PayloadType::IpmiMessage,
+            session_id: state.console_session_id.get(),
+            session_sequence_number: 33,
+            payload: response(0),
+        },
+    );
+    assert!(matches!(
+        state.recv(),
+        Err(RmcpIpmiReceiveError::TooManyUnrelatedPackets)
+    ));
+    assert!(state.ipmb_state.pending.is_none());
+
+    state.send(&mut req).unwrap();
+    peer.recv(&mut wire).unwrap();
+    send_answer(
+        &peer,
+        &mut crypto,
+        Message {
+            ty: PayloadType::IpmiMessage,
+            session_id: state.console_session_id.get(),
+            session_sequence_number: 34,
+            payload: response(1),
+        },
+    );
+    assert_eq!(state.recv().unwrap().seq(), 1);
+}
+
+#[test]
 fn negotiation_rejects_substituted_algorithms_and_handshake_headers() {
     let req = OpenSessionRequest {
         message_tag: 7,
