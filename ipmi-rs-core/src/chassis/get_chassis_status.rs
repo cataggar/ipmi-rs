@@ -70,25 +70,28 @@ pub struct LastPowerEvent {
     pub power_command: bool,
 }
 
-/// Optional front-panel button capabilities and status (fourth response byte).
+/// Optional front-panel button capabilities and status (fourth status byte).
+///
+/// IPMI 2.0 Rev 1.1, §28.2: bits 7–4 indicate whether disabling each button
+/// is allowed; bits 3–0 independently indicate whether each button is disabled.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrontPanelButtons {
-    /// Whether disabling the sleep button is allowed.
+    /// Whether disabling the standby (sleep) button is allowed.
     pub sleep_button_disable_allowed: bool,
     /// Whether disabling the diagnostic interrupt button is allowed.
     pub diagnostic_button_disable_allowed: bool,
     /// Whether disabling the reset button is allowed.
     pub reset_button_disable_allowed: bool,
-    /// Whether disabling the power button is allowed.
-    pub power_button_disable_allowed: bool,
-    /// Whether the sleep button is currently disabled.
+    /// Whether disabling the power off button is allowed.
+    pub power_off_button_disable_allowed: bool,
+    /// Whether the standby (sleep) button is currently disabled.
     pub sleep_button_disabled: bool,
     /// Whether the diagnostic interrupt button is currently disabled.
     pub diagnostic_button_disabled: bool,
     /// Whether the reset button is currently disabled.
     pub reset_button_disabled: bool,
-    /// Whether the power button is currently disabled.
-    pub power_button_disabled: bool,
+    /// Whether the power off button is currently disabled.
+    pub power_off_button_disabled: bool,
 }
 
 impl FrontPanelButtons {
@@ -97,11 +100,11 @@ impl FrontPanelButtons {
             sleep_button_disable_allowed: value & 0x80 != 0,
             diagnostic_button_disable_allowed: value & 0x40 != 0,
             reset_button_disable_allowed: value & 0x20 != 0,
-            power_button_disable_allowed: value & 0x10 != 0,
+            power_off_button_disable_allowed: value & 0x10 != 0,
             sleep_button_disabled: value & 0x08 != 0,
             diagnostic_button_disabled: value & 0x04 != 0,
             reset_button_disabled: value & 0x02 != 0,
-            power_button_disabled: value & 0x01 != 0,
+            power_off_button_disabled: value & 0x01 != 0,
         }
     }
 }
@@ -270,18 +273,18 @@ mod tests {
         assert!(buttons.sleep_button_disable_allowed);
         assert!(!buttons.diagnostic_button_disable_allowed);
         assert!(buttons.reset_button_disable_allowed);
-        assert!(!buttons.power_button_disable_allowed);
+        assert!(!buttons.power_off_button_disable_allowed);
         assert!(!buttons.sleep_button_disabled);
         assert!(buttons.diagnostic_button_disabled);
         assert!(!buttons.reset_button_disabled);
-        assert!(buttons.power_button_disabled);
+        assert!(buttons.power_off_button_disabled);
 
         let buttons = ChassisStatus::from_data(&[0, 0, 0, 0])
             .unwrap()
             .front_panel_buttons
             .unwrap();
-        assert!(!buttons.power_button_disable_allowed);
-        assert!(!buttons.power_button_disabled);
+        assert!(!buttons.power_off_button_disable_allowed);
+        assert!(!buttons.power_off_button_disabled);
     }
 
     #[test]
@@ -292,11 +295,11 @@ mod tests {
                 .front_panel_buttons
                 .unwrap();
             let flags = [
-                buttons.power_button_disabled,
+                buttons.power_off_button_disabled,
                 buttons.reset_button_disabled,
                 buttons.diagnostic_button_disabled,
                 buttons.sleep_button_disabled,
-                buttons.power_button_disable_allowed,
+                buttons.power_off_button_disable_allowed,
                 buttons.reset_button_disable_allowed,
                 buttons.diagnostic_button_disable_allowed,
                 buttons.sleep_button_disable_allowed,
