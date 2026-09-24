@@ -78,12 +78,14 @@ The following IPMI commands are currently supported in `ipmi-rs-core`:
 | Get Chassis Status                      | 28.2                  |
 | Chassis Control (host power)            | 28.3                  |
 | Get Device ID                           | 20.1                  |
+| Cold Reset / Warm Reset (BMC)            | App commands 0x02/0x03 |
 | Get Channel Authentication Capabilities | 22.13                 |
 | Get Channel Cipher Suites               | 22.15                 |
 | Get Session Challenge                   | 22.16                 |
 | Activate Session                        | 22.17                 |
 | Get Channel Access                      | 22.23                 |
 | Get Channel Info                        | 22.24                 |
+| Set / Get System Boot Options            | Chassis commands 0x08/0x09 |
 | Set LAN Configuration Parameters        | 23.1                  |
 | Get LAN Configuration Parameters        | 23.2                  |
 | Get SEL Info                            | 31.2                  |
@@ -97,6 +99,46 @@ The following IPMI commands are currently supported in `ipmi-rs-core`:
 | Get SDR Repository Info                 | 33.9                  |
 | Get SDR Repository Allocation Info      | 33.10                 |
 | Get SDR                                 | 33.12                 |
+
+## BMC reset and boot overrides
+
+`ipmi_rs::app::{WarmReset, ColdReset}` reset the **management controller**, not the host.
+To control host power, use the separate Chassis Control command. A cold reset can
+interrupt its own response. After a timeout or lost connection the outcome is
+**unknown**: neither retry the mutation automatically nor assume that an offline
+BMC proves success or failure.
+
+The core `ipmi_rs::chassis` boot-option commands support only parameters 0
+(set-in-progress), 3 (valid-bit clearing), 4 (boot-info acknowledgement), and 5
+(boot flags). For example, using an existing `Ipmi` connection:
+
+```rust
+use ipmi_rs::chassis::{
+    BootDevice, BootFlags, BootOptionWrite, BootOverride, BootOverrideDuration,
+    GetSystemBootOptions, SetSystemBootOptions,
+};
+
+let flags = ipmi.send_recv(GetSystemBootOptions::<BootFlags>::new())?;
+// BootFlags::Invalid means there is no active override.
+
+let next_pxe = BootOverride::new(BootDevice::Pxe, BootOverrideDuration::OneTime);
+ipmi.send_recv(SetSystemBootOptions::new(BootOptionWrite::BootFlags(next_pxe)))?;
+// Persistent CD-ROM is explicit:
+let cd = BootOverride::new(BootDevice::CdRom, BootOverrideDuration::Persistent);
+// Optional flags must be explicitly opted into, e.g. cd.with_clear_cmos(true).
+```
+
+Setting parameter 5 writes **all five boot-flag bytes**, replacing existing
+flags rather than performing a get/merge/set. EFI and clear-CMOS default to off;
+other boot-flag fields are sent as zero. It does not modify parameters 0, 3,
+or 4 implicitly, and does **not** restart the host. If coordination is needed,
+set those parameters explicitly. Get checks the parameter version, echoed
+selector, valid/unlocked state, lengths, and supported bits; unmodelled
+readbacks and unsupported writes fail instead of silently changing meaning.
+Boot-option support varies by controller and BIOS; completion codes (including
+`0x80` unsupported, `0x81` already in progress, `0x82` read-only) are surfaced,
+not worked around. Remote mutations should wait for the transport hardening
+tracked in issue #6.
 
 # Supported interfaces
 
