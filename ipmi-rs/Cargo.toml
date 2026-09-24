@@ -72,3 +72,6 @@ required-features = ["unix-file"]
 [[example]]
 name = "ipmi-lan-config"
 required-features = ["unix-file"]
+
+[[example]]
+name = "chassis"

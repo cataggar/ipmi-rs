@@ -37,6 +37,30 @@ This example discovers available channels and prints channel information. For LA
 ### `ipmi-lan-config`
 This example reads LAN configuration for all LAN channels and emits JSON. You can apply a JSON configuration with `--set`, print the input schema with `--print-schema`, or emit an IPv6 example payload with `--print-v6-example`.
 
+### `chassis`
+This RMCP+ example reads host chassis status by default. Provide the BMC address and port, and set
+`IPMI_USERNAME` and `IPMI_PASSWORD` in the environment via a secure credential source. Credentials
+are never accepted as command-line arguments or printed by the example.
+
+```sh
+cargo run -p ipmi-rs --example chassis -- --address 192.0.2.10:623
+```
+
+To request a **host** power action, explicitly supply `--action off`, `on`, `cycle`, or `reset`
+(hard host reset, **not** BMC reset). For example, only after verifying the target, access controls,
+and operational readiness:
+
+```sh
+cargo run -p ipmi-rs --example chassis -- --address 192.0.2.10:623 --action cycle
+```
+
+The example refuses to send commands if RMCP+ was requested but activation fell back to IPMI 1.5.
+Do not use remote mutations until the session/request validation and bounded failure handling
+tracked in #6 is available; controllers requiring cipher suite 17 also depend on #2. A lost,
+timed-out, or ambiguous control response means the **outcome is unknown**. Never automatically
+resend a power command, even for a "node busy" response. A later status read is useful for
+observation but cannot prove whether a cycle or reset occurred.
+
 # Project structure
 
 This project contains three crates:
@@ -51,6 +75,8 @@ The following IPMI commands are currently supported in `ipmi-rs-core`:
 
 | Command                                 | Specification section |
 | :-------------------------------------- | :-------------------- |
+| Get Chassis Status                      | 28.2                  |
+| Chassis Control (host power)            | 28.3                  |
 | Get Device ID                           | 20.1                  |
 | Get Channel Authentication Capabilities | 22.13                 |
 | Get Channel Cipher Suites               | 22.15                 |
