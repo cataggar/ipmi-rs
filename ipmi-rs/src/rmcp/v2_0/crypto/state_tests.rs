@@ -94,7 +94,7 @@ fn suite17_rakp_key_and_mac_vectors() {
         .unwrap()
     );
 
-    let m4_wire = hex::decode("0a00000088776655cc7f0f32087eb5777b13f4ee7f7e83d5").unwrap();
+    let m4_wire = hex::decode("0a00000040302010cc7f0f32087eb5777b13f4ee7f7e83d5").unwrap();
     let m4 = RakpMessage4::from_data(&m4_wire).unwrap();
     assert!(state.verify(
         osr.authentication_payload,

@@ -8,7 +8,7 @@ use aes::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, Ke
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use super::{CipherSuite, Rmcp};
+use super::{ActivationError, CipherSuite, Rmcp, V2_0ActivationError, ValidateRakpMessage4Error};
 use crate::connection::{IpmiConnection, LogicalUnit, Message, Request, RequestTargetAddress};
 
 const PASSWORD: &[u8] = b"correct horse battery staple";
@@ -40,7 +40,7 @@ fn send_handshake(socket: &UdpSocket, peer: SocketAddr, ty: u8, payload: &[u8]) 
     socket.send_to(&packet, peer).unwrap();
 }
 
-fn run_bmc(socket: UdpSocket) {
+fn run_bmc(socket: UdpSocket, wrong_rakp4_id: bool) {
     let (ping, peer) = receive(&socket);
     assert_eq!(&ping[..4], &[6, 0, 0xff, 6]);
     assert_eq!(ping[9], 0xc8);
@@ -127,9 +127,24 @@ fn run_bmc(socket: UdpSocket) {
     rakp4_input.extend_from_slice(&BMC_SESSION_ID);
     rakp4_input.extend_from_slice(&BMC_GUID);
     let mut rakp4 = vec![rakp3[0], 0, 0, 0];
-    rakp4.extend_from_slice(&BMC_SESSION_ID);
+    rakp4.extend_from_slice(if wrong_rakp4_id {
+        &BMC_SESSION_ID
+    } else {
+        &console_session_id
+    });
     rakp4.extend_from_slice(&mac(&sik, &rakp4_input)[..16]);
     send_handshake(&socket, peer, 0x15, &rakp4);
+
+    if wrong_rakp4_id {
+        socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        assert!(
+            socket.recv_from(&mut [0u8; 1024]).is_err(),
+            "unexpected fallback after an invalid RAKP4 console ID"
+        );
+        return;
+    }
 
     let (request, peer) = receive(&socket);
     assert_eq!(&request[..6], &[6, 0, 0xff, 7, 6, 0xc0]);
@@ -192,7 +207,7 @@ fn required_suite17_completes_handshake_and_encrypted_exchange() {
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
     let address = socket.local_addr().unwrap();
-    let bmc = thread::spawn(move || run_bmc(socket));
+    let bmc = thread::spawn(move || run_bmc(socket, false));
 
     let mut rmcp = Rmcp::new(address, Duration::from_secs(2)).unwrap();
     rmcp.activate_with_cipher_suite(CipherSuite::Id17, Some("ADMIN"), Some(PASSWORD))
@@ -208,4 +223,27 @@ fn required_suite17_completes_handshake_and_encrypted_exchange() {
     assert_eq!(response.cc(), 0);
     assert_eq!(response.data(), &[0x5a, 0x7b]);
     bmc.join().unwrap();
+}
+
+#[test]
+fn required_suite17_rejects_bmc_id_in_rakp4_console_id_field() {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let address = socket.local_addr().unwrap();
+    let bmc = thread::spawn(move || run_bmc(socket, true));
+
+    let mut rmcp = Rmcp::new(address, Duration::from_secs(2)).unwrap();
+    let result = rmcp.activate_with_cipher_suite(CipherSuite::Id17, Some("ADMIN"), Some(PASSWORD));
+    bmc.join().unwrap();
+    assert!(matches!(
+        result,
+        Err(ActivationError::V2_0(
+            V2_0ActivationError::RakpMessage4Validate(
+                ValidateRakpMessage4Error::RemoteConsoleSessionIdMismatch
+            )
+        ))
+    ));
+    assert!(!rmcp.is_active());
 }

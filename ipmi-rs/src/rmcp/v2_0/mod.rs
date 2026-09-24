@@ -42,6 +42,7 @@ pub enum ValidateRakpMessage2Error {
 #[derive(Debug)]
 pub enum ValidateRakpMessage4Error {
     MessageTagMismatch,
+    RemoteConsoleSessionIdMismatch,
     ManagedSystemSessionIdMismatch,
 }
 
@@ -272,7 +273,7 @@ impl State {
     }
 
     fn validate_rm3_rm4(
-        managed_system_session_id: NonZeroU32,
+        remote_console_session_id: NonZeroU32,
         rm3: &RakpMessage3,
         rm4: &RakpMessage4,
     ) -> Result<(), ValidateRakpMessage4Error> {
@@ -280,8 +281,8 @@ impl State {
             return Err(ValidateRakpMessage4Error::MessageTagMismatch);
         }
 
-        if rm4.managed_system_session_id != managed_system_session_id {
-            return Err(ValidateRakpMessage4Error::ManagedSystemSessionIdMismatch);
+        if rm4.managed_system_session_id != remote_console_session_id {
+            return Err(ValidateRakpMessage4Error::RemoteConsoleSessionIdMismatch);
         }
 
         Ok(())
@@ -450,7 +451,7 @@ impl State {
 
         log::debug!("Received RAKP Message 4: {rm4:X?}");
 
-        Self::validate_rm3_rm4(response.managed_system_session_id, &rm3, &rm4)?;
+        Self::validate_rm3_rm4(response.remote_console_session_id, &rm3, &rm4)?;
 
         Self::validate_rakp4_mac_len(
             response.authentication_payload,
