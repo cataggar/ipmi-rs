@@ -632,6 +632,7 @@ fn complete_rakp_sha1_aes_activation_and_request_over_udp() {
         &username,
         b"local test password",
         CipherSuite::Id3,
+        CryptoProvider::RustCrypto,
     )
     .unwrap();
     let response = state.send_recv(&mut request()).unwrap();
@@ -668,6 +669,7 @@ fn network_activation_rejects_wrong_open_session_payload() {
             &Username::new("root").unwrap(),
             b"password",
             CipherSuite::Id3,
+            CryptoProvider::RustCrypto,
         ),
         Err(ActivationError::UnexpectedPayloadType(
             PayloadType::RakpMessage2

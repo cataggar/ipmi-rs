@@ -16,7 +16,7 @@ use super::{
     checksum::Checksum,
     socket::{recv_datagram, TransportPolicy, MAX_UNRELATED},
     v1_5::State as V1_5State,
-    v2_0::State as V2_0State,
+    v2_0::{CryptoProvider, State as V2_0State},
     ASFMessage, ASFMessageType, ActivationError, RmcpHeader, RmcpIpmiError, RmcpIpmiReceiveError,
     RmcpIpmiSendError, RmcpType,
 };
@@ -147,6 +147,7 @@ impl RmcpWithState<Inactive> {
         self,
         rmcp_plus: bool,
         required_suite: Option<CipherSuite>,
+        provider: CryptoProvider,
         username: Option<&str>,
         password: Option<&[u8]>,
     ) -> Result<RmcpWithState<Active>, ActivationError> {
@@ -244,6 +245,7 @@ impl RmcpWithState<Inactive> {
                 &username,
                 password.unwrap_or(&[]),
                 required_suite.unwrap_or(CipherSuite::Id3),
+                provider,
             )?;
 
             Ok(RmcpWithState(Active::V2_0(res)))

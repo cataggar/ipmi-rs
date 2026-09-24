@@ -135,6 +135,8 @@ pub enum ActivationError {
     UnsupportedCipherSuite(CipherSuite),
     RmcpPlusRequired,
     InvalidUsername,
+    /// The requested backend cannot be used (e.g. SymCrypt was not compiled in).
+    CryptoBackend(CryptoBackendError),
     GetChannelAuthenticationCapabilities(CommandError<NotEnoughData>),
     V1_5(V1_5ActivationError),
     V2_0(V2_0ActivationError),
@@ -215,7 +217,13 @@ impl Rmcp {
         username: Option<&str>,
         password: Option<&[u8]>,
     ) -> Result<(), ActivationError> {
-        self.activate_with_selection(rmcp_plus, None, username, password)
+        self.activate_with_selection(
+            rmcp_plus,
+            None,
+            CryptoProvider::RustCrypto,
+            username,
+            password,
+        )
     }
 
     /// Activate RMCP+ using exactly `suite`, without falling back to another
@@ -226,13 +234,29 @@ impl Rmcp {
         username: Option<&str>,
         password: Option<&[u8]>,
     ) -> Result<(), ActivationError> {
-        self.activate_with_selection(true, Some(suite), username, password)
+        self.activate_with_provider(suite, CryptoProvider::RustCrypto, username, password)
+    }
+
+    /// Require exactly `suite` (3 or 17) and the selected RMCP+ crypto provider.
+    ///
+    /// This method never falls back to another provider, cipher suite or IPMI 1.5.
+    /// `SymCrypt` requires the `symcrypt-backend` feature and a compatible native
+    /// SymCrypt library available to the dynamic loader.
+    pub fn activate_with_provider(
+        &mut self,
+        suite: CipherSuite,
+        provider: CryptoProvider,
+        username: Option<&str>,
+        password: Option<&[u8]>,
+    ) -> Result<(), ActivationError> {
+        self.activate_with_selection(true, Some(suite), provider, username, password)
     }
 
     fn activate_with_selection(
         &mut self,
         rmcp_plus: bool,
         required_suite: Option<CipherSuite>,
+        provider: CryptoProvider,
         username: Option<&str>,
         password: Option<&[u8]>,
     ) -> Result<(), ActivationError> {
@@ -241,6 +265,10 @@ impl Rmcp {
                 return Err(ActivationError::UnsupportedCipherSuite(suite));
             }
         }
+
+        provider
+            .ensure_available()
+            .map_err(ActivationError::CryptoBackend)?;
 
         if self.active_state.take().is_some() {
             // TODO: shut down currently active state.
@@ -252,7 +280,8 @@ impl Rmcp {
             .bind()
             .map_err(ActivationError::BindSocket)?;
 
-        let activated = inactive.activate(rmcp_plus, required_suite, username, password)?;
+        let activated =
+            inactive.activate(rmcp_plus, required_suite, provider, username, password)?;
         self.active_state = Some(activated);
         Ok(())
     }
@@ -292,6 +321,17 @@ mod suite17_activation_tests {
     use super::*;
     use std::{net::UdpSocket, thread};
 
+    fn providers() -> &'static [CryptoProvider] {
+        #[cfg(feature = "symcrypt-backend")]
+        {
+            &[CryptoProvider::RustCrypto, CryptoProvider::SymCrypt]
+        }
+        #[cfg(not(feature = "symcrypt-backend"))]
+        {
+            &[CryptoProvider::RustCrypto]
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum OpenReply {
         NoRmcpPlus,
@@ -299,7 +339,7 @@ mod suite17_activation_tests {
         SubstituteAlgorithm(usize),
     }
 
-    fn mock_bmc(reply: OpenReply) -> (String, thread::JoinHandle<()>) {
+    fn mock_bmc(reply: OpenReply, suite: CipherSuite) -> (String, thread::JoinHandle<()>) {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -350,9 +390,10 @@ mod suite17_activation_tests {
                 let (len, peer) = socket.recv_from(&mut data).unwrap();
                 assert_eq!(data[5], 0x10);
                 assert_eq!(len, 48);
-                assert_eq!(data[28], 3);
-                assert_eq!(data[36], 4);
-                assert_eq!(data[44], 1);
+                let [authentication, integrity, confidentiality] = suite.into_suite();
+                assert_eq!(data[28], authentication);
+                assert_eq!(data[36], integrity);
+                assert_eq!(data[44], confidentiality);
 
                 let response = match reply {
                     OpenReply::RejectSuite => vec![0, 0x11],
@@ -394,56 +435,101 @@ mod suite17_activation_tests {
         assert!(!rmcp.is_active());
     }
 
+    #[cfg(not(feature = "symcrypt-backend"))]
     #[test]
-    fn required_suite_does_not_fall_back_to_ipmi_1_5() {
-        let (address, bmc) = mock_bmc(OpenReply::NoRmcpPlus);
-        let mut rmcp = Rmcp::new(address, Duration::from_secs(2)).unwrap();
-        let activation = rmcp.activate_with_cipher_suite(CipherSuite::Id17, None, None);
-        bmc.join().unwrap();
+    fn unavailable_symcrypt_is_rejected_before_any_network_io() {
+        let mut rmcp = Rmcp::new("127.0.0.1:1", Duration::from_millis(100)).unwrap();
         assert!(matches!(
-            activation,
-            Err(ActivationError::RequiredRmcpPlusNotSupported)
+            rmcp.activate_with_provider(CipherSuite::Id17, CryptoProvider::SymCrypt, None, None),
+            Err(ActivationError::CryptoBackend(
+                CryptoBackendError::Unavailable
+            ))
         ));
         assert!(!rmcp.is_active());
     }
 
     #[test]
-    fn peer_rejection_and_substitutions_stop_before_rakp1() {
-        for reply in [
-            OpenReply::RejectSuite,
-            OpenReply::SubstituteAlgorithm(0),
-            OpenReply::SubstituteAlgorithm(1),
-            OpenReply::SubstituteAlgorithm(2),
-        ] {
-            let (address, bmc) = mock_bmc(reply);
-            let mut rmcp = Rmcp::new(address, Duration::from_secs(2)).unwrap();
-            let activation = rmcp.activate_with_cipher_suite(CipherSuite::Id17, None, None);
-            bmc.join().unwrap();
-            match reply {
-                OpenReply::RejectSuite => assert!(matches!(
+    fn required_suite_does_not_fall_back_to_ipmi_1_5() {
+        for &provider in providers() {
+            for suite in [CipherSuite::Id3, CipherSuite::Id17] {
+                let (address, bmc) = mock_bmc(OpenReply::NoRmcpPlus, suite);
+                let mut rmcp = Rmcp::new(address, Duration::from_secs(2)).unwrap();
+                let activation = rmcp.activate_with_provider(suite, provider, None, None);
+                bmc.join().unwrap();
+                assert!(matches!(
                     activation,
-                    Err(ActivationError::V2_0(
-                        V2_0ActivationError::OpenSessionResponseParse(
-                            ParseSessionResponseError::HaveErrorCode(Ok(
-                                OpenSessionResponseErrorStatusCode::NoMatchingCipherSuite
-                            ))
-                        )
-                    ))
-                )),
-                OpenReply::SubstituteAlgorithm(_) => assert!(matches!(
-                    activation,
-                    Err(ActivationError::V2_0(
-                        V2_0ActivationError::OpenSessionResponseValidate(
-                            ValidateSessionResponseError::NegotiatedCipherSuiteMismatch {
-                                requested: CipherSuite::Id17,
-                                ..
-                            }
-                        )
-                    ))
-                )),
-                OpenReply::NoRmcpPlus => unreachable!(),
+                    Err(ActivationError::RequiredRmcpPlusNotSupported)
+                ));
+                assert!(!rmcp.is_active());
             }
-            assert!(!rmcp.is_active());
+        }
+    }
+
+    #[test]
+    fn peer_rejection_and_substitutions_stop_before_rakp1() {
+        for &provider in providers() {
+            for suite in [CipherSuite::Id3, CipherSuite::Id17] {
+                for reply in [
+                    OpenReply::RejectSuite,
+                    OpenReply::SubstituteAlgorithm(0),
+                    OpenReply::SubstituteAlgorithm(1),
+                    OpenReply::SubstituteAlgorithm(2),
+                ] {
+                    let (address, bmc) = mock_bmc(reply, suite);
+                    let mut rmcp = Rmcp::new(address, Duration::from_secs(2)).unwrap();
+                    let activation = rmcp.activate_with_provider(suite, provider, None, None);
+                    bmc.join().unwrap();
+                    match reply {
+                        OpenReply::RejectSuite => assert!(matches!(
+                            activation,
+                            Err(ActivationError::V2_0(
+                                V2_0ActivationError::OpenSessionResponseParse(
+                                    ParseSessionResponseError::HaveErrorCode(Ok(
+                                        OpenSessionResponseErrorStatusCode::NoMatchingCipherSuite
+                                    ))
+                                )
+                            ))
+                        )),
+                        OpenReply::SubstituteAlgorithm(which) => {
+                            let error = match activation {
+                                Err(ActivationError::V2_0(
+                                    V2_0ActivationError::OpenSessionResponseValidate(error),
+                                )) => error,
+                                other => panic!("expected negotiation error, got {other:?}"),
+                            };
+                            assert!(matches!(
+                                (suite, which, error),
+                                (
+                                    CipherSuite::Id17,
+                                    _,
+                                    ValidateSessionResponseError::NegotiatedCipherSuiteMismatch {
+                                        requested: CipherSuite::Id17,
+                                        ..
+                                    }
+                                ) | (
+                                    CipherSuite::Id3,
+                                    0,
+                                    ValidateSessionResponseError::AuthenticationAlgorithmMismatch(
+                                        _
+                                    )
+                                ) | (
+                                    CipherSuite::Id3,
+                                    1,
+                                    ValidateSessionResponseError::IntegrityAlgorithmMismatch(_)
+                                ) | (
+                                    CipherSuite::Id3,
+                                    2,
+                                    ValidateSessionResponseError::ConfidentialityAlgorithmMismatch(
+                                        _
+                                    )
+                                )
+                            ));
+                        }
+                        OpenReply::NoRmcpPlus => unreachable!(),
+                    }
+                    assert!(!rmcp.is_active());
+                }
+            }
         }
     }
 

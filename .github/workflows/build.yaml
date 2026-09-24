@@ -46,6 +46,9 @@ jobs:
           - "-p ipmi-rs --no-default-features --examples"
     steps:
       - uses: actions/checkout@v5
+      - name: Install pinned native SymCrypt for feature-enabled check
+        if: matrix.command == '-p ipmi-rs --all-features'
+        run: bash .github/scripts/setup-symcrypt.sh
       - name: Check a package with specific feature combination.
         run: CARGO_BUILD_WARNINGS=deny cargo check --locked ${{ matrix.command }}
 
@@ -70,6 +73,9 @@ jobs:
           - "-p ipmi-rs --all-features"
     steps:
       - uses: actions/checkout@v5
+      - name: Install pinned native SymCrypt for feature-enabled tests
+        if: matrix.command == '-p ipmi-rs --all-features'
+        run: bash .github/scripts/setup-symcrypt.sh
       - name: Check a package with specific feature combination.
         run: cargo test --locked ${{ matrix.command }}
 
@@ -84,6 +90,9 @@ jobs:
           - ipmi-rs
     steps:
       - uses: actions/checkout@v5
+      - name: Install pinned native SymCrypt for feature-enabled clippy
+        if: matrix.crate == 'ipmi-rs'
+        run: bash .github/scripts/setup-symcrypt.sh
       - name: Run cargo clippy
         run: cargo clippy --locked --all-features -p ${{ matrix.crate }} -- -Dwarnings
 

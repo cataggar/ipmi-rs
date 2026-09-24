@@ -29,12 +29,15 @@ rand = "0.8.5"
 aes = "0.8.4"
 cbc = "0.1.2"
 getrandom = "0.4.2"
+zeroize = "1.8"
+symcrypt = { version = "=0.5.1", optional = true, features = ["sha1"] }
 
 [features]
 default = [ "unix-file", "md5" ]
 
 # Connection features
 unix-file = [ "nix" ]
+symcrypt-backend = [ "dep:symcrypt" ]
 
 [dev-dependencies]
 pretty_env_logger = "0.5"
