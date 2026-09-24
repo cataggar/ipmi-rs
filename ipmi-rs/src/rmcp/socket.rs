@@ -16,6 +16,15 @@ pub const MAX_DATAGRAM: usize = 4096;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub(crate) const MAX_UNRELATED: usize = 32;
 
+pub(crate) fn count_unrelated(unrelated: &mut usize) -> Result<(), RecvError> {
+    *unrelated += 1;
+    if *unrelated >= MAX_UNRELATED {
+        Err(RecvError::TooManyUnrelatedPackets)
+    } else {
+        Ok(())
+    }
+}
+
 /// Shared, sticky cancellation signal. Create a new token for a new operation.
 #[derive(Debug, Clone, Default)]
 pub struct CancellationToken(Arc<AtomicBool>);
@@ -128,6 +137,22 @@ impl RmcpIpmiSocket {
         self.policy.cancellation.clone()
     }
 
+    /// Allow one bounded deactivation attempt even when the operation's token
+    /// was cancelled. Restore the original token before returning to callers.
+    pub(crate) fn begin_cleanup(
+        &mut self,
+        max_wait: Duration,
+    ) -> (CancellationToken, Option<Instant>) {
+        let token = std::mem::take(&mut self.policy.cancellation);
+        let previous_deadline = self.activation_deadline.replace(Instant::now() + max_wait);
+        (token, previous_deadline)
+    }
+
+    pub(crate) fn end_cleanup(&mut self, previous: (CancellationToken, Option<Instant>)) {
+        self.policy.cancellation = previous.0;
+        self.activation_deadline = previous.1;
+    }
+
     pub fn recv(&mut self) -> Result<&mut [u8], RmcpIpmiReceiveError> {
         self.recv_until(self.deadline())
     }
@@ -153,10 +178,7 @@ impl RmcpIpmiSocket {
             if is_ipmi {
                 return Ok(&mut self.buffer[4..received]);
             }
-            *unrelated += 1;
-            if *unrelated >= MAX_UNRELATED {
-                return Err(RecvError::TooManyUnrelatedPackets);
-            }
+            count_unrelated(unrelated)?;
         }
     }
 

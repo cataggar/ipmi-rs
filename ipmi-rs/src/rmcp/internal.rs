@@ -14,7 +14,7 @@ use crate::{
 
 use super::{
     checksum::Checksum,
-    socket::{recv_datagram, TransportPolicy, MAX_UNRELATED},
+    socket::{count_unrelated, recv_datagram, TransportPolicy},
     v1_5::State as V1_5State,
     v2_0::{CryptoProvider, State as V2_0State},
     ASFMessage, ASFMessageType, ActivationError, RmcpHeader, RmcpIpmiError, RmcpIpmiReceiveError,
@@ -88,12 +88,23 @@ impl<T> RmcpWithState<T> {
         &self.0
     }
 
-    fn state_mut(&mut self) -> &mut T {
+    pub(super) fn state_mut(&mut self) -> &mut T {
         &mut self.0
     }
 }
 
+#[cfg(test)]
+impl RmcpWithState<Active> {
+    pub(super) fn from_active(state: Active) -> Self {
+        Self(state)
+    }
+}
+
 impl RmcpWithState<Unbound> {
+    pub(super) fn address(&self) -> SocketAddr {
+        self.0.address
+    }
+
     pub fn new<R: ToSocketAddrs + core::fmt::Debug>(
         remote: R,
         timeout: Duration,
@@ -327,12 +338,7 @@ pub(super) fn record_unrelated(
     if first_mismatch.is_none() {
         *first_mismatch = Some(error);
     }
-    *unrelated += 1;
-    if *unrelated >= MAX_UNRELATED {
-        Err(RmcpIpmiReceiveError::TooManyUnrelatedPackets)
-    } else {
-        Ok(())
-    }
+    count_unrelated(unrelated)
 }
 
 // TODO: `ExactSizeIterator` to avoid/postpone allocation?

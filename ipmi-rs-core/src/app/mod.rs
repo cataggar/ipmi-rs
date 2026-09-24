@@ -15,6 +15,7 @@ pub use get_channel_access::{
 };
 
 pub mod auth;
+pub mod sol;
 
 mod reset;
 pub use reset::{ColdReset, UnexpectedResetResponseLength, WarmReset};

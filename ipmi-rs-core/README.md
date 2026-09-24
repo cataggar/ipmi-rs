@@ -26,4 +26,10 @@ selection. These commands never implicitly update other parameters, reset the
 host, or retry when the outcome is unknown after a timeout. Unsupported
 controllers or readback fields return errors.
 
+SOL commands are in `app::sol` (`ActivateSol`, `DeactivateSol`,
+`SolInstance`) and `transport` (`GetSolConfig`, `SetSolConfig`,
+`SolParameterValue`, `sol_write_guarded`). Configuration writes are always
+explicit and distinct from activation; a guarded write attempts a bounded
+set-complete cleanup and returns cleanup errors instead of hiding them.
+
 [`ipmi-rs`]: https://crates.io/crates/ipmi-rs
