@@ -23,6 +23,10 @@ pub use ipmi_rs_core::app::auth::{
     AuthenticationAlgorithm, CipherSuite, ConfidentialityAlgorithm, IntegrityAlgorithm,
 };
 
+mod sol;
+pub use sol::{
+    CaptureGap, SolCapture, SolError, SolInteractive, SolInterruption, SolInterruptionReason,
+};
 mod checksum;
 
 mod header;
@@ -48,6 +52,8 @@ pub enum RmcpIpmiReceiveError {
     SessionIdMismatch,
     InvalidSessionSequence,
     UnexpectedPayloadType,
+    Sol(v2_0::SolFrameError),
+    SolAckFailed,
     DatagramTooLarge,
     TooManyUnrelatedPackets,
     Timeout,
@@ -63,6 +69,7 @@ pub enum RmcpIpmiSendError {
     InvalidNetfn(u8),
     IpmbSequenceExhausted,
     SessionSequenceExhausted,
+    SolFrame,
     Cancelled,
     DeadlineExpired,
 }

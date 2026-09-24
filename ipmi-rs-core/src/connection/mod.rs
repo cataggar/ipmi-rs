@@ -179,6 +179,22 @@ pub trait IpmiConnection {
     fn send_recv(&mut self, request: &mut Request) -> Result<Response, Self::Error>;
 }
 
+impl<T: IpmiConnection + ?Sized> IpmiConnection for &mut T {
+    type SendError = T::SendError;
+    type RecvError = T::RecvError;
+    type Error = T::Error;
+
+    fn send(&mut self, request: &mut Request) -> Result<(), Self::SendError> {
+        (**self).send(request)
+    }
+    fn recv(&mut self) -> Result<Response, Self::RecvError> {
+        (**self).recv()
+    }
+    fn send_recv(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
+        (**self).send_recv(request)
+    }
+}
+
 /// The wire representation of an IPMI message.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Message {

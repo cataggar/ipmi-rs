@@ -88,6 +88,9 @@ The following IPMI commands are currently supported in `ipmi-rs-core`:
 | Set / Get System Boot Options            | Chassis commands 0x08/0x09 |
 | Set LAN Configuration Parameters        | 23.1                  |
 | Get LAN Configuration Parameters        | 23.2                  |
+| Set SOL Configuration Parameters        | 26.2                  |
+| Get SOL Configuration Parameters        | 26.3                  |
+| Activate / Deactivate Payload (SOL)     | 24.1 / 24.2           |
 | Get SEL Info                            | 31.2                  |
 | Get SEL Allocation Info                 | 31.3                  |
 | Reserve SEL                             | 31.4                  |
@@ -272,13 +275,74 @@ absolute deadline. If no correlated reply arrives, the first mismatch is
 reported rather than silently accepted or replayed. Malformed packets still
 fail explicitly.
 
-There are no implicit retransmissions. In particular, `send_recv` can return
+There are no implicit retransmissions of ordinary IPMI commands. In particular,
+`send_recv` can return
 `RmcpIpmiError::OutcomeUnknown` after a request was sent but its response was
 lost, invalid, cancelled or timed out. Do **not** automatically retry a power,
 reset, boot, or other potentially mutating request. A deliberate retry of a
 safe read uses a new IPMB sequence. An ambiguous sequence is never reused within
 the session; if all available correlation sequences are consumed, activate a
 fresh session.
+
+### Serial over LAN
+
+`ipmi_rs_core::transport::{GetSolConfig, SetSolConfig}` provide typed SOL
+parameters. `GetSolConfig` returns a revision-checked `SolConfigRaw`; call
+`raw.parse(parameter)` to validate the selected parameter's length and decode
+its value. Configuration is **never** changed by starting a capture or an
+interactive session. Explicit multi-step writes can use `sol_write_guarded`,
+which attempts set-complete cleanup even if writing or committing fails and
+reports both the original and cleanup failures. A failed write's outcome can
+still be uncertain; inspect `SolWriteError`.
+
+SOL requires an already authenticated **RMCP+ AES-CBC-128/HMAC-SHA1-96**
+connection. Enable `require_rmcp_plus(true)` *before* activation, then call
+`open_sol_capture(SolInstance::new(1).unwrap())` for a read-only capture or
+`open_sol_interactive(...)` only when console input is explicitly authorized.
+The activation request requires both SOL authentication and encryption; a BMC
+that negotiates a different UDP port or a nonzero VLAN is rejected and
+deactivation is attempted. No IPMI 1.5 fallback is allowed for SOL.
+
+```rust,no_run
+use ipmi_rs::{app::sol::SolInstance, rmcp::Rmcp};
+use std::time::Duration;
+
+let mut connection = Rmcp::new("127.0.0.1:623", Duration::from_secs(2))?;
+connection.require_rmcp_plus(true);
+let password = std::env::var("IPMI_PASSWORD")?;
+connection.activate(true, Some("operator"), Some(password.as_bytes()))
+    .map_err(|error| format!("{error:?}"))?;
+let mut capture = connection.open_sol_capture(SolInstance::new(1).unwrap())
+    .map_err(|error| format!("{error:?}"))?;
+let mut output = [0u8; 1024];
+let count = capture.read(&mut output).map_err(|error| format!("{error:?}"))?;
+// Process output[..count] without logging console data or credentials.
+let _ = count;
+capture.close().map_err(|error| format!("{error:?}"))?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Captures send only authenticated protocol ACKs and Deactivate Payload, never
+console-input or control characters. Interactive input is explicitly supplied
+to `SolInteractive::send_input` (up to 4096 bytes per call); break and flush
+require separate methods. SOL characters are limited to 255 per packet and
+queued output to 4096 bytes. Full queues send partial/NACK ACKs, not unbounded
+allocations. Data, IPMI replies and ACK-only packets are dispatched on the
+same identity-checked, replay-checked RMCP+ connection. A missing interactive
+ACK can retransmit the *same* SOL sequence at most twice within that session;
+the unacknowledged input is **never replayed across sessions**.
+
+Each read or send has a monotonic deadline; a read timeout, cancelled operation,
+frame gap, output overrun, or connection error interrupts the stream and makes
+a bounded (250ms) deactivation attempt. Check `SolError::Interrupted` for
+confirmed input bytes and uncertain input/output delivery or remote closure.
+Dropping the session also attempts deactivation but cannot report its outcome;
+call `close()` explicitly. A quiet console times out rather than silently
+waiting forever. To recover a capture, call `SolCapture::reconnect` with the
+credentials and a 1–3 attempt bound; each attempt uses a fresh RMCP+ handshake,
+resets per-session SOL sequence state and returns `CaptureGap`. Reset a cancelled
+token **explicitly** before reconnection. Interactive sessions do not
+automatically reconnect.
 
 ## License
 

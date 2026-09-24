@@ -7,6 +7,9 @@ use crypto::CryptoState;
 pub use crypto::{CryptoBackendError, CryptoProvider};
 
 mod messages;
+pub(in crate::rmcp) mod sol;
+pub use sol::{SolFlags, SolFrame, SolFrameError};
+use sol::{SolFlow, MAX_SOL_DATA};
 #[cfg(test)]
 mod tests;
 use ipmi_rs_core::app::auth::{
@@ -197,13 +200,14 @@ impl From<PayloadType> for u8 {
 
 #[derive(Debug)]
 pub struct State {
-    socket: RmcpIpmiSocket,
+    pub(super) socket: RmcpIpmiSocket,
     session_id: NonZeroU32,
     session_sequence_number: NonZeroU32,
     console_session_id: NonZeroU32,
     last_inbound_sequence: Option<u32>,
     state: CryptoState,
     ipmb_state: IpmbState,
+    sol: Option<Box<SolFlow>>,
 }
 
 impl State {
@@ -554,6 +558,7 @@ impl State {
             last_inbound_sequence: None,
             state: crypto_state,
             ipmb_state: IpmbState::default(),
+            sol: None,
         })
     }
 
@@ -600,6 +605,70 @@ impl State {
         Ok(())
     }
 
+    fn receive_one(
+        &mut self,
+        deadline: std::time::Instant,
+        unrelated: &mut usize,
+    ) -> Result<Option<crate::connection::Response>, RmcpIpmiReceiveError> {
+        let data = self.socket.recv_until_with_budget(deadline, unrelated)?;
+        let message = self
+            .state
+            .read_payload(data)
+            .map_err(|e| RmcpIpmiReceiveError::Session(UnwrapSessionError::V2_0(e)))?;
+        if message.session_id != self.console_session_id.get() {
+            return Err(RmcpIpmiReceiveError::SessionIdMismatch);
+        }
+        if message.session_sequence_number == 0
+            || self
+                .last_inbound_sequence
+                .is_some_and(|last| message.session_sequence_number <= last)
+        {
+            return Err(RmcpIpmiReceiveError::InvalidSessionSequence);
+        }
+        match message.ty {
+            PayloadType::IpmiMessage => {
+                if self.ipmb_state.pending.is_none() {
+                    return Err(RmcpIpmiReceiveError::UnexpectedPayloadType);
+                }
+                let response = self.ipmb_state.receive(&message.payload)?;
+                self.last_inbound_sequence = Some(message.session_sequence_number);
+                Ok(Some(response))
+            }
+            PayloadType::Sol => {
+                if self.sol.is_none() {
+                    return Err(RmcpIpmiReceiveError::UnexpectedPayloadType);
+                }
+                let frame =
+                    SolFrame::decode(&message.payload).map_err(RmcpIpmiReceiveError::Sol)?;
+                let flow = self.sol.as_mut().expect("SOL state checked");
+                let ack = match flow.accept(&frame) {
+                    Ok(ack) => ack,
+                    Err(err) => {
+                        if frame.sequence != 0 {
+                            self.send_sol_frame(&SolFrame::ack(frame.sequence, 0, true), deadline)
+                                .map_err(|_| RmcpIpmiReceiveError::SolAckFailed)?;
+                        }
+                        return Err(RmcpIpmiReceiveError::Sol(err));
+                    }
+                };
+                if let Some(ack) = ack {
+                    self.send_sol_frame(&ack, deadline)
+                        .map_err(|_| RmcpIpmiReceiveError::SolAckFailed)?;
+                }
+                if frame.flags.inactive || frame.flags.overrun {
+                    return Err(RmcpIpmiReceiveError::Sol(if frame.flags.inactive {
+                        SolFrameError::RemoteInactive
+                    } else {
+                        SolFrameError::OutputOverrun
+                    }));
+                }
+                self.last_inbound_sequence = Some(message.session_sequence_number);
+                Ok(None)
+            }
+            _ => Err(RmcpIpmiReceiveError::UnexpectedPayloadType),
+        }
+    }
+
     pub fn recv(&mut self) -> Result<crate::connection::Response, RmcpIpmiReceiveError> {
         let deadline = self
             .ipmb_state
@@ -610,45 +679,25 @@ impl State {
             let mut unrelated = 0;
             let mut first_mismatch = None;
             loop {
-                let data = match self.socket.recv_until_with_budget(deadline, &mut unrelated) {
-                    Ok(data) => data,
+                match self.receive_one(deadline, &mut unrelated) {
+                    Ok(Some(response)) => return Ok(response),
+                    Ok(None) => {
+                        super::socket::count_unrelated(&mut unrelated)?;
+                    }
                     Err(RmcpIpmiReceiveError::Timeout) => {
                         return Err(first_mismatch.unwrap_or(RmcpIpmiReceiveError::Timeout));
                     }
-                    Err(error) => return Err(error),
-                };
-                let message = self
-                    .state
-                    .read_payload(data)
-                    .map_err(|e| RmcpIpmiReceiveError::Session(UnwrapSessionError::V2_0(e)))?;
-                let mismatch = if message.ty != PayloadType::IpmiMessage {
-                    Some(RmcpIpmiReceiveError::UnexpectedPayloadType)
-                } else if message.session_id != self.console_session_id.get() {
-                    Some(RmcpIpmiReceiveError::SessionIdMismatch)
-                } else if message.session_sequence_number == 0
-                    || self
-                        .last_inbound_sequence
-                        .is_some_and(|last| message.session_sequence_number <= last)
-                {
-                    Some(RmcpIpmiReceiveError::InvalidSessionSequence)
-                } else {
-                    None
-                };
-                if let Some(error) = mismatch {
-                    super::internal::record_unrelated(error, &mut first_mismatch, &mut unrelated)?;
-                    continue;
-                }
-                match self.ipmb_state.receive(&message.payload) {
-                    Err(RmcpIpmiReceiveError::IpmbResponseMismatch) => {
+                    Err(
+                        error @ (RmcpIpmiReceiveError::IpmbResponseMismatch
+                        | RmcpIpmiReceiveError::SessionIdMismatch
+                        | RmcpIpmiReceiveError::InvalidSessionSequence
+                        | RmcpIpmiReceiveError::UnexpectedPayloadType),
+                    ) => {
                         super::internal::record_unrelated(
-                            RmcpIpmiReceiveError::IpmbResponseMismatch,
+                            error,
                             &mut first_mismatch,
                             &mut unrelated,
                         )?;
-                    }
-                    Ok(response) => {
-                        self.last_inbound_sequence = Some(message.session_sequence_number);
-                        return Ok(response);
                     }
                     Err(error) => return Err(error),
                 }
@@ -656,6 +705,80 @@ impl State {
         })();
         self.ipmb_state.retire_pending();
         result
+    }
+
+    pub(super) fn sol_open(&mut self) {
+        self.sol = Some(Box::new(SolFlow::new(MAX_SOL_DATA + 4, MAX_SOL_DATA + 4)));
+    }
+
+    pub(super) fn sol_limits(&mut self, input: u16, output: u16) {
+        if let Some(flow) = self.sol.as_mut() {
+            flow.max_input = usize::from(input).min(MAX_SOL_DATA + 4);
+            flow.max_output = usize::from(output).min(MAX_SOL_DATA + 4);
+        }
+    }
+
+    pub(super) fn sol_close(&mut self) {
+        self.sol = None;
+    }
+
+    pub(super) fn sol_flow(&mut self) -> &mut SolFlow {
+        self.sol.as_mut().expect("SOL session established")
+    }
+
+    pub(super) fn send_sol_frame(
+        &mut self,
+        frame: &SolFrame,
+        deadline: std::time::Instant,
+    ) -> Result<(), RmcpIpmiError> {
+        use super::RmcpIpmiSendError;
+        if self.socket.cancellation_token().is_cancelled() {
+            return Err(RmcpIpmiError::Send(RmcpIpmiSendError::Cancelled));
+        }
+        if deadline <= std::time::Instant::now() {
+            return Err(RmcpIpmiError::Send(RmcpIpmiSendError::DeadlineExpired));
+        }
+        let seq = self.session_sequence_number.get();
+        if seq == u32::MAX {
+            return Err(RmcpIpmiError::Send(
+                RmcpIpmiSendError::SessionSequenceExhausted,
+            ));
+        }
+        let payload = frame
+            .encode()
+            .map_err(|_| RmcpIpmiError::Send(RmcpIpmiSendError::SolFrame))?;
+        self.session_sequence_number = NonZeroU32::new(seq + 1).expect("sequence checked");
+        self.socket
+            .send(deadline, |buffer| {
+                self.state.write_message(
+                    &Message {
+                        ty: PayloadType::Sol,
+                        session_id: self.session_id.get(),
+                        session_sequence_number: seq,
+                        payload: payload.clone(),
+                    },
+                    buffer,
+                )
+            })
+            .map_err(|e| RmcpIpmiError::Send(e.into()))
+    }
+
+    pub(super) fn poll_sol(
+        &mut self,
+        deadline: std::time::Instant,
+        wait_ack: bool,
+    ) -> Result<(), RmcpIpmiReceiveError> {
+        let mut unrelated = 0;
+        loop {
+            if self.receive_one(deadline, &mut unrelated)?.is_some() {
+                return Err(RmcpIpmiReceiveError::UnexpectedPayloadType);
+            }
+            let flow = self.sol_flow();
+            if (wait_ack && flow.input_ack.is_some()) || (!wait_ack && flow.has_output()) {
+                return Ok(());
+            }
+            super::socket::count_unrelated(&mut unrelated)?;
+        }
     }
 
     pub fn send_recv(
