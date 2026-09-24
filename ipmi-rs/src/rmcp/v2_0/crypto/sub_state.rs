@@ -1,7 +1,11 @@
 use aes::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use ipmi_rs_core::app::auth::{ConfidentialityAlgorithm, IntegrityAlgorithm};
+use subtle::ConstantTimeEq;
 
-use crate::rmcp::{v2_0::crypto::sha1::Sha1Hmac, Message, PayloadType};
+use crate::rmcp::{
+    v2_0::crypto::{sha1::Sha1Hmac, sha256::Sha256Hmac},
+    Message, PayloadType,
+};
 
 use super::{
     super::{ReadError, WriteError},
@@ -65,15 +69,16 @@ impl SubState {
 
             match self.integrity_algorithm {
                 IntegrityAlgorithm::None => {}
-                IntegrityAlgorithm::HmacSha1_96 => {
-                    let integrity_data =
-                        Sha1Hmac::new(&self.keys.k1).feed(auth_code_data).finalize();
-
-                    buffer.extend_from_slice(&integrity_data[..12]);
-                }
+                IntegrityAlgorithm::HmacSha1_96 => buffer.extend_from_slice(
+                    &Sha1Hmac::new(&self.keys.k1).feed(auth_code_data).finalize()[..12],
+                ),
                 IntegrityAlgorithm::HmacMd5_128 => todo!(),
                 IntegrityAlgorithm::Md5_128 => todo!(),
-                IntegrityAlgorithm::HmacSha256_128 => todo!(),
+                IntegrityAlgorithm::HmacSha256_128 => buffer.extend_from_slice(
+                    &Sha256Hmac::new(&self.keys.k1)
+                        .feed(auth_code_data)
+                        .finalize()[..16],
+                ),
             }
         }
 
@@ -81,42 +86,47 @@ impl SubState {
     }
 
     fn validate_trailer<'a>(&self, data: &'a mut [u8]) -> Result<&'a mut [u8], CryptoUnwrapError> {
-        match self.integrity_algorithm {
-            IntegrityAlgorithm::None => Ok(data),
-            IntegrityAlgorithm::HmacSha1_96 => {
-                let (data, checksum_data) = data
-                    .split_last_chunk_mut::<12>()
-                    .ok_or(CryptoUnwrapError::IncorrectIntegrityTrailerLen)?;
-
-                let checksum = Sha1Hmac::new(&self.keys.k1).feed(data).finalize();
-
-                if &checksum[..12] != checksum_data {
-                    return Err(CryptoUnwrapError::AuthCodeMismatch);
-                }
-
-                let (data, [pad_len, next_header]) = data
-                    .split_last_chunk_mut()
-                    .ok_or(CryptoUnwrapError::IncorrectIntegrityTrailerLen)?;
-
-                let pad_len = *pad_len as usize;
-                let next_header = *next_header;
-
-                if next_header != 0x07 {
-                    return Err(CryptoUnwrapError::UnknownNextHeader(next_header));
-                }
-
-                let data_len = data.len();
-                // Strip the length of the pad
-                let (data, _) = data
-                    .split_at_mut_checked(data_len.saturating_sub(pad_len))
-                    .ok_or(CryptoUnwrapError::IncorrectIntegrityTrailerLen)?;
-
-                Ok(data)
-            }
+        let auth_code_len = match self.integrity_algorithm {
+            IntegrityAlgorithm::None => return Ok(data),
+            IntegrityAlgorithm::HmacSha1_96 => 12,
             IntegrityAlgorithm::HmacMd5_128 => todo!(),
             IntegrityAlgorithm::Md5_128 => todo!(),
-            IntegrityAlgorithm::HmacSha256_128 => todo!(),
+            IntegrityAlgorithm::HmacSha256_128 => 16,
+        };
+        if data.len() < auth_code_len + 2 {
+            return Err(CryptoUnwrapError::IncorrectIntegrityTrailerLen);
         }
+        let (authenticated_data, tag) = data.split_at_mut(data.len() - auth_code_len);
+        let checksum = match self.integrity_algorithm {
+            IntegrityAlgorithm::HmacSha1_96 => Sha1Hmac::new(&self.keys.k1)
+                .feed(authenticated_data)
+                .finalize()
+                .to_vec(),
+            IntegrityAlgorithm::HmacSha256_128 => Sha256Hmac::new(&self.keys.k1)
+                .feed(authenticated_data)
+                .finalize()
+                .to_vec(),
+            _ => unreachable!("only implemented integrity algorithms reach this point"),
+        };
+        if !bool::from(tag.ct_eq(&checksum[..auth_code_len])) {
+            return Err(CryptoUnwrapError::AuthCodeMismatch);
+        }
+
+        let (data, [pad_len, next_header]) = authenticated_data
+            .split_last_chunk_mut()
+            .ok_or(CryptoUnwrapError::IncorrectIntegrityTrailerLen)?;
+
+        if *next_header != 0x07 {
+            return Err(CryptoUnwrapError::UnknownNextHeader(*next_header));
+        }
+
+        let data_len = data.len();
+        let (data, _) = data
+            .split_at_mut_checked(data_len.saturating_sub(*pad_len as usize))
+            .filter(|(_, pad)| pad.len() == *pad_len as usize)
+            .ok_or(CryptoUnwrapError::IncorrectIntegrityTrailerLen)?;
+
+        Ok(data)
     }
 
     /// Write payload data `data` to `buffer`, potentially encrypting and adding
@@ -208,9 +218,12 @@ impl SubState {
                 let decryptor: cbc::Decryptor<aes::Aes128> =
                     cbc::Decryptor::<aes::Aes128>::new(self.keys.aes_key(), &(*iv).into());
 
+                if data_and_trailer.is_empty() || data_and_trailer.len() % 16 != 0 {
+                    return Err(CryptoUnwrapError::InvalidCiphertextLength);
+                }
                 decryptor
                     .decrypt_padded_mut::<NoPadding>(data_and_trailer)
-                    .unwrap();
+                    .map_err(|_| CryptoUnwrapError::InvalidCiphertextLength)?;
 
                 let (confidentiality_pad_len, payload_and_confidentiality_pad) = data_and_trailer
                     .split_last_mut()
@@ -267,7 +280,9 @@ impl SubState {
         let session_sequence_number = u32::from_le_bytes(data[6..10].try_into().unwrap());
 
         let data_with_header = self.validate_trailer(data)?;
-        let data = &mut data_with_header[10..];
+        let data = data_with_header
+            .get_mut(10..)
+            .ok_or(CryptoUnwrapError::NotEnoughData)?;
 
         if data.len() < 2 {
             return Err(CryptoUnwrapError::NotEnoughData.into());
@@ -321,8 +336,8 @@ mod tests {
     use ipmi_rs_core::app::auth::{ConfidentialityAlgorithm, IntegrityAlgorithm};
 
     use crate::rmcp::{
-        v2_0::crypto::{keys::Keys, CryptoUnwrapError, SubState},
-        PayloadType,
+        v2_0::crypto::{keys::Keys, sha256::Sha256Hmac, CryptoUnwrapError, SubState},
+        Message, PayloadType,
     };
 
     #[test]
@@ -401,5 +416,144 @@ mod tests {
         for i in 0..32 {
             assert!(state.validate_trailer(&mut vec![0u8; i]).is_err());
         }
+    }
+
+    fn suite17_state() -> SubState {
+        SubState {
+            keys: Keys::from_sha256_sik(
+                hex::decode("ebe2936b4a2cbf0b64ecbd75a5ca848f909e1d84214c428f0f57242bc89709a5")
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ),
+            confidentiality_algorithm: ConfidentialityAlgorithm::AesCbc128,
+            integrity_algorithm: IntegrityAlgorithm::HmacSha256_128,
+        }
+    }
+
+    fn packet_fixture() -> Vec<u8> {
+        // AES ciphertext from OpenSSL; keys and tag from Python's hmac/hashlib.
+        hex::decode(concat!(
+            "0600ff07",
+            "06c088776655443322112000",
+            "0102030405060708090a0b0c0d0e0f10",
+            "152c91626024c15ebd75f58a2a42d713",
+            "ffff0207",
+            "981c4785e9bdcfc754289ea56be39d34",
+        ))
+        .unwrap()
+    }
+
+    fn resign_packet(packet: &mut [u8], state: &SubState) {
+        let tag_offset = packet.len() - 16;
+        let tag = Sha256Hmac::new(&state.keys.k1)
+            .feed(&packet[4..tag_offset])
+            .finalize();
+        packet[tag_offset..].copy_from_slice(&tag[..16]);
+    }
+
+    #[test]
+    fn suite17_independent_encrypted_packet_vector() {
+        let mut state = suite17_state();
+        let message = Message {
+            ty: PayloadType::IpmiMessage,
+            session_id: 0x55667788,
+            session_sequence_number: 0x11223344,
+            payload: hex::decode("2018c881000173").unwrap(),
+        };
+        let mut outbound = vec![0x06, 0x00, 0xff, 0x07];
+        state.write_payload(&message, &mut outbound).unwrap();
+        assert_eq!(outbound, packet_fixture());
+
+        let mut incoming = packet_fixture();
+        let received = state.read_payload(&mut incoming[4..]).unwrap();
+        assert_eq!(received.ty, message.ty);
+        assert_eq!(received.session_id, message.session_id);
+        assert_eq!(
+            received.session_sequence_number,
+            message.session_sequence_number
+        );
+        assert_eq!(received.payload, message.payload);
+    }
+
+    #[test]
+    fn suite17_independent_inbound_packet_vector() {
+        let mut incoming = hex::decode(concat!(
+            "0600ff07",
+            "06c040302010040302012000",
+            "909192939495969798999a9b9c9d9e9f",
+            "5d4f5b4e82d7399eaa1ebd67d9ee3d28",
+            "ffff0207",
+            "a34d98e803fde1be251e9010c13452e0",
+        ))
+        .unwrap();
+        let received = suite17_state().read_payload(&mut incoming[4..]).unwrap();
+        assert_eq!(received.ty, PayloadType::IpmiMessage);
+        assert_eq!(received.session_id, 0x10203040);
+        assert_eq!(received.session_sequence_number, 0x01020304);
+        assert_eq!(received.payload, hex::decode("811c6320003800a8").unwrap());
+    }
+
+    #[test]
+    fn suite17_rejects_modified_authenticated_bytes_before_decryption() {
+        let mut state = suite17_state();
+        for position in [6, 11, 18, 34, 48, 50, 51] {
+            let mut incoming = packet_fixture();
+            incoming[position] ^= 1;
+            assert!(
+                matches!(
+                    state.read_payload(&mut incoming[4..]),
+                    Err(super::ReadError::DecryptionError(
+                        CryptoUnwrapError::AuthCodeMismatch
+                    ))
+                ),
+                "position {position}"
+            );
+        }
+        let mut incoming = packet_fixture();
+        incoming.pop();
+        assert!(state.read_payload(&mut incoming[4..]).is_err());
+        for size in 0..18 {
+            assert!(state.validate_trailer(&mut vec![0; size]).is_err());
+        }
+
+        let mut missing_payload = vec![6, 0xc0, 0x88, 0x77, 0x66, 0x55, 1, 0, 0, 0, 0, 7];
+        missing_payload.extend_from_slice(&[0; 16]);
+        let mac = Sha256Hmac::new(&state.keys.k1)
+            .feed(&missing_payload[..12])
+            .finalize();
+        missing_payload[12..].copy_from_slice(&mac[..16]);
+        assert!(matches!(
+            state.read_payload(&mut missing_payload),
+            Err(super::ReadError::DecryptionError(
+                CryptoUnwrapError::NotEnoughData
+            ))
+        ));
+    }
+
+    #[test]
+    fn suite17_valid_tag_does_not_hide_malformed_ciphertext() {
+        let mut state = suite17_state();
+
+        let mut incomplete_block = packet_fixture();
+        incomplete_block.remove(47);
+        incomplete_block[14] = 31;
+        resign_packet(&mut incomplete_block, &state);
+        assert!(matches!(
+            state.read_payload(&mut incomplete_block[4..]),
+            Err(super::ReadError::DecryptionError(
+                CryptoUnwrapError::InvalidCiphertextLength
+            ))
+        ));
+
+        let mut broken_padding = packet_fixture();
+        broken_padding[31] ^= 1;
+        resign_packet(&mut broken_padding, &state);
+        assert!(matches!(
+            state.read_payload(&mut broken_padding[4..]),
+            Err(super::ReadError::DecryptionError(
+                CryptoUnwrapError::InvalidConfidentialityTrailer
+            ))
+        ));
     }
 }

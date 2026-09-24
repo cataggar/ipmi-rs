@@ -13,6 +13,7 @@ pub enum ParseError {
 #[derive(Debug, Clone)]
 pub struct RakpMessage4<'a> {
     pub message_tag: u8,
+    /// Legacy name: on the wire RAKP4 carries the remote console session ID.
     pub managed_system_session_id: NonZeroU32,
     pub integrity_check_value: &'a [u8],
 }

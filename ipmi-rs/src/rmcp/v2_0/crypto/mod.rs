@@ -1,4 +1,5 @@
 mod sha1;
+mod sha256;
 
 mod keys;
 
@@ -15,6 +16,7 @@ pub enum CryptoUnwrapError {
     MismatchingAuthenticationState,
     IncorrectPayloadLen,
     IncorrectConfidentialityTrailerLen,
+    InvalidCiphertextLength,
     InvalidConfidentialityTrailer,
     AuthCodeMismatch,
     IncorrectIntegrityTrailerLen,

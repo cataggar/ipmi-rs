@@ -91,29 +91,37 @@ RMCP with the following authentication types is supported:
 
 ## RMCP+
 
-RCMP+ is supported, but the subset of authentication, confidentiality, and integrity algorithms is limited.
+RMCP+ supports cipher suites 3 (RAKP-HMAC-SHA1 / HMAC-SHA1-96 / AES-CBC-128)
+and 17 (RAKP-HMAC-SHA256 / HMAC-SHA256-128 / AES-CBC-128).
+`Rmcp::activate(true, username, password)` keeps the suite-3 default.
+To require suite 17, use
+`Rmcp::activate_with_cipher_suite(CipherSuite::Id17, username, password)`.
+This returns an activation error if the peer lacks RMCP+, rejects suite 17,
+or selects any different authentication, integrity, or confidentiality algorithm;
+it never falls back to suite 3 or IPMI 1.5. Suites other than 3 and 17
+are rejected before activation.
 
-| Authentication algorithm | Supported |
-| :----------------------- | :-------- |
-| RAKP-HMAC-SHA1           | Yes       |
-| RAKP-None                | No        |
-| RAKP-HMAC-MD5            | No        |
-| RAKP-HMAC-SHA256         | No        |
+| Authentication algorithm | Supported      |
+| :----------------------- | :------------- |
+| RAKP-HMAC-SHA1           | Yes (suite 3)  |
+| RAKP-None                | No             |
+| RAKP-HMAC-MD5            | No             |
+| RAKP-HMAC-SHA256         | Yes (suite 17) |
 
-| Confidentiality algorithm | Supported |
-| :------------------------ | :-------- |
-| None                      | Yes       |
-| AES-CBC-128               | Yes       |
-| xRC4-128                  | No        |
-| xRC4-40                   | No        |
+| Confidentiality algorithm | Supported           |
+| :------------------------ | :------------------ |
+| None                      | Supported primitive |
+| AES-CBC-128               | Yes (suites 3, 17)  |
+| xRC4-128                  | No                  |
+| xRC4-40                   | No                  |
 
-| Integrity algorithm | Supported |
-| :------------------ | :-------- |
-| None                | Yes       |
-| HMAC-SHA1-96        | Yes       |
-| HMAC-MD5-128        | No        |
-| MD5-128             | No        |
-| HMAC-SHA256-128     | No        |
+| Integrity algorithm | Supported           |
+| :------------------ | :------------------ |
+| None                | Supported primitive |
+| HMAC-SHA1-96        | Yes (suite 3)       |
+| HMAC-MD5-128        | No                  |
+| MD5-128             | No                  |
+| HMAC-SHA256-128     | Yes (suite 17)      |
 
 ## License
 
