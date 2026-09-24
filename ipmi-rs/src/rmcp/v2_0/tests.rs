@@ -104,6 +104,111 @@ fn send_answer(peer: &UdpSocket, crypto: &mut CryptoState, message: Message) {
     peer.send(&wire).unwrap();
 }
 
+fn pair_suite17(timeout: Duration, provider: CryptoProvider) -> (State, UdpSocket, CryptoState) {
+    let (mut state, peer, _) = pair(timeout);
+    state.console_session_id = NonZeroU32::new(0x10203040).unwrap();
+    state.session_id = NonZeroU32::new(0x55667788).unwrap();
+    let username = Username::new("ADMIN").unwrap();
+    let request = RakpMessage1 {
+        message_tag: 13,
+        managed_system_session_id: state.session_id,
+        remote_console_random_number: core::array::from_fn(|i| i as u8),
+        requested_maximum_privilege_level: PrivilegeLevel::Administrator,
+        username: &username,
+    };
+    let rakp2_wire = hex::decode(concat!(
+        "0d00000040302010",
+        "101112131415161718191a1b1c1d1e1f",
+        "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+        "897e8b5e6a75f382aea006eff95c210f9f26edd01e5ea38f22fcc749f3ffdb10"
+    ))
+    .unwrap();
+    let response = RakpMessage2::from_data(&rakp2_wire).unwrap();
+    let negotiated = OpenSessionResponse {
+        message_tag: 0,
+        maximum_privilege_level: PrivilegeLevel::Administrator,
+        remote_console_session_id: state.console_session_id,
+        managed_system_session_id: state.session_id,
+        authentication_payload: AuthenticationAlgorithm::RakpHmacSha256,
+        integrity_payload: IntegrityAlgorithm::HmacSha256_128,
+        confidentiality_payload: ConfidentialityAlgorithm::AesCbc128,
+    };
+    let make_crypto = || {
+        let mut crypto =
+            CryptoState::new_with_provider(None, b"correct horse battery staple", provider);
+        assert!(crypto
+            .calculate_rakp3_data(&negotiated, &request, &response)
+            .unwrap()
+            .is_some());
+        crypto
+    };
+    state.state = make_crypto();
+    (state, peer, make_crypto())
+}
+
+fn encrypted_suite17_sol_and_ipmi_for(provider: CryptoProvider) {
+    let (mut state, peer, mut crypto) = pair_suite17(Duration::from_millis(250), provider);
+    state.sol_open();
+    let mut req = request();
+    state.send(&mut req).unwrap();
+    let outbound = read_secure(&peer, &mut crypto);
+    assert_eq!(outbound.ty, PayloadType::IpmiMessage);
+    assert_eq!(outbound.session_id, state.session_id.get());
+
+    send_answer(
+        &peer,
+        &mut crypto,
+        Message {
+            ty: PayloadType::Sol,
+            session_id: state.console_session_id.get(),
+            session_sequence_number: 1,
+            payload: vec![1, 0, 0, 0, b'S'],
+        },
+    );
+    send_answer(
+        &peer,
+        &mut crypto,
+        Message {
+            ty: PayloadType::IpmiMessage,
+            session_id: state.console_session_id.get(),
+            session_sequence_number: 2,
+            payload: response(0),
+        },
+    );
+    assert_eq!(state.recv().unwrap().seq(), 0);
+    let ack = read_secure(&peer, &mut crypto);
+    assert_eq!(ack.ty, PayloadType::Sol);
+    assert_eq!(ack.payload, [0, 1, 1, 0]);
+    let mut output = [0];
+    assert_eq!(state.sol_flow().read(&mut output), 1);
+    assert_eq!(output, [b'S']);
+
+    send_answer(
+        &peer,
+        &mut crypto,
+        Message {
+            ty: PayloadType::Sol,
+            session_id: state.console_session_id.get(),
+            session_sequence_number: 2,
+            payload: vec![2, 0, 0, 0, b'!'],
+        },
+    );
+    assert!(matches!(
+        state.poll_sol(
+            std::time::Instant::now() + Duration::from_millis(100),
+            false
+        ),
+        Err(RmcpIpmiReceiveError::InvalidSessionSequence)
+    ));
+}
+
+#[test]
+fn encrypted_suite17_sol_and_ipmi_share_authenticated_session() {
+    encrypted_suite17_sol_and_ipmi_for(CryptoProvider::RustCrypto);
+    #[cfg(feature = "symcrypt-backend")]
+    encrypted_suite17_sol_and_ipmi_for(CryptoProvider::SymCrypt);
+}
+
 #[test]
 fn valid_sha1_aes_udp_and_replay_policy() {
     let (mut state, peer, mut crypto) = pair(Duration::from_millis(250));
@@ -211,6 +316,50 @@ fn sol_dispatch_keeps_rmcp_identity_and_replay_checks() {
         ),
         Err(RmcpIpmiReceiveError::InvalidSessionSequence)
     ));
+    assert!(peer.recv(&mut [0; 4096]).is_err());
+}
+
+#[test]
+fn malformed_authenticated_sol_cannot_replay_its_session_sequence() {
+    let (mut state, peer, mut crypto) = pair(Duration::from_millis(100));
+    state.sol_open();
+    peer.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    send_answer(
+        &peer,
+        &mut crypto,
+        Message {
+            ty: PayloadType::Sol,
+            session_id: state.console_session_id.get(),
+            session_sequence_number: 1,
+            payload: vec![1, 0, 0, 0x80],
+        },
+    );
+    assert!(matches!(
+        state.poll_sol(
+            std::time::Instant::now() + Duration::from_millis(100),
+            false
+        ),
+        Err(RmcpIpmiReceiveError::Sol(SolFrameError::InvalidHeader))
+    ));
+    send_answer(
+        &peer,
+        &mut crypto,
+        Message {
+            ty: PayloadType::Sol,
+            session_id: state.console_session_id.get(),
+            session_sequence_number: 1,
+            payload: vec![1, 0, 0, 0, b'x'],
+        },
+    );
+    assert!(matches!(
+        state.poll_sol(
+            std::time::Instant::now() + Duration::from_millis(100),
+            false
+        ),
+        Err(RmcpIpmiReceiveError::InvalidSessionSequence)
+    ));
+    assert!(!state.sol_flow().has_output());
     assert!(peer.recv(&mut [0; 4096]).is_err());
 }
 
@@ -368,6 +517,74 @@ fn late_reply_is_drained_before_valid_reply_without_poisoning_next_request() {
 }
 
 #[test]
+fn late_reply_and_sol_output_before_correlated_reply() {
+    let (mut state, peer, mut crypto) = pair(Duration::from_millis(90));
+    state.sol_open();
+    let mut req = request();
+    let mut wire = [0; 4096];
+    state.send(&mut req).unwrap();
+    peer.recv(&mut wire).unwrap();
+    assert!(matches!(state.recv(), Err(RmcpIpmiReceiveError::Timeout)));
+
+    state.send(&mut req).unwrap();
+    peer.recv(&mut wire).unwrap();
+    // The late reply's newer session sequence must not retire the request
+    // or suppress an earlier, still-fresh SOL frame and correlated reply.
+    send_answer(
+        &peer,
+        &mut crypto,
+        Message {
+            ty: PayloadType::IpmiMessage,
+            session_id: state.console_session_id.get(),
+            session_sequence_number: 100,
+            payload: response(0),
+        },
+    );
+    send_answer(
+        &peer,
+        &mut crypto,
+        Message {
+            ty: PayloadType::Sol,
+            session_id: state.console_session_id.get(),
+            session_sequence_number: 1,
+            payload: vec![1, 0, 0, 0, b'X'],
+        },
+    );
+    send_answer(
+        &peer,
+        &mut crypto,
+        Message {
+            ty: PayloadType::IpmiMessage,
+            session_id: state.console_session_id.get(),
+            session_sequence_number: 2,
+            payload: response(1),
+        },
+    );
+    assert_eq!(state.recv().unwrap().seq(), 1);
+    let ack = read_secure(&peer, &mut crypto);
+    assert_eq!(ack.ty, PayloadType::Sol);
+    assert_eq!(ack.payload, [0, 1, 1, 0]); // no console-input characters
+    let mut output = [0; 2];
+    assert_eq!(state.sol_flow().read(&mut output), 1);
+    assert_eq!(output[0], b'X');
+    assert!(state.ipmb_state.pending.is_none());
+
+    state.send(&mut req).unwrap();
+    peer.recv(&mut wire).unwrap();
+    send_answer(
+        &peer,
+        &mut crypto,
+        Message {
+            ty: PayloadType::IpmiMessage,
+            session_id: state.console_session_id.get(),
+            session_sequence_number: 3,
+            payload: response(2),
+        },
+    );
+    assert_eq!(state.recv().unwrap().seq(), 2);
+}
+
+#[test]
 fn mismatched_reply_flood_is_bounded_and_pending_is_retired() {
     let (mut state, peer, mut crypto) = pair(Duration::from_millis(350));
     let mut req = request();
@@ -415,6 +632,163 @@ fn mismatched_reply_flood_is_bounded_and_pending_is_retired() {
         },
     );
     assert_eq!(state.recv().unwrap().seq(), 1);
+}
+
+#[test]
+fn mixed_sol_and_ipmi_flood_shares_pending_receive_budget() {
+    let (mut state, peer, mut crypto) = pair(Duration::from_millis(350));
+    state.sol_open();
+    let mut req = request();
+    let mut wire = [0; 4096];
+    state.send(&mut req).unwrap();
+    peer.recv(&mut wire).unwrap();
+    for seq in 1..=super::super::socket::MAX_UNRELATED as u32 {
+        send_answer(
+            &peer,
+            &mut crypto,
+            Message {
+                ty: if seq % 2 == 0 {
+                    PayloadType::Sol
+                } else {
+                    PayloadType::IpmiMessage
+                },
+                session_id: state.console_session_id.get(),
+                session_sequence_number: seq,
+                payload: if seq % 2 == 0 {
+                    vec![0, 0, 0, 0] // ACK-only: no output to interrupt the receive
+                } else {
+                    response(63)
+                },
+            },
+        );
+    }
+    assert!(matches!(
+        state.recv(),
+        Err(RmcpIpmiReceiveError::TooManyUnrelatedPackets)
+    ));
+    assert!(state.ipmb_state.pending.is_none());
+
+    state.send(&mut req).unwrap();
+    peer.recv(&mut wire).unwrap();
+    send_answer(
+        &peer,
+        &mut crypto,
+        Message {
+            ty: PayloadType::IpmiMessage,
+            session_id: state.console_session_id.get(),
+            session_sequence_number: 33,
+            payload: response(1),
+        },
+    );
+    assert_eq!(state.recv().unwrap().seq(), 1);
+}
+
+#[test]
+fn sol_poll_shares_budget_between_rmcp_and_ack_only_frames() {
+    let (mut state, peer, mut crypto) = pair(Duration::from_millis(350));
+    state.sol_open();
+    for seq in 1..=super::super::socket::MAX_UNRELATED as u32 {
+        if seq % 2 == 0 {
+            send_answer(
+                &peer,
+                &mut crypto,
+                Message {
+                    ty: PayloadType::Sol,
+                    session_id: state.console_session_id.get(),
+                    session_sequence_number: seq,
+                    payload: vec![0, 0, 0, 0],
+                },
+            );
+        } else {
+            peer.send(&[6, 0, 0xff, 6]).unwrap(); // unrelated ASF datagram
+        }
+    }
+    assert!(matches!(
+        state.poll_sol(
+            std::time::Instant::now() + Duration::from_millis(350),
+            false
+        ),
+        Err(RmcpIpmiReceiveError::TooManyUnrelatedPackets)
+    ));
+}
+
+#[test]
+fn encrypted_partial_sol_ack_rejects_changed_retransmission_suffix() {
+    let (mut state, peer, mut crypto) = pair(Duration::from_millis(350));
+    peer.set_read_timeout(Some(Duration::from_millis(350)))
+        .unwrap();
+    state.sol_open();
+
+    for session_seq in 1..=16u32 {
+        let sol_seq = ((session_seq - 1) % 15 + 1) as u8;
+        let mut data = vec![sol_seq, 0, 0, 0];
+        data.extend([b'x'; 255]);
+        send_answer(
+            &peer,
+            &mut crypto,
+            Message {
+                ty: PayloadType::Sol,
+                session_id: state.console_session_id.get(),
+                session_sequence_number: session_seq,
+                payload: data,
+            },
+        );
+        state
+            .poll_sol(
+                std::time::Instant::now() + Duration::from_millis(350),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            read_secure(&peer, &mut crypto).payload,
+            [0, sol_seq, 255, 0]
+        );
+    }
+
+    let mut partial = vec![2, 0, 0, 0];
+    partial.extend([b'a'; 17]);
+    send_answer(
+        &peer,
+        &mut crypto,
+        Message {
+            ty: PayloadType::Sol,
+            session_id: state.console_session_id.get(),
+            session_sequence_number: 17,
+            payload: partial.clone(),
+        },
+    );
+    state
+        .poll_sol(
+            std::time::Instant::now() + Duration::from_millis(350),
+            false,
+        )
+        .unwrap();
+    assert_eq!(read_secure(&peer, &mut crypto).payload, [0, 2, 16, 0x40]);
+    let mut delivered = vec![0; 4096];
+    assert_eq!(state.sol_flow().read(&mut delivered), 4096);
+
+    partial[20] = b'z'; // This byte was not accepted, but must still match the retry.
+    send_answer(
+        &peer,
+        &mut crypto,
+        Message {
+            ty: PayloadType::Sol,
+            session_id: state.console_session_id.get(),
+            session_sequence_number: 18,
+            payload: partial,
+        },
+    );
+    assert!(matches!(
+        state.poll_sol(
+            std::time::Instant::now() + Duration::from_millis(350),
+            false
+        ),
+        Err(RmcpIpmiReceiveError::Sol(
+            SolFrameError::ConflictingRetransmission
+        ))
+    ));
+    assert_eq!(read_secure(&peer, &mut crypto).payload, [0, 2, 0, 0x40]);
+    assert!(!state.sol_flow().has_output());
 }
 
 #[test]

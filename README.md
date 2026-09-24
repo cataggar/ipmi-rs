@@ -55,11 +55,10 @@ cargo run -p ipmi-rs --example chassis -- --address 192.0.2.10:623 --action cycl
 ```
 
 The example refuses to send commands if RMCP+ was requested but activation fell back to IPMI 1.5.
-Do not use remote mutations until the session/request validation and bounded failure handling
-tracked in #6 is available; controllers requiring cipher suite 17 also depend on #2. A lost,
-timed-out, or ambiguous control response means the **outcome is unknown**. Never automatically
-resend a power command, even for a "node busy" response. A later status read is useful for
-observation but cannot prove whether a cycle or reset occurred.
+A lost, timed-out, or ambiguous control response means the **outcome is unknown**.
+Never automatically resend a power command, even for a "node busy" response.
+A later status read is useful for observation but cannot prove whether a cycle
+or reset occurred.
 
 # Project structure
 
@@ -261,23 +260,24 @@ is sticky. Call `reset()` **after** the cancelled operation has returned before
 starting another one.
 
 An RMCP connection supports one pending request at a time. Active RMCP+ traffic
-requires the negotiated console session ID, SHA-1 integrity, and fresh, strictly
-increasing nonzero inbound session sequences; reordered packets (including SOL)
-are rejected. Outbound requests use the managed-system ID. IPMB replies must
+requires the negotiated console session ID, the selected suite's SHA-1 or
+SHA-256 integrity, and fresh, strictly increasing nonzero inbound session
+sequences; reordered packets (including SOL) are rejected. Outbound requests
+use the managed-system ID. IPMB replies must
 match the request's address, LUN, six-bit sequence, netfn and command and have
 both valid checksums. Bridged IPMB targets are not supported (explicit local BMC
 addresses on the primary/current channel are accepted). Datagram payloads
 over 4,096 bytes are rejected rather than silently truncated.
 
 Late or unrelated, well-formed replies are drained while awaiting the current
-request, with a shared cap of 32 unrelated datagrams per receive and the original
-absolute deadline. If no correlated reply arrives, the first mismatch is
-reported rather than silently accepted or replayed. Malformed packets still
-fail explicitly.
+request; valid SOL data is ACKed and retained for the capture/interactive reader.
+Both RMCP+ IPMI receives and SOL polling share a cap of 32 unrelated datagrams
+per operation and the original absolute deadline. If no correlated reply arrives,
+the first mismatch is reported rather than silently accepted or replayed.
+Malformed packets still fail explicitly.
 
 There are no implicit retransmissions of ordinary IPMI commands. In particular,
-`send_recv` can return
-`RmcpIpmiError::OutcomeUnknown` after a request was sent but its response was
+`send_recv` can return `RmcpIpmiError::OutcomeUnknown` after a request was sent but its response was
 lost, invalid, cancelled or timed out. Do **not** automatically retry a power,
 reset, boot, or other potentially mutating request. A deliberate retry of a
 safe read uses a new IPMB sequence. An ambiguous sequence is never reused within
@@ -295,8 +295,10 @@ which attempts set-complete cleanup even if writing or committing fails and
 reports both the original and cleanup failures. A failed write's outcome can
 still be uncertain; inspect `SolWriteError`.
 
-SOL requires an already authenticated **RMCP+ AES-CBC-128/HMAC-SHA1-96**
-connection. Enable `require_rmcp_plus(true)` *before* activation, then call
+SOL requires an already authenticated and encrypted RMCP+ connection using
+suite 3 (AES-CBC-128/HMAC-SHA1-96) or suite 17
+(AES-CBC-128/HMAC-SHA256-128), with either supported crypto backend.
+Enable `require_rmcp_plus(true)` *before* activation, then call
 `open_sol_capture(SolInstance::new(1).unwrap())` for a read-only capture or
 `open_sol_interactive(...)` only when console input is explicitly authorized.
 The activation request requires both SOL authentication and encryption; a BMC

@@ -14,7 +14,7 @@ use crate::{
 
 use super::{
     checksum::Checksum,
-    socket::{count_unrelated, recv_datagram, TransportPolicy, MAX_UNRELATED},
+    socket::{count_unrelated, recv_datagram, TransportPolicy},
     v1_5::State as V1_5State,
     v2_0::{CryptoProvider, State as V2_0State},
     ASFMessage, ASFMessageType, ActivationError, RmcpHeader, RmcpIpmiError, RmcpIpmiReceiveError,

@@ -638,6 +638,7 @@ impl State {
                 if self.sol.is_none() {
                     return Err(RmcpIpmiReceiveError::UnexpectedPayloadType);
                 }
+                self.last_inbound_sequence = Some(message.session_sequence_number);
                 let frame =
                     SolFrame::decode(&message.payload).map_err(RmcpIpmiReceiveError::Sol)?;
                 let flow = self.sol.as_mut().expect("SOL state checked");
@@ -662,7 +663,6 @@ impl State {
                         SolFrameError::OutputOverrun
                     }));
                 }
-                self.last_inbound_sequence = Some(message.session_sequence_number);
                 Ok(None)
             }
             _ => Err(RmcpIpmiReceiveError::UnexpectedPayloadType),
