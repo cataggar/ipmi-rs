@@ -27,7 +27,7 @@ impl<'a> RakpMessage2<'a> {
         }
 
         let message_tag = data[0];
-        let status_code = data[2];
+        let status_code = data[1];
 
         if status_code != 0 {
             return Err(ErrorStatusCode::try_from(status_code)
@@ -81,7 +81,7 @@ impl TryFrom<u8> for ErrorStatusCode {
         }
 
         let value = match value {
-            0x03 => ErrorStatusCode::InactiveSessionId,
+            0x08 => ErrorStatusCode::InactiveSessionId,
             0x09 => ErrorStatusCode::InvalidRole,
             0x0A => ErrorStatusCode::UnauthorizedRoleOrPrivilegeLevelRequested,
             0x0B => ErrorStatusCode::InsufficientResourcesToCreateSessionAtRequestedRole,
@@ -123,4 +123,18 @@ pub fn from_data() {
     };
 
     assert_eq!(expected, message);
+}
+
+#[test]
+fn error_status_is_byte_one_not_reserved_byte_two() {
+    assert!(matches!(
+        RakpMessage2::from_data(&[0, 8, 0, 0]),
+        Err(ParseError::ErrorStatusCode(
+            ErrorStatusCode::InactiveSessionId
+        ))
+    ));
+    assert!(matches!(
+        RakpMessage2::from_data(&[0, 0, 8, 0]),
+        Err(ParseError::NotEnoughData)
+    ));
 }

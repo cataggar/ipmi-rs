@@ -1,4 +1,4 @@
-mod sha1;
+pub(crate) mod sha1;
 mod sha256;
 
 mod keys;
@@ -21,4 +21,9 @@ pub enum CryptoUnwrapError {
     AuthCodeMismatch,
     IncorrectIntegrityTrailerLen,
     UnknownNextHeader(u8),
+    InvalidIntegrityPadding,
+    InvalidCiphertext,
+    UnsupportedIntegrityAlgorithm(IntegrityAlgorithm),
+    UnsupportedConfidentialityAlgorithm(ConfidentialityAlgorithm),
 }
+use ipmi_rs_core::app::auth::{ConfidentialityAlgorithm, IntegrityAlgorithm};

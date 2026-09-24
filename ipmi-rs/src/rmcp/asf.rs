@@ -12,7 +12,7 @@ impl TryFrom<u8> for SupportedInteractions {
         let dmtf_dash = (value & 0x10) == 0x10;
 
         // All of these bits must be 0
-        if (value & 0b0101_1111) != 0 {
+        if (value & 0b0110_1111) != 0 {
             return Err(());
         }
 
@@ -78,13 +78,16 @@ impl ASFMessageType {
             return None;
         }
 
-        let data_len = data[0];
+        let data_len = usize::from(data[0]);
+        if data.len() != data_len + 1 {
+            return None;
+        }
 
         let data = match type_byte {
             0x80 if data_len == 0 => Self::Ping,
             0x40 if data_len == 0x10 => {
-                let enterprise_number = u32::from_be_bytes(data[1..5].try_into().unwrap());
-                let oem_data = u32::from_be_bytes(data[5..9].try_into().unwrap());
+                let enterprise_number = u32::from_be_bytes(data.get(1..5)?.try_into().ok()?);
+                let oem_data = u32::from_be_bytes(data.get(5..9)?.try_into().ok()?);
                 let supported_entities = SupportedEntities::from(data[9]);
                 let supported_interactions = SupportedInteractions::try_from(data[10]).ok()?;
 
@@ -116,8 +119,8 @@ impl ASFMessageType {
             } => {
                 // Data length
                 buffer.push(0x10);
-                buffer.extend_from_slice(&enterprise_number.to_le_bytes());
-                buffer.extend_from_slice(&oem_data.to_le_bytes());
+                buffer.extend_from_slice(&enterprise_number.to_be_bytes());
+                buffer.extend_from_slice(&oem_data.to_be_bytes());
                 buffer.extend_from_slice(&[
                     u8::from(*supported_entities),
                     u8::from(*supported_interactions),
@@ -170,3 +173,6 @@ impl ASFMessage {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

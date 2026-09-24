@@ -52,12 +52,16 @@ impl CryptoState {
         }
     }
 
-    pub fn calculate_rakp3_data(&mut self, osr: &OSR, m1: &RM1, m2: &RM2) -> Option<Vec<u8>> {
+    pub fn calculate_rakp3_data(
+        &mut self,
+        osr: &OSR,
+        m1: &RM1,
+        m2: &RM2,
+    ) -> Result<Option<Vec<u8>>, AuthenticationAlgorithm> {
         match osr.authentication_payload {
-            AuthenticationAlgorithm::RakpNone => None,
-            AuthenticationAlgorithm::RakpHmacSha1 => self.validate_hmac_sha1(osr, m1, m2),
-            AuthenticationAlgorithm::RakpHmacMd5 => None,
-            AuthenticationAlgorithm::RakpHmacSha256 => self.validate_hmac_sha256(osr, m1, m2),
+            AuthenticationAlgorithm::RakpHmacSha1 => Ok(self.validate_hmac_sha1(osr, m1, m2)),
+            AuthenticationAlgorithm::RakpHmacSha256 => Ok(self.validate_hmac_sha256(osr, m1, m2)),
+            unsupported => Err(unsupported),
         }
     }
 
@@ -68,9 +72,8 @@ impl CryptoState {
         managed_system_session_id: u32,
         managed_system_guid: &[u8; 16],
         integrity_check_value: &[u8],
-    ) -> bool {
+    ) -> Result<bool, AuthenticationAlgorithm> {
         match algorithm {
-            AuthenticationAlgorithm::RakpNone => integrity_check_value.is_empty(),
             AuthenticationAlgorithm::RakpHmacSha1 => {
                 let integrity = &Sha1Hmac::new(&self.state.keys.sik)
                     .feed(remote_console_random_number)
@@ -78,10 +81,9 @@ impl CryptoState {
                     .feed(managed_system_guid)
                     .finalize()[..12];
 
-                integrity_check_value.len() == integrity.len()
-                    && bool::from(integrity_check_value.ct_eq(integrity))
+                Ok(integrity_check_value.len() == integrity.len()
+                    && integrity_check_value.ct_eq(integrity).unwrap_u8() == 1)
             }
-            AuthenticationAlgorithm::RakpHmacMd5 => false,
             AuthenticationAlgorithm::RakpHmacSha256 => {
                 let integrity = Sha256Hmac::new(&self.state.keys.sik)
                     .feed(remote_console_random_number)
@@ -89,9 +91,10 @@ impl CryptoState {
                     .feed(managed_system_guid)
                     .finalize();
 
-                integrity_check_value.len() == 16
-                    && bool::from(integrity_check_value.ct_eq(&integrity[..16]))
+                Ok(integrity_check_value.len() == 16
+                    && integrity_check_value.ct_eq(&integrity[..16]).unwrap_u8() == 1)
             }
+            unsupported => Err(unsupported),
         }
     }
 
@@ -109,7 +112,7 @@ impl CryptoState {
             .finalize();
 
         if m2.key_exchange_auth_code.len() == hmac_output.len()
-            && bool::from(m2.key_exchange_auth_code.ct_eq(&hmac_output[..]))
+            && m2.key_exchange_auth_code.ct_eq(&hmac_output).unwrap_u8() == 1
         {
             let sik = Sha1Hmac::new(self.kg())
                 .feed(&m1.remote_console_random_number)

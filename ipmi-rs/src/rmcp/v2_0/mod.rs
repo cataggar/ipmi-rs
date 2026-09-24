@@ -1,4 +1,4 @@
-use std::{num::NonZeroU32, ops::Add};
+use std::num::NonZeroU32;
 
 use crate::app::auth::PrivilegeLevel;
 
@@ -6,9 +6,10 @@ mod crypto;
 use crypto::CryptoState;
 
 mod messages;
-use ipmi_rs_core::{
-    app::auth::{AuthenticationAlgorithm, CipherSuite},
-    connection::Response,
+#[cfg(test)]
+mod tests;
+use ipmi_rs_core::app::auth::{
+    AuthenticationAlgorithm, CipherSuite, ConfidentialityAlgorithm, IntegrityAlgorithm,
 };
 pub(super) use messages::*;
 pub use messages::{
@@ -31,6 +32,10 @@ pub enum ValidateSessionResponseError {
         requested: CipherSuite,
         received: [u8; 3],
     },
+    PrivilegeLevelMismatch,
+    AuthenticationAlgorithmMismatch(AuthenticationAlgorithm),
+    IntegrityAlgorithmMismatch(IntegrityAlgorithm),
+    ConfidentialityAlgorithmMismatch(ConfidentialityAlgorithm),
 }
 
 #[derive(Debug)]
@@ -42,6 +47,7 @@ pub enum ValidateRakpMessage2Error {
 #[derive(Debug)]
 pub enum ValidateRakpMessage4Error {
     MessageTagMismatch,
+    /// The RAKP4 wire field is the console ID, despite its legacy field name.
     RemoteConsoleSessionIdMismatch,
     ManagedSystemSessionIdMismatch,
 }
@@ -68,6 +74,9 @@ pub enum ActivationError {
     RakpMessage4Validate(ValidateRakpMessage4Error),
     RakpMessage4InvalidIntegrityCheckValue,
     ServerAuthenticationFailed,
+    UnsupportedAuthenticationAlgorithm(AuthenticationAlgorithm),
+    UnexpectedPayloadType(PayloadType),
+    UnexpectedSessionHeader,
 }
 
 impl From<ParseSessionResponseError> for ActivationError {
@@ -97,8 +106,14 @@ impl From<ValidateRakpMessage4Error> for ActivationError {
 #[derive(Debug)]
 pub enum WriteError {
     Io(std::io::Error),
+    Random(getrandom::Error),
     PayloadTooLong,
     EncryptedPayloadTooLong,
+    InvalidEncryptionLength,
+    UnsupportedIntegrityAlgorithm(IntegrityAlgorithm),
+    UnsupportedConfidentialityAlgorithm(ConfidentialityAlgorithm),
+    Cancelled,
+    DeadlineExpired,
 }
 
 impl From<std::io::Error> for WriteError {
@@ -182,6 +197,8 @@ pub struct State {
     socket: RmcpIpmiSocket,
     session_id: NonZeroU32,
     session_sequence_number: NonZeroU32,
+    console_session_id: NonZeroU32,
+    last_inbound_sequence: Option<u32>,
     state: CryptoState,
     ipmb_state: IpmbState,
 }
@@ -217,7 +234,12 @@ impl State {
         if resp.remote_console_session_id != req.remote_console_session_id {
             return Err(ValidateSessionResponseError::RemoteConsoleSessionIdMismatch);
         }
-
+        if req
+            .requested_max_privilege
+            .is_some_and(|level| level != resp.maximum_privilege_level)
+        {
+            return Err(ValidateSessionResponseError::PrivilegeLevelMismatch);
+        }
         let requested = [
             u8::from(req.authentication_algorithms),
             u8::from(req.integrity_algorithms),
@@ -228,13 +250,31 @@ impl State {
             u8::from(resp.integrity_payload),
             u8::from(resp.confidentiality_payload),
         ];
-        if received != requested {
+        if requested == CipherSuite::Id17.into_suite() && received != requested {
             return Err(
                 ValidateSessionResponseError::NegotiatedCipherSuiteMismatch {
-                    requested: CipherSuite::from_suite(requested)
-                        .expect("requested suite is defined"),
+                    requested: CipherSuite::Id17,
                     received,
                 },
+            );
+        }
+        if resp.authentication_payload != req.authentication_algorithms {
+            return Err(
+                ValidateSessionResponseError::AuthenticationAlgorithmMismatch(
+                    resp.authentication_payload,
+                ),
+            );
+        }
+        if resp.integrity_payload != req.integrity_algorithms {
+            return Err(ValidateSessionResponseError::IntegrityAlgorithmMismatch(
+                resp.integrity_payload,
+            ));
+        }
+        if resp.confidentiality_payload != req.confidentiality_algorithms {
+            return Err(
+                ValidateSessionResponseError::ConfidentialityAlgorithmMismatch(
+                    resp.confidentiality_payload,
+                ),
             );
         }
 
@@ -288,6 +328,16 @@ impl State {
         Ok(())
     }
 
+    fn validate_handshake(message: &Message, expected: PayloadType) -> Result<(), ActivationError> {
+        if message.ty != expected {
+            return Err(ActivationError::UnexpectedPayloadType(message.ty));
+        }
+        if message.session_id != 0 || message.session_sequence_number != 0 {
+            return Err(ActivationError::UnexpectedSessionHeader);
+        }
+        Ok(())
+    }
+
     pub fn activate(
         state: v1_5::State,
         privilege_level: Option<PrivilegeLevel>,
@@ -309,6 +359,13 @@ impl State {
             ty: PayloadType,
             payload: Vec<u8>,
         ) -> Result<(), WriteError> {
+            if socket.cancellation_token().is_cancelled() {
+                return Err(WriteError::Cancelled);
+            }
+            let deadline = socket.deadline();
+            if deadline <= std::time::Instant::now() {
+                return Err(WriteError::DeadlineExpired);
+            }
             let message = Message {
                 ty,
                 session_id: 0,
@@ -316,7 +373,9 @@ impl State {
                 payload,
             };
 
-            socket.send(|buffer| CryptoState::write_unencrypted(&message, buffer))
+            socket.send(deadline, |buffer| {
+                CryptoState::write_unencrypted(&message, buffer)
+            })
         }
 
         fn recv(data: &mut [u8]) -> Result<Message, UnwrapSessionError> {
@@ -325,7 +384,7 @@ impl State {
                 .map_err(UnwrapSessionError::V2_0)
         }
 
-        let mut socket = RmcpIpmiSocket::new(state.release_socket());
+        let mut socket = state.release_socket();
 
         let remote_console_session_id: NonZeroU32 = rng.gen();
 
@@ -348,6 +407,7 @@ impl State {
             .map_err(ActivationError::OpenSessionResponseReceive)?;
 
         let response_data = recv(data).map_err(ActivationError::OpenSessionResponseRead)?;
+        Self::validate_handshake(&response_data, PayloadType::RmcpPlusOpenSessionResponse)?;
 
         let response = match OpenSessionResponse::from_data(&response_data.payload) {
             Ok(r) => r,
@@ -368,7 +428,8 @@ impl State {
             message_tag: 0x0D,
             managed_system_session_id: response.managed_system_session_id,
             remote_console_random_number: random_data,
-            requested_maximum_privilege_level: PrivilegeLevel::Administrator,
+            requested_maximum_privilege_level: privilege_level
+                .unwrap_or(response.maximum_privilege_level),
             username,
         };
 
@@ -385,6 +446,7 @@ impl State {
             .map_err(ActivationError::RakpMessage2Receive)?;
 
         let v2_message = recv(data).map_err(ActivationError::RakpMessage2Read)?;
+        Self::validate_handshake(&v2_message, PayloadType::RakpMessage2)?;
         let rm2 = RakpMessage2::from_data(&v2_message.payload)
             .map_err(ActivationError::RakpMessage2Parse)?;
 
@@ -409,7 +471,9 @@ impl State {
         }
 
         let mut crypto_state = CryptoState::new(None, password);
-        let message_3_value = crypto_state.calculate_rakp3_data(&response, &rm1, &rm2);
+        let message_3_value = crypto_state
+            .calculate_rakp3_data(&response, &rm1, &rm2)
+            .map_err(ActivationError::UnsupportedAuthenticationAlgorithm)?;
 
         let rm3 = if let Some(m3) = message_3_value.as_ref() {
             RakpMessage3 {
@@ -446,6 +510,7 @@ impl State {
             .map_err(ActivationError::RakpMessage4Receive)?;
 
         let message = recv(data).map_err(ActivationError::RakpMessage4Read)?;
+        Self::validate_handshake(&message, PayloadType::RakpMessage4)?;
         let rm4 = RakpMessage4::from_data(&message.payload)
             .map_err(ActivationError::RakpMessage4Parse)?;
 
@@ -458,40 +523,59 @@ impl State {
             rm4.integrity_check_value.len(),
         )?;
 
-        if !crypto_state.verify(
-            response.authentication_payload,
-            &rm1.remote_console_random_number,
-            rm3.managed_system_session_id.get(),
-            &rm2.managed_system_guid,
-            rm4.integrity_check_value,
-        ) {
+        if !crypto_state
+            .verify(
+                response.authentication_payload,
+                &rm1.remote_console_random_number,
+                rm3.managed_system_session_id.get(),
+                &rm2.managed_system_guid,
+                rm4.integrity_check_value,
+            )
+            .map_err(ActivationError::UnsupportedAuthenticationAlgorithm)?
+        {
             log::error!("Received incorrect/invalid integrity check value in RAKP Message 4.");
             return Err(ActivationError::RakpMessage4InvalidIntegrityCheckValue);
         }
 
         let session_id = rm3.managed_system_session_id;
-        let session_sequence_number = NonZeroU32::new(1).unwrap();
+        let session_sequence_number = NonZeroU32::MIN;
+        socket.clear_activation_deadline();
 
         Ok(Self {
             socket,
             session_id,
             session_sequence_number,
+            console_session_id: remote_console_session_id,
+            last_inbound_sequence: None,
             state: crypto_state,
             ipmb_state: IpmbState::default(),
         })
     }
 
     pub fn send(&mut self, request: &mut crate::connection::Request) -> Result<(), RmcpIpmiError> {
+        if self.socket.cancellation_token().is_cancelled() {
+            return Err(RmcpIpmiError::Send(super::RmcpIpmiSendError::Cancelled));
+        }
+        let deadline = self.socket.deadline();
+        if deadline <= std::time::Instant::now() {
+            return Err(RmcpIpmiError::Send(
+                super::RmcpIpmiSendError::DeadlineExpired,
+            ));
+        }
         let session_sequence_number = self.session_sequence_number.get();
 
         if session_sequence_number == u32::MAX {
-            todo!("Handle wrapping session number by re-activating?");
+            return Err(RmcpIpmiError::Send(
+                super::RmcpIpmiSendError::SessionSequenceExhausted,
+            ));
         }
 
-        self.session_sequence_number =
-            NonZeroU32::new(self.session_sequence_number.get().add(1)).unwrap();
-
-        let payload = super::internal::next_ipmb_message(request, &mut self.ipmb_state);
+        let payload = self
+            .ipmb_state
+            .begin(request, deadline)
+            .map_err(RmcpIpmiError::Send)?;
+        self.session_sequence_number = NonZeroU32::new(session_sequence_number + 1)
+            .expect("checked session sequence exhaustion");
 
         let message = Message {
             ty: PayloadType::IpmiMessage,
@@ -500,50 +584,47 @@ impl State {
             payload,
         };
 
-        self.socket
-            .send(|buffer| self.state.write_message(&message, buffer))
-            .unwrap();
+        let sent = self.socket.send(deadline, |buffer| {
+            self.state.write_message(&message, buffer)
+        });
+        if sent.is_err() {
+            self.ipmb_state.retire_pending();
+        }
+        sent.map_err(|e| RmcpIpmiError::Send(e.into()))?;
 
         Ok(())
     }
 
-    // TODO: validate session sequence number
-    // TODO: Validate session sequence ID
     pub fn recv(&mut self) -> Result<crate::connection::Response, RmcpIpmiReceiveError> {
-        let data = self.socket.recv()?;
-
-        let data = self
-            .state
-            .read_payload(data)
-            .map_err(|e| RmcpIpmiReceiveError::Session(UnwrapSessionError::V2_0(e)))?
-            .payload;
-
-        if data.len() < 7 {
-            return Err(RmcpIpmiReceiveError::NotEnoughData);
-        }
-
-        let _req_addr = data[0];
-        let netfn = data[1] >> 2;
-        let _checksum1 = data[2];
-        let _rs_addr = data[3];
-        let _rqseq = data[4];
-        let cmd = data[5];
-        let response_data: Vec<_> = data[6..data.len() - 1].to_vec();
-        let _checksum2 = data[data.len() - 1];
-
-        // TODO: validate sequence, checksums, etc.
-
-        let response = if let Some(resp) = Response::new(
-            crate::connection::Message::new_raw(netfn, cmd, response_data),
-            0,
-        ) {
-            resp
-        } else {
-            // TODO: need better message here :)
-            return Err(RmcpIpmiReceiveError::EmptyMessage);
-        };
-
-        Ok(response)
+        let deadline = self
+            .ipmb_state
+            .pending
+            .ok_or(RmcpIpmiReceiveError::NoPendingRequest)?
+            .deadline;
+        let result = (|| {
+            let data = self.socket.recv_until(deadline)?;
+            let message = self
+                .state
+                .read_payload(data)
+                .map_err(|e| RmcpIpmiReceiveError::Session(UnwrapSessionError::V2_0(e)))?;
+            if message.ty != PayloadType::IpmiMessage {
+                return Err(RmcpIpmiReceiveError::UnexpectedPayloadType);
+            }
+            if message.session_id != self.console_session_id.get() {
+                return Err(RmcpIpmiReceiveError::SessionIdMismatch);
+            }
+            if message.session_sequence_number == 0
+                || self
+                    .last_inbound_sequence
+                    .is_some_and(|last| message.session_sequence_number <= last)
+            {
+                return Err(RmcpIpmiReceiveError::InvalidSessionSequence);
+            }
+            self.last_inbound_sequence = Some(message.session_sequence_number);
+            self.ipmb_state.receive(&message.payload)
+        })();
+        self.ipmb_state.retire_pending();
+        result
     }
 
     pub fn send_recv(
@@ -551,12 +632,12 @@ impl State {
         request: &mut crate::connection::Request,
     ) -> Result<crate::connection::Response, RmcpIpmiError> {
         self.send(request)?;
-        self.recv().map_err(Into::into)
+        self.recv().map_err(RmcpIpmiError::OutcomeUnknown)
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod suite17_tests {
     use super::*;
     use ipmi_rs_core::app::auth::{ConfidentialityAlgorithm, IntegrityAlgorithm};
 

@@ -279,3 +279,28 @@ pub fn from_data() {
 
     assert_eq!(message, expected);
 }
+
+#[test]
+fn response_truncation_and_algorithm_lengths() {
+    let valid = [
+        0, 0, 4, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 8, 1, 0, 0, 0, 1, 0, 0, 8, 1, 0, 0, 0, 2, 0,
+        0, 8, 1, 0, 0, 0,
+    ];
+    assert!(OpenSessionResponse::from_data(&valid).is_ok());
+    for end in 0..valid.len() {
+        assert!(
+            OpenSessionResponse::from_data(&valid[..end]).is_err(),
+            "truncation at {end}"
+        );
+    }
+    for index in [15, 23, 31] {
+        let mut malformed = valid;
+        malformed[index] = 7;
+        assert!(matches!(
+            OpenSessionResponse::from_data(&malformed),
+            Err(ParseSessionResponseError::AlgorithmPayloadError(
+                AlgorithmPayloadError::IncorrectPayloadLenValue
+            ))
+        ));
+    }
+}

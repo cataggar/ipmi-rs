@@ -191,6 +191,36 @@ are rejected before activation.
 | MD5-128             | No                  |
 | HMAC-SHA256-128     | Yes (suite 17)      |
 
+### RMCP operational behavior
+
+`Rmcp::new(remote, timeout)` uses the timeout as a monotonic deadline for the
+entire activation handshake and for each request/response transaction (not as a
+timeout that restarts after every packet). For operations that must not downgrade
+to IPMI 1.5, call `connection.require_rmcp_plus(true)` before
+`connection.activate(true, username, password)`.
+
+`connection.cancellation_token()` returns a cloneable signal; call `cancel()` from
+another thread to interrupt a receive (polled at most every 50 ms). The signal
+is sticky. Call `reset()` **after** the cancelled operation has returned before
+starting another one.
+
+An RMCP connection supports one pending request at a time. Active RMCP+ traffic
+requires the negotiated console session ID, SHA-1 integrity, and fresh, strictly
+increasing nonzero inbound session sequences; reordered packets (including SOL)
+are rejected. Outbound requests use the managed-system ID. IPMB replies must
+match the request's address, LUN, six-bit sequence, netfn and command and have
+both valid checksums. Bridged IPMB targets are not supported (explicit local BMC
+addresses on the primary/current channel are accepted). Datagram payloads
+over 4,096 bytes are rejected rather than silently truncated.
+
+There are no implicit retransmissions. In particular, `send_recv` can return
+`RmcpIpmiError::OutcomeUnknown` after a request was sent but its response was
+lost, invalid, cancelled or timed out. Do **not** automatically retry a power,
+reset, boot, or other potentially mutating request. A deliberate retry of a
+safe read uses a new IPMB sequence. An ambiguous sequence is never reused within
+the session; if all available correlation sequences are consumed, activate a
+fresh session.
+
 ## License
 
 All source code (including code snippets) is licensed under either of

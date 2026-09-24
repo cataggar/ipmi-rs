@@ -1,4 +1,4 @@
-use std::{net::UdpSocket, num::NonZeroU32};
+use std::{net::UdpSocket, num::NonZeroU32, time::Instant};
 
 use crate::{
     app::auth::{
@@ -10,8 +10,8 @@ use crate::{
 };
 
 use super::{
-    internal::{validate_ipmb_checksums, IpmbState},
-    socket::RmcpIpmiSocket,
+    internal::IpmbState,
+    socket::{RmcpIpmiSocket, TransportPolicy},
     RmcpIpmiError, RmcpIpmiReceiveError, RmcpIpmiSendError,
 };
 
@@ -66,6 +66,8 @@ pub struct State {
     auth_type: crate::app::auth::AuthType,
     password: Option<[u8; 16]>,
     session_sequence: u32,
+    last_inbound_sequence: Option<u32>,
+    activated: bool,
 }
 
 impl core::fmt::Debug for State {
@@ -82,19 +84,29 @@ impl core::fmt::Debug for State {
 }
 
 impl State {
-    pub fn new(socket: UdpSocket) -> Self {
+    pub fn new(
+        socket: UdpSocket,
+        policy: TransportPolicy,
+        activation_deadline: Option<Instant>,
+    ) -> Self {
         Self {
-            socket: RmcpIpmiSocket::new(socket),
+            socket: RmcpIpmiSocket::new(socket, policy, activation_deadline),
             ipmb_state: IpmbState::default(),
             auth_type: AuthType::None,
             password: None,
             session_id: None,
             session_sequence: 0,
+            last_inbound_sequence: None,
+            activated: false,
         }
     }
 
-    pub fn release_socket(self) -> UdpSocket {
-        self.socket.release()
+    pub fn release_socket(self) -> RmcpIpmiSocket {
+        self.socket
+    }
+
+    pub fn require_rmcp_plus(&self) -> bool {
+        self.socket.require_rmcp_plus()
     }
 
     pub fn activate(
@@ -158,6 +170,9 @@ impl State {
 
         self.session_sequence = activation_info.initial_sequence_number;
         self.session_id = Some(activation_info.session_id);
+        self.last_inbound_sequence = None;
+        self.activated = true;
+        self.socket.clear_activation_deadline();
 
         assert_eq!(activate_session.auth_type, activation_auth_type);
 
@@ -174,16 +189,25 @@ impl IpmiConnection for State {
 
     fn send(&mut self, request: &mut Request) -> Result<(), RmcpIpmiSendError> {
         log::trace!("Sending message with auth type {:?}", self.auth_type);
+        if self.socket.cancellation_token().is_cancelled() {
+            return Err(RmcpIpmiSendError::Cancelled);
+        }
+        let deadline = self.socket.deadline();
+        if deadline <= Instant::now() {
+            return Err(RmcpIpmiSendError::DeadlineExpired);
+        }
 
         let request_sequence = &mut self.session_sequence;
+        if self.session_id.is_some() && *request_sequence == u32::MAX {
+            return Err(RmcpIpmiSendError::SessionSequenceExhausted);
+        }
+        let final_data = self.ipmb_state.begin(request, deadline)?;
 
         // Only increment the request sequence once a session has been established
         // successfully.
         if self.session_id.is_some() {
-            *request_sequence = request_sequence.wrapping_add(1);
+            *request_sequence += 1;
         }
-
-        let final_data = super::internal::next_ipmb_message(request, &mut self.ipmb_state);
 
         let message = Message {
             auth_type: self.auth_type,
@@ -203,11 +227,15 @@ impl IpmiConnection for State {
             }
         }
 
-        match self.socket.send(|buffer| {
+        let sent = self.socket.send(deadline, |buffer| {
             message
                 .write_data(self.password.as_ref(), buffer)
                 .map_err(Send::Ipmi)
-        }) {
+        });
+        if sent.is_err() {
+            self.ipmb_state.retire_pending();
+        }
+        match sent {
             Ok(()) => Ok(()),
             Err(Send::Ipmi(ipmi)) => Err(RmcpIpmiSendError::V1_5(ipmi)),
             Err(Send::Io(io)) => Err(RmcpIpmiSendError::V1_5(WriteError::Io(io))),
@@ -215,45 +243,39 @@ impl IpmiConnection for State {
     }
 
     fn recv(&mut self) -> Result<Response, RmcpIpmiReceiveError> {
-        let data = self.socket.recv()?;
-
-        let data = Message::from_data(self.password.as_ref(), data)
-            .map_err(|e| RmcpIpmiReceiveError::Session(super::UnwrapSessionError::V1_5(e)))?
-            .payload;
-
-        if data.len() < 7 {
-            return Err(RmcpIpmiReceiveError::NotEnoughData);
-        }
-
-        let _req_addr = data[0];
-        let netfn = data[1] >> 2;
-        let _checksum1 = data[2];
-        let _rs_addr = data[3];
-        let _rqseq = data[4];
-        let cmd = data[5];
-        let response_data: Vec<_> = data[6..data.len() - 1].to_vec();
-        let _checksum2 = data[data.len() - 1];
-
-        if !validate_ipmb_checksums(&data) {
-            return Err(RmcpIpmiReceiveError::IpmbChecksumFailed);
-        }
-
-        // TODO: validate sequence number
-
-        if let Some(resp) = Response::new(
-            crate::connection::Message::new_raw(netfn, cmd, response_data),
-            0,
-        ) {
-            Ok(resp)
-        } else {
-            // TODO: need better message here :)
-            Err(RmcpIpmiReceiveError::EmptyMessage)
-        }
+        let deadline = self
+            .ipmb_state
+            .pending
+            .ok_or(RmcpIpmiReceiveError::NoPendingRequest)?
+            .deadline;
+        let result = (|| {
+            let data = self.socket.recv_until(deadline)?;
+            let message = Message::from_data(self.password.as_ref(), data)
+                .map_err(|e| RmcpIpmiReceiveError::Session(super::UnwrapSessionError::V1_5(e)))?;
+            if let Some(session_id) = self.session_id {
+                if message.session_id != session_id.get() || message.auth_type != self.auth_type {
+                    return Err(RmcpIpmiReceiveError::SessionIdMismatch);
+                }
+                if self.activated {
+                    if message.session_sequence_number == 0
+                        || self
+                            .last_inbound_sequence
+                            .is_some_and(|last| message.session_sequence_number <= last)
+                    {
+                        return Err(RmcpIpmiReceiveError::InvalidSessionSequence);
+                    }
+                    self.last_inbound_sequence = Some(message.session_sequence_number);
+                }
+            }
+            self.ipmb_state.receive(&message.payload)
+        })();
+        self.ipmb_state.retire_pending();
+        result
     }
 
     fn send_recv(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         self.send(request)?;
-        let response = self.recv()?;
+        let response = self.recv().map_err(RmcpIpmiError::OutcomeUnknown)?;
         Ok(response)
     }
 }
