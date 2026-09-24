@@ -1,7 +1,11 @@
 use ipmi_rs_core::app::auth::AuthenticationAlgorithm;
+use subtle::ConstantTimeEq;
 
 use crate::rmcp::{
-    v2_0::{crypto::sha1::Sha1Hmac, ReadError, WriteError},
+    v2_0::{
+        crypto::{sha1::Sha1Hmac, sha256::Sha256Hmac},
+        ReadError, WriteError,
+    },
     Message, OpenSessionResponse as OSR, RakpMessage1 as RM1, RakpMessage2 as RM2,
 };
 
@@ -9,7 +13,7 @@ use super::{keys::Keys, SubState};
 
 pub struct CryptoState {
     password: Vec<u8>,
-    kg: Option<[u8; 20]>,
+    kg: Option<Vec<u8>>,
     state: SubState,
 }
 
@@ -40,9 +44,9 @@ impl CryptoState {
 }
 
 impl CryptoState {
-    pub fn new(kg: Option<[u8; 20]>, password: &[u8]) -> Self {
+    pub fn new(kg: Option<&[u8]>, password: &[u8]) -> Self {
         Self {
-            kg,
+            kg: kg.map(ToOwned::to_owned),
             password: password.to_vec(),
             state: SubState::empty(),
         }
@@ -50,10 +54,10 @@ impl CryptoState {
 
     pub fn calculate_rakp3_data(&mut self, osr: &OSR, m1: &RM1, m2: &RM2) -> Option<Vec<u8>> {
         match osr.authentication_payload {
-            AuthenticationAlgorithm::RakpNone => todo!(),
+            AuthenticationAlgorithm::RakpNone => None,
             AuthenticationAlgorithm::RakpHmacSha1 => self.validate_hmac_sha1(osr, m1, m2),
-            AuthenticationAlgorithm::RakpHmacMd5 => todo!(),
-            AuthenticationAlgorithm::RakpHmacSha256 => todo!(),
+            AuthenticationAlgorithm::RakpHmacMd5 => None,
+            AuthenticationAlgorithm::RakpHmacSha256 => self.validate_hmac_sha256(osr, m1, m2),
         }
     }
 
@@ -74,10 +78,20 @@ impl CryptoState {
                     .feed(managed_system_guid)
                     .finalize()[..12];
 
-                integrity_check_value == integrity
+                integrity_check_value.len() == integrity.len()
+                    && bool::from(integrity_check_value.ct_eq(integrity))
             }
-            AuthenticationAlgorithm::RakpHmacMd5 => todo!(),
-            AuthenticationAlgorithm::RakpHmacSha256 => todo!(),
+            AuthenticationAlgorithm::RakpHmacMd5 => false,
+            AuthenticationAlgorithm::RakpHmacSha256 => {
+                let integrity = Sha256Hmac::new(&self.state.keys.sik)
+                    .feed(remote_console_random_number)
+                    .feed(&managed_system_session_id.to_le_bytes())
+                    .feed(managed_system_guid)
+                    .finalize();
+
+                integrity_check_value.len() == 16
+                    && bool::from(integrity_check_value.ct_eq(&integrity[..16]))
+            }
         }
     }
 
@@ -94,7 +108,9 @@ impl CryptoState {
             .feed(m1.username)
             .finalize();
 
-        if hmac_output == m2.key_exchange_auth_code {
+        if m2.key_exchange_auth_code.len() == hmac_output.len()
+            && bool::from(m2.key_exchange_auth_code.ct_eq(&hmac_output[..]))
+        {
             let sik = Sha1Hmac::new(self.kg())
                 .feed(&m1.remote_console_random_number)
                 .feed(&m2.managed_system_random_number)
@@ -122,6 +138,49 @@ impl CryptoState {
             None
         }
     }
+
+    fn validate_hmac_sha256(&mut self, osr: &OSR, m1: &RM1, m2: &RM2) -> Option<Vec<u8>> {
+        let privilege_level_byte = u8::from(m1.requested_maximum_privilege_level);
+        let role_and_username_len = [privilege_level_byte, m1.username.len()];
+
+        let hmac_output = Sha256Hmac::new(&self.password)
+            .feed(&m2.remote_console_session_id.get().to_le_bytes())
+            .feed(&m1.managed_system_session_id.get().to_le_bytes())
+            .feed(&m1.remote_console_random_number)
+            .feed(&m2.managed_system_random_number)
+            .feed(&m2.managed_system_guid)
+            .feed(&role_and_username_len)
+            .feed(m1.username)
+            .finalize();
+
+        if m2.key_exchange_auth_code.len() != hmac_output.len()
+            || !bool::from(m2.key_exchange_auth_code.ct_eq(&hmac_output[..]))
+        {
+            return None;
+        }
+
+        let sik = Sha256Hmac::new(self.kg())
+            .feed(&m1.remote_console_random_number)
+            .feed(&m2.managed_system_random_number)
+            .feed(&role_and_username_len)
+            .feed(m1.username)
+            .finalize();
+
+        let output = Sha256Hmac::new(&self.password)
+            .feed(&m2.managed_system_random_number)
+            .feed(&m2.remote_console_session_id.get().to_le_bytes())
+            .feed(&role_and_username_len)
+            .feed(m1.username)
+            .finalize();
+
+        self.state = SubState {
+            keys: Keys::from_sha256_sik(sik),
+            confidentiality_algorithm: osr.confidentiality_payload,
+            integrity_algorithm: osr.integrity_payload,
+        };
+
+        Some(output.to_vec())
+    }
 }
 
 impl CryptoState {
@@ -141,3 +200,7 @@ impl CryptoState {
         self.state.write_payload(message, buffer)
     }
 }
+
+#[cfg(test)]
+#[path = "state_tests.rs"]
+mod tests;

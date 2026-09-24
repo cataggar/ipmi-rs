@@ -215,7 +215,7 @@ macro_rules ! cipher_suite {
             }
 
             pub fn confidentiality(&self) -> ConfidentialityAlgorithm {
-                let conf = self.as_suite()[1];
+                let conf = self.as_suite()[2];
                 TryFrom::try_from(conf).unwrap()
             }
         }
@@ -243,4 +243,46 @@ cipher_suite! {
     [Id17, 17, 0x03, 0x04, 0x01],
     [Id18, 18, 0x03, 0x04, 0x02],
     [Id19, 19, 0x03, 0x04, 0x03]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CipherSuite;
+
+    #[test]
+    fn cipher_suite_accessors() {
+        let triples = [
+            [0, 0, 0],
+            [1, 0, 0],
+            [1, 1, 0],
+            [1, 1, 1],
+            [1, 1, 2],
+            [1, 1, 3],
+            [2, 0, 0],
+            [2, 2, 0],
+            [2, 2, 1],
+            [2, 2, 2],
+            [2, 2, 3],
+            [2, 3, 0],
+            [2, 3, 1],
+            [2, 3, 2],
+            [2, 3, 3],
+            [3, 0, 0],
+            [3, 4, 0],
+            [3, 4, 1],
+            [3, 4, 2],
+            [3, 4, 3],
+        ];
+
+        for (id, expected) in triples.into_iter().enumerate() {
+            let suite = CipherSuite::from_id(id as u8).unwrap();
+            assert_eq!(suite.id(), id as u8);
+            assert_eq!(suite.into_suite(), expected);
+            assert_eq!(suite.as_suite(), &expected);
+            assert_eq!(u8::from(suite.authentication()), expected[0]);
+            assert_eq!(u8::from(suite.integrity()), expected[1]);
+            assert_eq!(u8::from(suite.confidentiality()), expected[2]);
+            assert_eq!(CipherSuite::from_suite(expected), Some(suite));
+        }
+    }
 }

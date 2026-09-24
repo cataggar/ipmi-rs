@@ -2,7 +2,10 @@ mod rakp;
 pub use rakp::ErrorStatusCode as RakpErrorStatusCode;
 
 mod open_session;
-pub use open_session::{OpenSessionRequest, OpenSessionResponse, ParseSessionResponseError};
+pub use open_session::{
+    OpenSessionRequest, OpenSessionResponse, OpenSessionResponseErrorStatusCode,
+    ParseSessionResponseError,
+};
 
 mod rakp_1;
 pub use rakp_1::{RakpMessage1, Username};

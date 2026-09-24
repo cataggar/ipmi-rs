@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    app::auth::{GetChannelAuthenticationCapabilities, PrivilegeLevel},
+    app::auth::{CipherSuite, GetChannelAuthenticationCapabilities, PrivilegeLevel},
     connection::{Channel, IpmiConnection, LogicalUnit, Response},
 };
 
@@ -99,6 +99,7 @@ impl RmcpWithState<Inactive> {
     pub fn activate(
         self,
         rmcp_plus: bool,
+        required_suite: Option<CipherSuite>,
         username: Option<&str>,
         password: Option<&[u8]>,
     ) -> Result<RmcpWithState<Active>, ActivationError> {
@@ -186,9 +187,12 @@ impl RmcpWithState<Inactive> {
                 Some(privilege_level),
                 &username,
                 password.unwrap_or(&[]),
+                required_suite.unwrap_or(CipherSuite::Id3),
             )?;
 
             Ok(RmcpWithState(Active::V2_0(res)))
+        } else if required_suite.is_some() {
+            Err(ActivationError::RequiredRmcpPlusNotSupported)
         } else if authentication_caps.ipmi15_connections_supported {
             let activated = ipmi.release().activate(
                 &authentication_caps,

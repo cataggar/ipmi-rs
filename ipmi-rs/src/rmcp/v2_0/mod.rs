@@ -7,13 +7,13 @@ use crypto::CryptoState;
 
 mod messages;
 use ipmi_rs_core::{
-    app::auth::{AuthenticationAlgorithm, ConfidentialityAlgorithm, IntegrityAlgorithm},
+    app::auth::{AuthenticationAlgorithm, CipherSuite},
     connection::Response,
 };
 pub(super) use messages::*;
 pub use messages::{
-    ParseSessionResponseError, RakpMessage2ErrorStatusCode, RakpMessage2ParseError,
-    RakpMessage4ErrorStatusCode, RakpMessage4ParseError,
+    OpenSessionResponseErrorStatusCode, ParseSessionResponseError, RakpMessage2ErrorStatusCode,
+    RakpMessage2ParseError, RakpMessage4ErrorStatusCode, RakpMessage4ParseError,
 };
 
 use self::crypto::CryptoUnwrapError;
@@ -27,6 +27,10 @@ use super::{
 pub enum ValidateSessionResponseError {
     MessageTagMismatch,
     RemoteConsoleSessionIdMismatch,
+    NegotiatedCipherSuiteMismatch {
+        requested: CipherSuite,
+        received: [u8; 3],
+    },
 }
 
 #[derive(Debug)]
@@ -45,6 +49,7 @@ pub enum ValidateRakpMessage4Error {
 pub enum ActivationError {
     Io(std::io::Error),
     InvalidKeyExchangeAuthCodeLen(usize, AuthenticationAlgorithm),
+    InvalidRakpMessage4IntegrityCheckValueLen(usize, AuthenticationAlgorithm),
     OpenSessionRequestSend(WriteError),
     OpenSessionResponseReceive(RmcpIpmiReceiveError),
     OpenSessionResponseRead(UnwrapSessionError),
@@ -181,6 +186,25 @@ pub struct State {
 }
 
 impl State {
+    fn validate_rakp4_mac_len(
+        algorithm: AuthenticationAlgorithm,
+        actual_len: usize,
+    ) -> Result<(), ActivationError> {
+        let expected_len = match algorithm {
+            AuthenticationAlgorithm::RakpHmacSha1 => 12,
+            AuthenticationAlgorithm::RakpHmacSha256 => 16,
+            AuthenticationAlgorithm::RakpNone => 0,
+            AuthenticationAlgorithm::RakpHmacMd5 => 16,
+        };
+        if actual_len != expected_len {
+            Err(ActivationError::InvalidRakpMessage4IntegrityCheckValueLen(
+                actual_len, algorithm,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     fn validate_open_session(
         req: &OpenSessionRequest,
         resp: &OpenSessionResponse,
@@ -193,7 +217,42 @@ impl State {
             return Err(ValidateSessionResponseError::RemoteConsoleSessionIdMismatch);
         }
 
+        let requested = [
+            u8::from(req.authentication_algorithms),
+            u8::from(req.integrity_algorithms),
+            u8::from(req.confidentiality_algorithms),
+        ];
+        let received = [
+            u8::from(resp.authentication_payload),
+            u8::from(resp.integrity_payload),
+            u8::from(resp.confidentiality_payload),
+        ];
+        if received != requested {
+            return Err(
+                ValidateSessionResponseError::NegotiatedCipherSuiteMismatch {
+                    requested: CipherSuite::from_suite(requested)
+                        .expect("requested suite is defined"),
+                    received,
+                },
+            );
+        }
+
         Ok(())
+    }
+
+    fn open_session_request(
+        requested_max_privilege: Option<PrivilegeLevel>,
+        remote_console_session_id: NonZeroU32,
+        suite: CipherSuite,
+    ) -> OpenSessionRequest {
+        OpenSessionRequest {
+            message_tag: 0,
+            requested_max_privilege,
+            remote_console_session_id,
+            authentication_algorithms: suite.authentication(),
+            integrity_algorithms: suite.integrity(),
+            confidentiality_algorithms: suite.confidentiality(),
+        }
     }
 
     fn validate_rm1_rm2(
@@ -233,6 +292,7 @@ impl State {
         privilege_level: Option<PrivilegeLevel>,
         username: &Username,
         password: &[u8],
+        suite: CipherSuite,
     ) -> Result<Self, ActivationError> {
         use rand::{CryptoRng, Rng};
 
@@ -268,14 +328,8 @@ impl State {
 
         let remote_console_session_id: NonZeroU32 = rng.gen();
 
-        let open_session_request = OpenSessionRequest {
-            message_tag: 0,
-            requested_max_privilege: privilege_level,
-            remote_console_session_id,
-            authentication_algorithms: AuthenticationAlgorithm::RakpHmacSha1,
-            confidentiality_algorithms: ConfidentialityAlgorithm::AesCbc128,
-            integrity_algorithms: IntegrityAlgorithm::HmacSha1_96,
-        };
+        let open_session_request =
+            Self::open_session_request(privilege_level, remote_console_session_id, suite);
 
         log::debug!("Sending RMCP+ Open Session Request. {open_session_request:X?}");
 
@@ -383,20 +437,25 @@ impl State {
             .map_err(ActivationError::RakpMessage3Send)?;
 
         if rm3.is_failure() {
-            return Err(ActivationError::ServerAuthenticationFailed)?;
+            return Err(ActivationError::ServerAuthenticationFailed);
         }
 
         let data = socket
             .recv()
             .map_err(ActivationError::RakpMessage4Receive)?;
 
-        let message = recv(data).unwrap();
+        let message = recv(data).map_err(ActivationError::RakpMessage4Read)?;
         let rm4 = RakpMessage4::from_data(&message.payload)
             .map_err(ActivationError::RakpMessage4Parse)?;
 
         log::debug!("Received RAKP Message 4: {rm4:X?}");
 
         Self::validate_rm3_rm4(response.remote_console_session_id, &rm3, &rm4)?;
+
+        Self::validate_rakp4_mac_len(
+            response.authentication_payload,
+            rm4.integrity_check_value.len(),
+        )?;
 
         if !crypto_state.verify(
             response.authentication_payload,
@@ -492,5 +551,85 @@ impl State {
     ) -> Result<crate::connection::Response, RmcpIpmiError> {
         self.send(request)?;
         self.recv().map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ipmi_rs_core::app::auth::{ConfidentialityAlgorithm, IntegrityAlgorithm};
+
+    #[test]
+    fn suite17_open_session_wire_and_negotiation() {
+        let req = State::open_session_request(
+            Some(PrivilegeLevel::Administrator),
+            NonZeroU32::new(0x10203040).unwrap(),
+            CipherSuite::Id17,
+        );
+        let mut actual = Vec::new();
+        req.write_data(&mut actual);
+        assert_eq!(
+            actual,
+            hex::decode("0004000040302010000000080300000001000008040000000200000801000000")
+                .unwrap()
+        );
+
+        let response = OpenSessionResponse::from_data(
+            &hex::decode(
+                "000004004030201088776655000000080300000001000008040000000200000801000000",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(State::validate_open_session(&req, &response).is_ok());
+
+        for changed in 0..3 {
+            let mut substituted = response.clone();
+            match changed {
+                0 => substituted.authentication_payload = AuthenticationAlgorithm::RakpHmacSha1,
+                1 => substituted.integrity_payload = IntegrityAlgorithm::HmacSha1_96,
+                _ => substituted.confidentiality_payload = ConfidentialityAlgorithm::None,
+            }
+            assert!(matches!(
+                State::validate_open_session(&req, &substituted),
+                Err(
+                    ValidateSessionResponseError::NegotiatedCipherSuiteMismatch {
+                        requested: CipherSuite::Id17,
+                        ..
+                    }
+                )
+            ));
+        }
+
+        assert_eq!(
+            OpenSessionResponse::from_data(&[0, 0x11]),
+            Err(ParseSessionResponseError::HaveErrorCode(Ok(
+                OpenSessionResponseErrorStatusCode::NoMatchingCipherSuite
+            )))
+        );
+    }
+
+    #[test]
+    fn default_suite_stays_three_and_rakp4_length_is_exact() {
+        let req = State::open_session_request(None, NonZeroU32::new(1).unwrap(), CipherSuite::Id3);
+        assert_eq!(
+            [
+                u8::from(req.authentication_algorithms),
+                u8::from(req.integrity_algorithms),
+                u8::from(req.confidentiality_algorithms)
+            ],
+            [1, 1, 1]
+        );
+
+        for len in [0, 12, 15, 17, 32] {
+            assert!(matches!(
+                State::validate_rakp4_mac_len(AuthenticationAlgorithm::RakpHmacSha256, len),
+                Err(ActivationError::InvalidRakpMessage4IntegrityCheckValueLen(
+                    _,
+                    _
+                ))
+            ));
+        }
+        assert!(State::validate_rakp4_mac_len(AuthenticationAlgorithm::RakpHmacSha256, 16).is_ok());
     }
 }
