@@ -5,6 +5,7 @@ use crate::{
 use std::{net::ToSocketAddrs, time::Duration};
 
 mod socket;
+pub use socket::CancellationToken;
 
 mod v1_5;
 pub use v1_5::{
@@ -42,12 +43,28 @@ pub enum RmcpIpmiReceiveError {
     NotEnoughData,
     EmptyMessage,
     IpmbChecksumFailed,
+    IpmbResponseMismatch,
+    NoPendingRequest,
+    SessionIdMismatch,
+    InvalidSessionSequence,
+    UnexpectedPayloadType,
+    DatagramTooLarge,
+    TooManyUnrelatedPackets,
+    Timeout,
+    Cancelled,
 }
 
 #[derive(Debug)]
 pub enum RmcpIpmiSendError {
     V1_5(V1_5WriteError),
     V2_0(V2_0WriteError),
+    RequestPending,
+    UnsupportedTarget,
+    InvalidNetfn(u8),
+    IpmbSequenceExhausted,
+    SessionSequenceExhausted,
+    Cancelled,
+    DeadlineExpired,
 }
 
 impl From<V1_5WriteError> for RmcpIpmiSendError {
@@ -85,6 +102,8 @@ pub enum RmcpIpmiError {
     NotActive,
     Receive(RmcpIpmiReceiveError),
     Send(RmcpIpmiSendError),
+    /// A request may have executed; it must not be automatically retried.
+    OutcomeUnknown(RmcpIpmiReceiveError),
 }
 
 impl From<RmcpIpmiReceiveError> for RmcpIpmiError {
@@ -105,7 +124,7 @@ type CommandError<T> = IpmiError<RmcpIpmiError, T>;
 pub enum ActivationError {
     BindSocket(std::io::Error),
     PingSend(std::io::Error),
-    PongReceive(std::io::Error),
+    PongReceive(RmcpIpmiReceiveError),
     PongRead,
     /// The contacted host does not support IPMI over RMCP.
     IpmiNotSupported,
@@ -114,6 +133,8 @@ pub enum ActivationError {
     RequiredRmcpPlusNotSupported,
     /// Only RMCP+ cipher suites 3 and 17 are implemented.
     UnsupportedCipherSuite(CipherSuite),
+    RmcpPlusRequired,
+    InvalidUsername,
     GetChannelAuthenticationCapabilities(CommandError<NotEnoughData>),
     V1_5(V1_5ActivationError),
     V2_0(V2_0ActivationError),
@@ -170,6 +191,16 @@ impl Rmcp {
         self.active_state
             .as_ref()
             .is_some_and(RmcpWithState::is_rmcp_plus)
+    }
+
+    /// A cloneable cancellation signal checked at most every 50 ms during receives.
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.unbound_state.policy().cancellation.clone()
+    }
+
+    /// Refuse IPMI 1.5 fallback when RMCP+ was requested.
+    pub fn require_rmcp_plus(&mut self, require: bool) {
+        self.unbound_state.policy_mut().require_rmcp_plus = require;
     }
 
     /// Activate this RMCP connection with the provided username and password.
@@ -257,7 +288,7 @@ impl IpmiConnection for Rmcp {
 mod suite17_tests;
 
 #[cfg(test)]
-mod tests {
+mod suite17_activation_tests {
     use super::*;
     use std::{net::UdpSocket, thread};
 
@@ -423,3 +454,5 @@ mod tests {
         assert!(!rmcp.is_rmcp_plus());
     }
 }
+#[cfg(test)]
+mod tests;

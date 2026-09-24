@@ -98,7 +98,7 @@ impl Message {
             data.to_vec()
         }
         // Data & legacy PAD
-        else if data.len() - 1 == data_len as usize {
+        else if data.len().checked_sub(1) == Some(data_len as usize) && data.last() == Some(&0) {
             data[..data.len() - 1].to_vec()
         } else {
             return Err(ReadError::IncorrectPayloadLen);
@@ -155,6 +155,12 @@ mod test {
     test!(
         nonempty_incorrect_len,
         [0, 1, 0, 0, 0, 2, 0, 0, 0, 5, 1, 2, 3, 4],
+        Err(ReadError::IncorrectPayloadLen)
+    );
+
+    test!(
+        declared_payload_with_no_bytes,
+        [0, 1, 0, 0, 0, 2, 0, 0, 0, 1],
         Err(ReadError::IncorrectPayloadLen)
     );
 

@@ -51,6 +51,9 @@ pub enum RmcpHeaderError {
     InvalidASFMessage,
     /// The class of the RMCP packet was not valid.
     InvalidRmcpClass,
+    InvalidVersion(u8),
+    InvalidReservedByte,
+    InvalidSequence,
 }
 
 #[derive(Clone, Debug)]
@@ -126,10 +129,19 @@ impl RmcpHeader {
         let version = data[0];
         let sequence_number = data[2];
         let class = data[3];
+        if version != 6 {
+            return Err(RmcpHeaderError::InvalidVersion(version));
+        }
+        if data[1] != 0 {
+            return Err(RmcpHeaderError::InvalidReservedByte);
+        }
 
         let data = &mut data[4..];
 
         let class = RmcpClass::try_from(class).map_err(|_| RmcpHeaderError::InvalidRmcpClass)?;
+        if class.ty == RmcpType::Ipmi && sequence_number != 0xff {
+            return Err(RmcpHeaderError::InvalidSequence);
+        }
 
         Ok((
             Self {

@@ -44,7 +44,7 @@ fn suite17_rakp_key_and_mac_vectors() {
     .unwrap();
     let m2 = RM2::from_data(&m2_wire).unwrap();
     let mut state = CryptoState::new(None, b"correct horse battery staple");
-    let m3_mac = state.calculate_rakp3_data(&osr, &m1, &m2).unwrap();
+    let m3_mac = state.calculate_rakp3_data(&osr, &m1, &m2).unwrap().unwrap();
     assert_eq!(
         m3_mac,
         hex::decode("6d93b76fc673ced17dab8503827c91ea64785c0c519ab815de407b64cbf61681").unwrap()
@@ -96,13 +96,15 @@ fn suite17_rakp_key_and_mac_vectors() {
 
     let m4_wire = hex::decode("0a00000040302010cc7f0f32087eb5777b13f4ee7f7e83d5").unwrap();
     let m4 = RakpMessage4::from_data(&m4_wire).unwrap();
-    assert!(state.verify(
-        osr.authentication_payload,
-        &m1.remote_console_random_number,
-        m1.managed_system_session_id.get(),
-        &m2.managed_system_guid,
-        m4.integrity_check_value
-    ));
+    assert!(state
+        .verify(
+            osr.authentication_payload,
+            &m1.remote_console_random_number,
+            m1.managed_system_session_id.get(),
+            &m2.managed_system_guid,
+            m4.integrity_check_value
+        )
+        .unwrap());
     let mut wrong_m4 = m4.integrity_check_value.to_vec();
     wrong_m4[0] ^= 1;
     for invalid_mac in [
@@ -114,13 +116,15 @@ fn suite17_rakp_key_and_mac_vectors() {
         ))
         .unwrap()[..],
     ] {
-        assert!(!state.verify(
-            osr.authentication_payload,
-            &m1.remote_console_random_number,
-            m1.managed_system_session_id.get(),
-            &m2.managed_system_guid,
-            invalid_mac
-        ));
+        assert!(!state
+            .verify(
+                osr.authentication_payload,
+                &m1.remote_console_random_number,
+                m1.managed_system_session_id.get(),
+                &m2.managed_system_guid,
+                invalid_mac
+            )
+            .unwrap());
     }
 
     for invalid_len in [31, 33] {
@@ -132,6 +136,7 @@ fn suite17_rakp_key_and_mac_vectors() {
         let invalid_m2 = RM2::from_data(&corrupted).unwrap();
         assert!(CryptoState::new(None, b"correct horse battery staple")
             .calculate_rakp3_data(&osr, &m1, &invalid_m2)
+            .unwrap()
             .is_none());
     }
     let mut corrupted = m2_wire.clone();
@@ -139,12 +144,16 @@ fn suite17_rakp_key_and_mac_vectors() {
     let invalid_m2 = RM2::from_data(&corrupted).unwrap();
     assert!(CryptoState::new(None, b"correct horse battery staple")
         .calculate_rakp3_data(&osr, &m1, &invalid_m2)
+        .unwrap()
         .is_none());
 
     let kg: Vec<u8> = (0x20..0x40).collect();
     let mut kg_state = CryptoState::new(Some(&kg), b"correct horse battery staple");
     assert_eq!(
-        kg_state.calculate_rakp3_data(&osr, &m1, &m2).unwrap(),
+        kg_state
+            .calculate_rakp3_data(&osr, &m1, &m2)
+            .unwrap()
+            .unwrap(),
         m3_mac
     );
     assert_eq!(
