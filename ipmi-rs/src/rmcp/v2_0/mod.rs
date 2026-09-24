@@ -450,7 +450,7 @@ impl State {
 
         log::debug!("Received RAKP Message 4: {rm4:X?}");
 
-        Self::validate_rm3_rm4(response.remote_console_session_id, &rm3, &rm4)?;
+        Self::validate_rm3_rm4(response.managed_system_session_id, &rm3, &rm4)?;
 
         Self::validate_rakp4_mac_len(
             response.authentication_payload,

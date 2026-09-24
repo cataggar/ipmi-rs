@@ -244,6 +244,9 @@ impl IpmiConnection for Rmcp {
 }
 
 #[cfg(test)]
+mod suite17_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::{net::UdpSocket, thread};
