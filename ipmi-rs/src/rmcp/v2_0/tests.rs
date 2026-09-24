@@ -855,6 +855,224 @@ fn capture_dispatches_interleaved_sol_and_never_sends_console_input() {
 }
 
 #[test]
+fn cancellation_delivers_acked_activation_output_and_preserves_cleanup_output() {
+    use crate::{
+        app::sol::SolInstance,
+        rmcp::{SolError, SolInterruptionReason},
+    };
+    let (mut rmcp, peer, mut crypto) = sol_fixture(Duration::from_millis(500));
+    let token = rmcp.cancellation_token();
+    let server = std::thread::spawn(move || {
+        let activation = read_secure(&peer, &mut crypto);
+        reply_sol(&peer, &mut crypto, 1, &[1, 0, 0, 0, b'X']);
+        reply_command(
+            &peer,
+            &mut crypto,
+            &activation,
+            2,
+            0,
+            &activate_response(peer.local_addr().unwrap().port()),
+        );
+        let ack = read_secure(&peer, &mut crypto);
+        assert_eq!(ack.payload, [0, 1, 1, 0]); // X was accepted during activation
+        let deactivate = read_secure(&peer, &mut crypto);
+        assert_eq!(deactivate.payload[5], 0x49);
+        // Even output arriving while closing must be returned to the caller.
+        reply_sol(
+            &peer,
+            &mut crypto,
+            3,
+            &[2, 0, 0, 0, b'M', b'A', b'R', b'K', b'E', b'R'],
+        );
+        reply_command(&peer, &mut crypto, &deactivate, 4, 0, &[]);
+        let ack = read_secure(&peer, &mut crypto);
+        assert_eq!(ack.payload, [0, 2, 6, 0]);
+    });
+    let mut capture = rmcp.open_sol_capture(SolInstance::new(1).unwrap()).unwrap();
+    token.cancel();
+    assert_eq!(capture.read(&mut []).unwrap(), 0); // zero-length read cannot consume X
+    let mut output = [0u8; 1];
+    assert_eq!(capture.read(&mut output).unwrap(), 1);
+    assert_eq!(output, [b'X']);
+    match capture.read(&mut output) {
+        Err(SolError::Interrupted(stopped)) => {
+            assert!(matches!(
+                stopped.reason,
+                SolInterruptionReason::Receive(RmcpIpmiReceiveError::Cancelled)
+            ));
+            assert!(!stopped.remote_close_unconfirmed);
+            assert_eq!(stopped.buffered_output.as_bytes(), b"MARKER");
+            assert!(!format!("{stopped:?}").contains("MARKER"));
+            assert_eq!(stopped.buffered_output.into_bytes(), b"MARKER");
+        }
+        other => panic!("expected interruption, got {other:?}"),
+    }
+    capture.close().unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn cancellation_during_activation_preserves_already_acked_output() {
+    use crate::{app::sol::SolInstance, rmcp::SolError};
+    let (mut rmcp, peer, mut crypto) = sol_fixture(Duration::from_millis(500));
+    let token = rmcp.cancellation_token();
+    let server = std::thread::spawn(move || {
+        let _activation = read_secure(&peer, &mut crypto);
+        reply_sol(
+            &peer,
+            &mut crypto,
+            1,
+            &[1, 0, 0, 0, b'P', b'H', b'R', b'A', b'S', b'E'],
+        );
+        assert_eq!(read_secure(&peer, &mut crypto).payload, [0, 1, 6, 0]);
+        token.cancel(); // activation response is lost after console output was ACKed
+        let deactivate = read_secure(&peer, &mut crypto);
+        assert_eq!(deactivate.payload[5], 0x49);
+        reply_command(&peer, &mut crypto, &deactivate, 2, 0, &[]);
+    });
+    match rmcp.open_sol_capture(SolInstance::new(1).unwrap()) {
+        Err(SolError::ActivationUncertain {
+            remote_close_unconfirmed: false,
+            buffered_output,
+            ..
+        }) => {
+            assert_eq!(buffered_output.as_bytes(), b"PHRASE");
+            assert!(!format!("{buffered_output:?}").contains("PHRASE"));
+        }
+        Ok(_) => panic!("activation unexpectedly succeeded"),
+        Err(error) => panic!("unexpected activation error: {error:?}"),
+    }
+    server.join().unwrap();
+}
+
+#[test]
+fn cancellation_during_input_exposes_buffered_output_without_logging_it() {
+    use crate::{
+        app::sol::SolInstance,
+        rmcp::{SolError, SolInterruptionReason},
+    };
+    let (mut rmcp, peer, mut crypto) = sol_fixture(Duration::from_millis(500));
+    let token = rmcp.cancellation_token();
+    let server = std::thread::spawn(move || {
+        let activation = read_secure(&peer, &mut crypto);
+        reply_command(
+            &peer,
+            &mut crypto,
+            &activation,
+            1,
+            0,
+            &activate_response(peer.local_addr().unwrap().port()),
+        );
+        let input = read_secure(&peer, &mut crypto);
+        assert_eq!(input.payload, [1, 0, 0, 0, b'?']);
+        reply_sol(
+            &peer,
+            &mut crypto,
+            2,
+            &[1, 0, 0, 0, b'O', b'P', b'A', b'Q', b'U', b'E'],
+        );
+        let ack = read_secure(&peer, &mut crypto);
+        assert_eq!(ack.payload, [0, 1, 6, 0]);
+        token.cancel();
+        let deactivate = read_secure(&peer, &mut crypto);
+        assert_eq!(deactivate.payload[5], 0x49);
+        reply_command(&peer, &mut crypto, &deactivate, 3, 0, &[]);
+    });
+    let mut interactive = rmcp
+        .open_sol_interactive(SolInstance::new(1).unwrap())
+        .unwrap();
+    match interactive.send_input(b"?") {
+        Err(SolError::Interrupted(stopped)) => {
+            assert!(matches!(
+                stopped.reason,
+                SolInterruptionReason::Receive(RmcpIpmiReceiveError::Cancelled)
+            ));
+            assert!(stopped.input_delivery_uncertain);
+            assert_eq!(stopped.buffered_output.as_bytes(), b"OPAQUE");
+            assert!(!format!("{stopped:?}").contains("OPAQUE"));
+        }
+        other => panic!("expected interruption, got {other:?}"),
+    }
+    interactive.close().unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn reconnect_refuses_to_discard_acked_unread_output() {
+    use crate::{app::sol::SolInstance, rmcp::SolError};
+    let (mut rmcp, peer, mut crypto) = sol_fixture(Duration::from_millis(500));
+    let server = std::thread::spawn(move || {
+        let activation = read_secure(&peer, &mut crypto);
+        reply_sol(&peer, &mut crypto, 1, &[1, 0, 0, 0, b'R']);
+        reply_command(
+            &peer,
+            &mut crypto,
+            &activation,
+            2,
+            0,
+            &activate_response(peer.local_addr().unwrap().port()),
+        );
+        assert_eq!(read_secure(&peer, &mut crypto).payload, [0, 1, 1, 0]);
+        let deactivate = read_secure(&peer, &mut crypto);
+        assert_eq!(deactivate.payload[5], 0x49);
+        reply_command(&peer, &mut crypto, &deactivate, 3, 0, &[]);
+    });
+    let mut capture = rmcp.open_sol_capture(SolInstance::new(1).unwrap()).unwrap();
+    assert!(matches!(
+        capture.reconnect("root", b"local test password", 1),
+        Err(SolError::BufferedOutputPending)
+    ));
+    let mut output = [0; 1];
+    assert_eq!(capture.read(&mut output).unwrap(), 1);
+    assert_eq!(output, [b'R']);
+    capture.close().unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn explicit_close_reports_acked_unread_output_even_if_deactivation_succeeds() {
+    use crate::{
+        app::sol::SolInstance,
+        rmcp::{SolError, SolInterruptionReason},
+    };
+    let (mut rmcp, peer, mut crypto) = sol_fixture(Duration::from_millis(500));
+    let server = std::thread::spawn(move || {
+        let activation = read_secure(&peer, &mut crypto);
+        reply_sol(
+            &peer,
+            &mut crypto,
+            1,
+            &[1, 0, 0, 0, b'U', b'N', b'I', b'Q', b'U', b'E'],
+        );
+        reply_command(
+            &peer,
+            &mut crypto,
+            &activation,
+            2,
+            0,
+            &activate_response(peer.local_addr().unwrap().port()),
+        );
+        assert_eq!(read_secure(&peer, &mut crypto).payload, [0, 1, 6, 0]);
+        let deactivate = read_secure(&peer, &mut crypto);
+        reply_command(&peer, &mut crypto, &deactivate, 3, 0, &[]);
+    });
+    let capture = rmcp.open_sol_capture(SolInstance::new(1).unwrap()).unwrap();
+    match capture.close() {
+        Err(SolError::Interrupted(stopped)) => {
+            assert!(matches!(
+                stopped.reason,
+                SolInterruptionReason::ClosedWithBufferedOutput
+            ));
+            assert!(!stopped.remote_close_unconfirmed);
+            assert_eq!(stopped.buffered_output.as_bytes(), b"UNIQUE");
+            assert!(!format!("{stopped:?}").contains("UNIQUE"));
+        }
+        other => panic!("expected unread output, got {other:?}"),
+    }
+    server.join().unwrap();
+}
+
+#[test]
 fn negotiated_route_is_rejected_and_deactivated() {
     use crate::{app::sol::SolInstance, rmcp::SolError};
     for vlan in [0, 1] {

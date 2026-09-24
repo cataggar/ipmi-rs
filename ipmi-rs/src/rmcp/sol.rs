@@ -18,6 +18,33 @@ const RETRY_WAIT: Duration = Duration::from_millis(150);
 const MAX_RETRANSMISSIONS: usize = 2;
 const MAX_INPUT_CALL: usize = 4096;
 
+/// Authenticated output buffered but not yet returned to a reader.
+///
+/// An ACK send failure can make remote acknowledgment uncertain. Debug output
+/// intentionally reports only the length, never console contents.
+#[derive(Default)]
+pub struct BufferedSolOutput(Vec<u8>);
+
+impl BufferedSolOutput {
+    /// Inspect the bytes without consuming the interruption.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Take ownership of the bytes for lossless recovery.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl std::fmt::Debug for BufferedSolOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BufferedSolOutput")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
+
 /// Why a SOL stream was interrupted. None of these variants contains console data.
 #[derive(Debug)]
 pub enum SolInterruptionReason {
@@ -31,6 +58,9 @@ pub enum SolInterruptionReason {
     NoProgress,
     /// Deactivation was not acknowledged.
     Deactivation,
+    /// Deactivation succeeded, but it received console output that the
+    /// caller had not yet read. The bytes are on the interruption.
+    ClosedWithBufferedOutput,
     /// Reauthentication or reactivation failed.
     Reconnect,
 }
@@ -48,6 +78,8 @@ pub struct SolInterruption {
     pub output_delivery_uncertain: bool,
     /// A successful remote Deactivate Payload could not be confirmed.
     pub remote_close_unconfirmed: bool,
+    /// Buffered authenticated output not yet delivered; Debug redacts it.
+    pub buffered_output: BufferedSolOutput,
 }
 
 /// An error opening, operating, or closing SOL.
@@ -59,6 +91,14 @@ pub enum SolError {
     InvalidOperation,
     /// Activate Payload failed.
     Activation(IpmiError<RmcpIpmiError, SolPayloadError>),
+    /// Activation failed definitively, but already ACKed output must be
+    /// consumed before discarding the failed session.
+    ActivationWithOutput {
+        /// Activation failure.
+        source: IpmiError<RmcpIpmiError, SolPayloadError>,
+        /// Already ACKed output.
+        buffered_output: BufferedSolOutput,
+    },
     /// Activation may have succeeded; cleanup was attempted, but the remote
     /// deactivation outcome must be checked before reusing the instance.
     ActivationUncertain {
@@ -66,6 +106,8 @@ pub enum SolError {
         source: IpmiError<RmcpIpmiError, SolPayloadError>,
         /// Deactivate Payload also failed or was not acknowledged.
         remote_close_unconfirmed: bool,
+        /// Already ACKed output, including data received while deactivating.
+        buffered_output: BufferedSolOutput,
     },
     /// Routing to the negotiated UDP port or VLAN is unsupported.
     UnsupportedRoute {
@@ -75,7 +117,11 @@ pub enum SolError {
         vlan: u16,
         /// Deactivation also failed, so the remote payload may still be active.
         remote_close_unconfirmed: bool,
+        /// Already ACKed output, including data received while deactivating.
+        buffered_output: BufferedSolOutput,
     },
+    /// A live capture has unread output; read it before reconnecting.
+    BufferedOutputPending,
     /// Operation stopped; examine uncertain outcomes before retrying.
     Interrupted(SolInterruption),
 }
@@ -120,17 +166,29 @@ fn state(connection: &mut Rmcp) -> Result<&mut State, SolError> {
 fn deactivate_bounded(
     connection: &mut Rmcp,
     instance: SolInstance,
-) -> Result<(), IpmiError<RmcpIpmiError, SolPayloadError>> {
+) -> (
+    Result<(), IpmiError<RmcpIpmiError, SolPayloadError>>,
+    BufferedSolOutput,
+) {
     let old_policy = match state(connection) {
         Ok(state) => state.socket.begin_cleanup(CLEANUP_WAIT),
-        Err(_) => return Err(IpmiError::Connection(RmcpIpmiError::NotActive)),
+        Err(_) => {
+            return (
+                Err(IpmiError::Connection(RmcpIpmiError::NotActive)),
+                BufferedSolOutput::default(),
+            )
+        }
     };
     let result = Ipmi::new(&mut *connection).send_recv(DeactivateSol { instance });
-    if let Ok(state) = state(connection) {
+    let buffered_output = if let Ok(state) = state(connection) {
         state.socket.end_cleanup(old_policy);
+        let output = BufferedSolOutput(state.sol_flow().take_output());
         state.sol_close();
-    }
-    result
+        output
+    } else {
+        BufferedSolOutput::default()
+    };
+    (result, buffered_output)
 }
 
 impl Rmcp {
@@ -173,24 +231,33 @@ impl Rmcp {
                         )
                 );
                 if possibly_activated {
-                    let remote_close_unconfirmed = deactivate_bounded(self, instance).is_err();
+                    let (cleanup, buffered_output) = deactivate_bounded(self, instance);
                     return Err(SolError::ActivationUncertain {
                         source: error,
-                        remote_close_unconfirmed,
+                        remote_close_unconfirmed: cleanup.is_err(),
+                        buffered_output,
                     });
                 } else {
+                    let buffered_output = BufferedSolOutput(state(self)?.sol_flow().take_output());
                     state(self)?.sol_close();
+                    if !buffered_output.as_bytes().is_empty() {
+                        return Err(SolError::ActivationWithOutput {
+                            source: error,
+                            buffered_output,
+                        });
+                    }
                 }
                 return Err(SolError::Activation(error));
             }
         };
         let address = self.unbound_state.address();
         if port != address.port() || vlan != 0 {
-            let remote_close_unconfirmed = deactivate_bounded(self, instance).is_err();
+            let (cleanup, buffered_output) = deactivate_bounded(self, instance);
             return Err(SolError::UnsupportedRoute {
                 port,
                 vlan,
-                remote_close_unconfirmed,
+                remote_close_unconfirmed: cleanup.is_err(),
+                buffered_output,
             });
         }
         state(self)?.sol_limits(max_input, max_output);
@@ -231,11 +298,12 @@ impl SolSession<'_> {
         confirmed_input: usize,
         input_delivery_uncertain: bool,
     ) -> SolError {
-        let remote_close_unconfirmed = if self.active {
+        let (remote_close_unconfirmed, buffered_output) = if self.active {
             self.active = false;
-            deactivate_bounded(self.connection, self.instance).is_err()
+            let (cleanup, output) = deactivate_bounded(self.connection, self.instance);
+            (cleanup.is_err(), output)
         } else {
-            true
+            (true, BufferedSolOutput::default())
         };
         self.remote_close_unconfirmed = remote_close_unconfirmed;
         SolError::Interrupted(SolInterruption {
@@ -244,12 +312,20 @@ impl SolSession<'_> {
             input_delivery_uncertain,
             output_delivery_uncertain: true,
             remote_close_unconfirmed,
+            buffered_output,
         })
     }
 
     fn read_until(&mut self, output: &mut [u8], deadline: Instant) -> Result<usize, SolError> {
         if !self.active {
             return Err(SolError::InvalidOperation);
+        }
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let count = state(self.connection)?.sol_flow().read(output);
+        if count > 0 {
+            return Ok(count);
         }
         if self.connection.cancellation_token().is_cancelled() {
             return Err(self.interrupted(
@@ -258,14 +334,7 @@ impl SolSession<'_> {
                 false,
             ));
         }
-        if output.is_empty() {
-            return Ok(0);
-        }
         let active = state(self.connection)?;
-        let count = active.sol_flow().read(output);
-        if count > 0 {
-            return Ok(count);
-        }
         let deadline = deadline.min(active.socket.deadline());
         match active.poll_sol(deadline, false) {
             Ok(()) => Ok(active.sol_flow().read(output)),
@@ -282,13 +351,15 @@ impl SolSession<'_> {
                     input_delivery_uncertain: false,
                     output_delivery_uncertain: true,
                     remote_close_unconfirmed: true,
+                    buffered_output: BufferedSolOutput::default(),
                 }))
             } else {
                 Ok(())
             };
         }
         self.active = false;
-        self.remote_close_unconfirmed = deactivate_bounded(self.connection, self.instance).is_err();
+        let (cleanup, buffered_output) = deactivate_bounded(self.connection, self.instance);
+        self.remote_close_unconfirmed = cleanup.is_err();
         if self.remote_close_unconfirmed {
             return Err(SolError::Interrupted(SolInterruption {
                 reason: SolInterruptionReason::Deactivation,
@@ -296,6 +367,17 @@ impl SolSession<'_> {
                 input_delivery_uncertain: false,
                 output_delivery_uncertain: true,
                 remote_close_unconfirmed: true,
+                buffered_output,
+            }));
+        }
+        if !buffered_output.as_bytes().is_empty() {
+            return Err(SolError::Interrupted(SolInterruption {
+                reason: SolInterruptionReason::ClosedWithBufferedOutput,
+                confirmed_input: 0,
+                input_delivery_uncertain: false,
+                output_delivery_uncertain: true,
+                remote_close_unconfirmed: false,
+                buffered_output,
             }));
         }
         Ok(())
@@ -340,8 +422,19 @@ impl SolCapture<'_> {
         if !(1..=3).contains(&max_attempts) {
             return Err(SolError::InvalidOperation);
         }
+        if self.0.active && state(self.0.connection)?.sol_flow().has_output() {
+            return Err(SolError::BufferedOutputPending);
+        }
         let previous_remote_close_unconfirmed = if self.0.active {
-            self.0.close_inner().is_err()
+            match self.0.close_inner() {
+                Ok(()) => false,
+                Err(SolError::Interrupted(interruption))
+                    if !interruption.buffered_output.as_bytes().is_empty() =>
+                {
+                    return Err(SolError::Interrupted(interruption));
+                }
+                Err(_) => true,
+            }
         } else {
             self.0.remote_close_unconfirmed
         };
@@ -352,6 +445,7 @@ impl SolCapture<'_> {
                 input_delivery_uncertain: false,
                 output_delivery_uncertain: true,
                 remote_close_unconfirmed: previous_remote_close_unconfirmed,
+                buffered_output: BufferedSolOutput::default(),
             }));
         }
         self.0.connection.require_rmcp_plus(true);
@@ -374,13 +468,22 @@ impl SolCapture<'_> {
                     Err(
                         SolError::ActivationUncertain {
                             remote_close_unconfirmed: unconfirmed,
+                            buffered_output,
                             ..
                         }
                         | SolError::UnsupportedRoute {
                             remote_close_unconfirmed: unconfirmed,
+                            buffered_output,
                             ..
                         },
-                    ) => remote_close_unconfirmed |= unconfirmed,
+                    ) if buffered_output.as_bytes().is_empty() => {
+                        remote_close_unconfirmed |= unconfirmed;
+                    }
+                    Err(
+                        err @ (SolError::ActivationUncertain { .. }
+                        | SolError::ActivationWithOutput { .. }
+                        | SolError::UnsupportedRoute { .. }),
+                    ) => return Err(err),
                     Err(_) => {}
                 }
             }
@@ -399,6 +502,7 @@ impl SolCapture<'_> {
             input_delivery_uncertain: false,
             output_delivery_uncertain: true,
             remote_close_unconfirmed,
+            buffered_output: BufferedSolOutput::default(),
         }))
     }
 }

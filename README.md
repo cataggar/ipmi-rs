@@ -336,8 +336,17 @@ Each read or send has a monotonic deadline; a read timeout, cancelled operation,
 frame gap, output overrun, or connection error interrupts the stream and makes
 a bounded (250ms) deactivation attempt. Check `SolError::Interrupted` for
 confirmed input bytes and uncertain input/output delivery or remote closure.
+Already ACKed output buffered before cancellation is returned by subsequent
+nonempty reads *before* the interruption is raised. If output is still buffered
+when a send or cleanup fails, consume `interruption.buffered_output.as_bytes()`
+or `into_bytes()` before discarding the error. Debug formatting reports only its
+length, never console contents; the same applies to output attached to SOL
+activation or routing errors. Reconnection of a live capture with unread
+output returns `BufferedOutputPending` rather than discarding it.
 Dropping the session also attempts deactivation but cannot report its outcome;
-call `close()` explicitly. A quiet console times out rather than silently
+call `close()` explicitly. Even if deactivation succeeds, `close()` returns
+`ClosedWithBufferedOutput` if it received ACKed output not yet read; consume
+those bytes from the interruption. A quiet console times out rather than silently
 waiting forever. To recover a capture, call `SolCapture::reconnect` with the
 credentials and a 1–3 attempt bound; each attempt uses a fresh RMCP+ handshake,
 resets per-session SOL sequence state and returns `CaptureGap`. Reset a cancelled

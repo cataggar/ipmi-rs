@@ -188,6 +188,10 @@ impl SolFlow {
         count
     }
 
+    pub fn take_output(&mut self) -> Vec<u8> {
+        self.output.drain(..).collect()
+    }
+
     pub fn has_output(&self) -> bool {
         !self.output.is_empty()
     }
@@ -219,14 +223,21 @@ impl SolFlow {
             return Ok(None);
         }
 
+        let new_sequence = self.previous_sequence != Some(frame.sequence);
         if let Some(previous) = self.previous_sequence {
             if frame.sequence == previous {
-                let common = self.previous_accepted.min(frame.data.len());
+                // The BMC may retry a partially ACKed packet after the caller
+                // has consumed our output queue. Compare all bytes previously
+                // seen, not only the accepted prefix: silently replacing an
+                // unaccepted suffix would corrupt the console stream.
+                let common = self.previous_data.len().min(frame.data.len());
                 if frame.data[..common] != self.previous_data[..common] {
                     return Err(SolFrameError::ConflictingRetransmission);
                 }
                 if frame.data.len() < self.previous_accepted {
-                    return Ok(Some(SolFrame::ack(frame.sequence, frame.data.len(), false)));
+                    // An ACK smaller than our already confirmed count could
+                    // make the BMC replay characters we delivered earlier.
+                    return Err(SolFrameError::ConflictingRetransmission);
                 }
             } else if frame.sequence != if previous == 15 { 1 } else { previous + 1 }
                 || (self.previous_accepted < self.previous_data.len()
@@ -247,7 +258,9 @@ impl SolFlow {
         self.output
             .extend(frame.data[self.previous_accepted..end].iter().copied());
         self.previous_sequence = Some(frame.sequence);
-        self.previous_data.clone_from(&frame.data);
+        if new_sequence || frame.data.len() > self.previous_data.len() {
+            self.previous_data.clone_from(&frame.data);
+        }
         self.previous_accepted = end;
         Ok(Some(SolFrame::ack(
             frame.sequence,
@@ -316,6 +329,38 @@ mod tests {
         let mut out = vec![0; MAX_OUTPUT_QUEUE];
         assert_eq!(flow.read(&mut out), MAX_OUTPUT_QUEUE);
         assert_eq!(flow.accept(&data(2, b"xy")).unwrap().unwrap().accepted, 2);
+    }
+
+    #[test]
+    fn partial_ack_retries_cannot_replace_unaccepted_suffix_after_queue_is_drained() {
+        let mut flow = SolFlow::new(128, 128);
+        flow.output
+            .extend(std::iter::repeat_n(b'q', MAX_OUTPUT_QUEUE - 1));
+        let ack = flow.accept(&data(1, b"abc")).unwrap().unwrap();
+        assert_eq!(ack.accepted, 1);
+        assert!(ack.flags.nack);
+        let mut delivered = vec![0; MAX_OUTPUT_QUEUE];
+        assert_eq!(flow.read(&mut delivered), MAX_OUTPUT_QUEUE);
+        assert_eq!(delivered[MAX_OUTPUT_QUEUE - 1], b'a');
+        assert_eq!(
+            flow.accept(&data(1, b"aXY")).unwrap_err(),
+            SolFrameError::ConflictingRetransmission
+        );
+        assert!(!flow.has_output());
+        // A shorter, valid retry must not discard our memory of the suffix.
+        assert_eq!(flow.accept(&data(1, b"a")).unwrap().unwrap().accepted, 1);
+        assert_eq!(
+            flow.accept(&data(1, b"aXY")).unwrap_err(),
+            SolFrameError::ConflictingRetransmission
+        );
+        assert_eq!(flow.accept(&data(1, b"abc")).unwrap().unwrap().accepted, 3);
+        let mut recovered = [0; 3];
+        assert_eq!(flow.read(&mut recovered), 2);
+        assert_eq!(&recovered[..2], b"bc");
+        assert_eq!(
+            flow.accept(&data(1, b"ab")).unwrap_err(),
+            SolFrameError::ConflictingRetransmission
+        );
     }
 
     #[test]

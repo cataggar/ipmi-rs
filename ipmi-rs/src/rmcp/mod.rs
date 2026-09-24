@@ -25,7 +25,8 @@ pub use ipmi_rs_core::app::auth::{
 
 mod sol;
 pub use sol::{
-    CaptureGap, SolCapture, SolError, SolInteractive, SolInterruption, SolInterruptionReason,
+    BufferedSolOutput, CaptureGap, SolCapture, SolError, SolInteractive, SolInterruption,
+    SolInterruptionReason,
 };
 mod checksum;
 
