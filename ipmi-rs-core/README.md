@@ -17,4 +17,13 @@ Never automatically resend a chassis control request after a lost or ambiguous
 response; a subsequent status read cannot prove whether a cycle/reset happened.
 
 [`chassis`]: https://docs.rs/ipmi-rs-core/latest/ipmi_rs_core/chassis/
+
+`app::{WarmReset, ColdReset}` resets the BMC, not the host. The typed
+`chassis::{GetSystemBootOptions, SetSystemBootOptions}` commands cover only
+boot-option parameters 0, 3, 4, and 5. Setting boot flags explicitly replaces
+all five bytes; optional EFI/clear-CMOS and persistence require explicit
+selection. These commands never implicitly update other parameters, reset the
+host, or retry when the outcome is unknown after a timeout. Unsupported
+controllers or readback fields return errors.
+
 [`ipmi-rs`]: https://crates.io/crates/ipmi-rs
