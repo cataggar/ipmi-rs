@@ -162,6 +162,16 @@ impl Rmcp {
         self.active_state.is_some()
     }
 
+    /// Whether the active session uses RMCP+ (IPMI 2.0), rather than IPMI 1.5.
+    ///
+    /// Returns `false` before activation. Requesting RMCP+ with
+    /// [`Self::activate`] does not guarantee it was negotiated.
+    pub fn is_rmcp_plus(&self) -> bool {
+        self.active_state
+            .as_ref()
+            .is_some_and(RmcpWithState::is_rmcp_plus)
+    }
+
     /// Activate this RMCP connection with the provided username and password.
     ///
     /// If `rmcp_plus` is `true`, upgrade the connection to an RMCP+ connection
@@ -404,5 +414,12 @@ mod tests {
             }
             assert!(!rmcp.is_active());
         }
+    }
+
+    #[test]
+    fn inactive_connection_is_not_rmcp_plus() {
+        let rmcp = Rmcp::new("127.0.0.1:623", Duration::from_secs(1)).unwrap();
+        assert!(!rmcp.is_active());
+        assert!(!rmcp.is_rmcp_plus());
     }
 }

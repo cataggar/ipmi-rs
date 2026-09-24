@@ -56,6 +56,12 @@ pub enum Active {
 #[derive(Debug, Clone)]
 pub(super) struct RmcpWithState<T>(T);
 
+impl RmcpWithState<Active> {
+    pub(super) fn is_rmcp_plus(&self) -> bool {
+        matches!(self.state(), Active::V2_0(_))
+    }
+}
+
 impl<T> RmcpWithState<T> {
     fn state(&self) -> &T {
         &self.0

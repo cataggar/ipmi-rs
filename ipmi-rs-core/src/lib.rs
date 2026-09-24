@@ -5,6 +5,8 @@
 
 pub mod app;
 
+pub mod chassis;
+
 pub mod connection;
 
 pub mod storage;
