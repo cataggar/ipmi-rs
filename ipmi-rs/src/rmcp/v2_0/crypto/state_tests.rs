@@ -9,8 +9,7 @@ use crate::rmcp::{
 };
 
 // MACs and key derivations were generated independently with Python's hmac/hashlib.
-#[test]
-fn suite17_rakp_key_and_mac_vectors() {
+fn suite17_rakp_key_and_mac_vectors_for(provider: CryptoProvider) {
     let osr = OSR::from_data(
         &hex::decode("000004004030201088776655000000080300000001000008040000000200000801000000")
             .unwrap(),
@@ -43,7 +42,7 @@ fn suite17_rakp_key_and_mac_vectors() {
     ))
     .unwrap();
     let m2 = RM2::from_data(&m2_wire).unwrap();
-    let mut state = CryptoState::new(None, b"correct horse battery staple");
+    let mut state = CryptoState::new_with_provider(None, b"correct horse battery staple", provider);
     let m3_mac = state.calculate_rakp3_data(&osr, &m1, &m2).unwrap().unwrap();
     assert_eq!(
         m3_mac,
@@ -134,21 +133,26 @@ fn suite17_rakp_key_and_mac_vectors() {
             corrupted.push(0);
         }
         let invalid_m2 = RM2::from_data(&corrupted).unwrap();
-        assert!(CryptoState::new(None, b"correct horse battery staple")
-            .calculate_rakp3_data(&osr, &m1, &invalid_m2)
-            .unwrap()
-            .is_none());
+        assert!(
+            CryptoState::new_with_provider(None, b"correct horse battery staple", provider)
+                .calculate_rakp3_data(&osr, &m1, &invalid_m2)
+                .unwrap()
+                .is_none()
+        );
     }
     let mut corrupted = m2_wire.clone();
     corrupted[45] ^= 1;
     let invalid_m2 = RM2::from_data(&corrupted).unwrap();
-    assert!(CryptoState::new(None, b"correct horse battery staple")
-        .calculate_rakp3_data(&osr, &m1, &invalid_m2)
-        .unwrap()
-        .is_none());
+    assert!(
+        CryptoState::new_with_provider(None, b"correct horse battery staple", provider)
+            .calculate_rakp3_data(&osr, &m1, &invalid_m2)
+            .unwrap()
+            .is_none()
+    );
 
     let kg: Vec<u8> = (0x20..0x40).collect();
-    let mut kg_state = CryptoState::new(Some(&kg), b"correct horse battery staple");
+    let mut kg_state =
+        CryptoState::new_with_provider(Some(&kg), b"correct horse battery staple", provider);
     assert_eq!(
         kg_state
             .calculate_rakp3_data(&osr, &m1, &m2)
@@ -162,4 +166,132 @@ fn suite17_rakp_key_and_mac_vectors() {
     );
     assert_ne!(kg_state.state.keys.k1, state.state.keys.k1);
     assert_eq!(CipherSuite::Id17.into_suite(), [3, 4, 1]);
+}
+
+#[test]
+fn suite17_rakp_key_and_mac_vectors() {
+    suite17_rakp_key_and_mac_vectors_for(CryptoProvider::RustCrypto);
+    #[cfg(feature = "symcrypt-backend")]
+    suite17_rakp_key_and_mac_vectors_for(CryptoProvider::SymCrypt);
+}
+
+fn suite3_rakp_key_and_mac_vectors_for(provider: CryptoProvider) {
+    let osr = OSR::from_data(
+        &hex::decode("000004004030201088776655000000080100000001000008010000000200000801000000")
+            .unwrap(),
+    )
+    .unwrap();
+    let username = Username::new("ADMIN").unwrap();
+    let m1 = RM1 {
+        message_tag: 0x0d,
+        managed_system_session_id: NonZeroU32::new(0x55667788).unwrap(),
+        remote_console_random_number: core::array::from_fn(|i| i as u8),
+        requested_maximum_privilege_level: PrivilegeLevel::Administrator,
+        username: &username,
+    };
+    let m2_wire = hex::decode(concat!(
+        "0d00000040302010",
+        "101112131415161718191a1b1c1d1e1f",
+        "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf",
+        "bc226b9f207eb9aa24ea53a6c5bb9b1683d541e0",
+    ))
+    .unwrap();
+    let m2 = RM2::from_data(&m2_wire).unwrap();
+    let mut state = CryptoState::new_with_provider(None, b"correct horse battery staple", provider);
+    let m3_mac = state.calculate_rakp3_data(&osr, &m1, &m2).unwrap().unwrap();
+    assert_eq!(
+        m3_mac,
+        hex::decode("ec50e49822cc8f6e55bf475708b8f6f120bbcf15").unwrap()
+    );
+    assert_eq!(
+        state.state.keys.sik,
+        hex::decode("a8e9e0c660a01fc8dcf8349b60d19101a7f2865a").unwrap()
+    );
+    assert_eq!(
+        state.state.keys.k1,
+        hex::decode("6598ff195d794966ae52fd52ef5e1a66a182fea6").unwrap()
+    );
+    assert_eq!(
+        state.state.keys.k2,
+        hex::decode("7d5a62d9c32d495cbe9db54d7dedee25b756251b").unwrap()
+    );
+    assert_eq!(
+        state.state.keys.k3,
+        hex::decode("ca0517efd325e614f8c91e6513a89277473f4d3c").unwrap()
+    );
+    assert_eq!(
+        state.state.keys.aes_key().as_slice(),
+        &hex::decode("7d5a62d9c32d495cbe9db54d7dedee25").unwrap()
+    );
+    let m3 = RakpMessage3 {
+        message_tag: 0x0a,
+        managed_system_session_id: m1.managed_system_session_id,
+        contents: RakpMessage3Contents::Success(&m3_mac),
+    };
+    let mut m3_wire = Vec::new();
+    m3.write(&mut m3_wire);
+    assert_eq!(
+        m3_wire,
+        hex::decode("0a00000088776655ec50e49822cc8f6e55bf475708b8f6f120bbcf15").unwrap()
+    );
+    let m4_wire = hex::decode("0a0000008877665546306d76848b7773555ff920").unwrap();
+    let m4 = RakpMessage4::from_data(&m4_wire).unwrap();
+    assert!(state
+        .verify(
+            osr.authentication_payload,
+            &m1.remote_console_random_number,
+            m1.managed_system_session_id.get(),
+            &m2.managed_system_guid,
+            m4.integrity_check_value,
+        )
+        .unwrap());
+    for bad_tag in [
+        &m4.integrity_check_value[..11],
+        &hex::decode("46306d76848b7773555ff921").unwrap()[..],
+    ] {
+        assert!(!state
+            .verify(
+                osr.authentication_payload,
+                &m1.remote_console_random_number,
+                m1.managed_system_session_id.get(),
+                &m2.managed_system_guid,
+                bad_tag,
+            )
+            .unwrap());
+    }
+    let mut tampered = m2_wire.clone();
+    tampered[41] ^= 1;
+    assert!(
+        CryptoState::new_with_provider(None, b"correct horse battery staple", provider)
+            .calculate_rakp3_data(&osr, &m1, &RM2::from_data(&tampered).unwrap())
+            .unwrap()
+            .is_none()
+    );
+    for mac_len in [19, 21] {
+        let mut bad_length = m2_wire.clone();
+        bad_length.resize(40 + mac_len, 0);
+        bad_length.truncate(40 + mac_len);
+        assert!(
+            CryptoState::new_with_provider(None, b"correct horse battery staple", provider)
+                .calculate_rakp3_data(&osr, &m1, &RM2::from_data(&bad_length).unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+    let mut substituted = osr;
+    substituted.integrity_payload = IntegrityAlgorithm::HmacSha256_128;
+    assert!(
+        CryptoState::new_with_provider(None, b"correct horse battery staple", provider)
+            .calculate_rakp3_data(&substituted, &m1, &m2)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!format!("{state:?}").contains("correct horse battery staple"));
+}
+
+#[test]
+fn suite3_rakp_key_and_mac_vectors() {
+    suite3_rakp_key_and_mac_vectors_for(CryptoProvider::RustCrypto);
+    #[cfg(feature = "symcrypt-backend")]
+    suite3_rakp_key_and_mac_vectors_for(CryptoProvider::SymCrypt);
 }

@@ -2,6 +2,9 @@ pub(crate) mod sha1;
 mod sha256;
 
 mod keys;
+mod provider;
+use provider::HashAlgorithm;
+pub use provider::{CryptoBackendError, CryptoProvider};
 
 mod state;
 pub use state::CryptoState;
@@ -16,7 +19,6 @@ pub enum CryptoUnwrapError {
     MismatchingAuthenticationState,
     IncorrectPayloadLen,
     IncorrectConfidentialityTrailerLen,
-    InvalidCiphertextLength,
     InvalidConfidentialityTrailer,
     AuthCodeMismatch,
     IncorrectIntegrityTrailerLen,
@@ -25,5 +27,6 @@ pub enum CryptoUnwrapError {
     InvalidCiphertext,
     UnsupportedIntegrityAlgorithm(IntegrityAlgorithm),
     UnsupportedConfidentialityAlgorithm(ConfidentialityAlgorithm),
+    CryptoBackend(CryptoBackendError),
 }
 use ipmi_rs_core::app::auth::{ConfidentialityAlgorithm, IntegrityAlgorithm};

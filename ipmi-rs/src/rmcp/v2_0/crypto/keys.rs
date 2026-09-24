@@ -1,14 +1,15 @@
-use aes::cipher::{consts::U16, generic_array::GenericArray};
+use zeroize::{Zeroize, Zeroizing};
 
-use super::{sha1::Sha1Hmac, sha256::Sha256Hmac};
+use super::{CryptoBackendError, CryptoProvider, HashAlgorithm};
 
-#[allow(unused)]
 pub struct Keys {
     pub(super) sik: Vec<u8>,
     pub(super) k1: Vec<u8>,
     pub(super) k2: Vec<u8>,
-    aes_key: GenericArray<u8, U16>,
+    aes_key: [u8; 16],
     pub(super) k3: Vec<u8>,
+    pub(super) provider: CryptoProvider,
+    pub(super) hash: HashAlgorithm,
 }
 
 impl core::fmt::Debug for Keys {
@@ -17,32 +18,56 @@ impl core::fmt::Debug for Keys {
     }
 }
 
+impl Drop for Keys {
+    fn drop(&mut self) {
+        self.sik.zeroize();
+        self.k1.zeroize();
+        self.k2.zeroize();
+        self.k3.zeroize();
+        self.aes_key.zeroize();
+    }
+}
+
 impl Keys {
+    pub fn empty() -> Self {
+        Self {
+            sik: Vec::new(),
+            k1: Vec::new(),
+            k2: Vec::new(),
+            k3: Vec::new(),
+            aes_key: [0; 16],
+            provider: CryptoProvider::RustCrypto,
+            hash: HashAlgorithm::Sha1,
+        }
+    }
+
+    pub fn derive(
+        provider: CryptoProvider,
+        hash: HashAlgorithm,
+        sik: &[u8],
+    ) -> Result<Self, CryptoBackendError> {
+        let k1 = Zeroizing::new(provider.hmac(hash, sik, &[&[0x01; 20]])?);
+        let k2 = Zeroizing::new(provider.hmac(hash, sik, &[&[0x02; 20]])?);
+        let k3 = Zeroizing::new(provider.hmac(hash, sik, &[&[0x03; 20]])?);
+        let mut aes_key = [0; 16];
+        aes_key.copy_from_slice(&k2[..16]);
+        Ok(Self {
+            sik: sik.to_vec(),
+            k1: k1.to_vec(),
+            k2: k2.to_vec(),
+            k3: k3.to_vec(),
+            aes_key,
+            provider,
+            hash,
+        })
+    }
+
+    #[cfg(test)]
     pub fn from_sik(sik: [u8; 20]) -> Self {
-        let k2 = Sha1Hmac::new(&sik).feed(&[0x02; 20]).finalize().to_vec();
-        let aes_key = <[u8; 16]>::try_from(&k2[..16]).unwrap().into();
-        Self {
-            sik: sik.to_vec(),
-            k1: Sha1Hmac::new(&sik).feed(&[0x01; 20]).finalize().to_vec(),
-            k2,
-            k3: Sha1Hmac::new(&sik).feed(&[0x03; 20]).finalize().to_vec(),
-            aes_key,
-        }
+        Self::derive(CryptoProvider::RustCrypto, HashAlgorithm::Sha1, &sik).unwrap()
     }
 
-    pub fn from_sha256_sik(sik: [u8; 32]) -> Self {
-        let k2 = Sha256Hmac::new(&sik).feed(&[0x02; 20]).finalize().to_vec();
-        let aes_key = <[u8; 16]>::try_from(&k2[..16]).unwrap().into();
-        Self {
-            sik: sik.to_vec(),
-            k1: Sha256Hmac::new(&sik).feed(&[0x01; 20]).finalize().to_vec(),
-            k2,
-            k3: Sha256Hmac::new(&sik).feed(&[0x03; 20]).finalize().to_vec(),
-            aes_key,
-        }
-    }
-
-    pub fn aes_key(&self) -> &GenericArray<u8, U16> {
+    pub fn aes_key(&self) -> &[u8; 16] {
         &self.aes_key
     }
 }

@@ -4,6 +4,7 @@ use crate::app::auth::PrivilegeLevel;
 
 mod crypto;
 use crypto::CryptoState;
+pub use crypto::{CryptoBackendError, CryptoProvider};
 
 mod messages;
 #[cfg(test)]
@@ -77,6 +78,7 @@ pub enum ActivationError {
     UnsupportedAuthenticationAlgorithm(AuthenticationAlgorithm),
     UnexpectedPayloadType(PayloadType),
     UnexpectedSessionHeader,
+    CryptoBackend(CryptoBackendError),
 }
 
 impl From<ParseSessionResponseError> for ActivationError {
@@ -114,6 +116,7 @@ pub enum WriteError {
     UnsupportedConfidentialityAlgorithm(ConfidentialityAlgorithm),
     Cancelled,
     DeadlineExpired,
+    CryptoBackend(CryptoBackendError),
 }
 
 impl From<std::io::Error> for WriteError {
@@ -344,6 +347,7 @@ impl State {
         username: &Username,
         password: &[u8],
         suite: CipherSuite,
+        provider: CryptoProvider,
     ) -> Result<Self, ActivationError> {
         use rand::{CryptoRng, Rng};
 
@@ -436,7 +440,7 @@ impl State {
         let mut payload = Vec::new();
         rm1.write(&mut payload);
 
-        log::debug!("Sending RMCP+ RAKP Message 1. {rm1:X?}");
+        log::debug!("Sending RMCP+ RAKP Message 1");
 
         send(&mut socket, PayloadType::RakpMessage1, payload)
             .map_err(ActivationError::SendRakpMessage1)?;
@@ -450,7 +454,7 @@ impl State {
         let rm2 = RakpMessage2::from_data(&v2_message.payload)
             .map_err(ActivationError::RakpMessage2Parse)?;
 
-        log::debug!("Received RMCP+ RAKP Message 2. {rm2:X?}");
+        log::debug!("Received RMCP+ RAKP Message 2");
 
         Self::validate_rm1_rm2(remote_console_session_id, &rm1, &rm2)?;
 
@@ -470,10 +474,11 @@ impl State {
             ));
         }
 
-        let mut crypto_state = CryptoState::new(None, password);
+        let mut crypto_state = CryptoState::new_with_provider(None, password, provider);
         let message_3_value = crypto_state
             .calculate_rakp3_data(&response, &rm1, &rm2)
-            .map_err(ActivationError::UnsupportedAuthenticationAlgorithm)?;
+            .map_err(ActivationError::CryptoBackend)?
+            .map(zeroize::Zeroizing::new);
 
         let rm3 = if let Some(m3) = message_3_value.as_ref() {
             RakpMessage3 {
@@ -496,7 +501,7 @@ impl State {
         let mut payload = Vec::new();
         rm3.write(&mut payload);
 
-        log::debug!("Sending RAKP message 3. {rm3:X?}");
+        log::debug!("Sending RAKP message 3");
 
         send(&mut socket, PayloadType::RakpMessage3, payload)
             .map_err(ActivationError::RakpMessage3Send)?;
@@ -514,7 +519,7 @@ impl State {
         let rm4 = RakpMessage4::from_data(&message.payload)
             .map_err(ActivationError::RakpMessage4Parse)?;
 
-        log::debug!("Received RAKP Message 4: {rm4:X?}");
+        log::debug!("Received RAKP Message 4");
 
         Self::validate_rm3_rm4(response.remote_console_session_id, &rm3, &rm4)?;
 
@@ -531,7 +536,7 @@ impl State {
                 &rm2.managed_system_guid,
                 rm4.integrity_check_value,
             )
-            .map_err(ActivationError::UnsupportedAuthenticationAlgorithm)?
+            .map_err(ActivationError::CryptoBackend)?
         {
             log::error!("Received incorrect/invalid integrity check value in RAKP Message 4.");
             return Err(ActivationError::RakpMessage4InvalidIntegrityCheckValue);

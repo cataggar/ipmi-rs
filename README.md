@@ -169,6 +169,59 @@ or selects any different authentication, integrity, or confidentiality algorithm
 it never falls back to suite 3 or IPMI 1.5. Suites other than 3 and 17
 are rejected before activation.
 
+### Optional SymCrypt RMCP+ backend
+
+The default build uses RustCrypto and does not need a native library. To
+select SymCrypt for **all** RMCP+ HMAC and AES-128-CBC operations (including
+RAKP authentication, SIK/K1/K2 and packet integrity), enable
+`symcrypt-backend` and request it explicitly:
+
+```rust,no_run
+use ipmi_rs::rmcp::{CipherSuite, CryptoProvider, Rmcp};
+use std::time::Duration;
+
+let mut connection = Rmcp::new("192.0.2.1:623", Duration::from_secs(3)).unwrap();
+let _result = connection.activate_with_provider(
+    CipherSuite::Id17,
+    CryptoProvider::SymCrypt,
+    Some("ADMIN"),
+    Some(b"password"),
+);
+// Handle `_result: Result<(), ActivationError>` as appropriate for your application.
+```
+
+Suites 3 (legacy SHA-1 interoperability) and 17 (SHA-256) are both supported.
+If the feature is absent, a SymCrypt request returns
+`ActivationError::CryptoBackend(CryptoBackendError::Unavailable)` **before
+network I/O**. A rejected cipher suite or altered algorithms never select
+another provider, a weaker suite, or IPMI 1.5. `activate()` retains its
+existing suite-3/default-backend behavior and IPMI 1.5 compatibility.
+
+The pinned `symcrypt` Rust wrapper **0.5.1** requires native
+[Microsoft SymCrypt](https://github.com/microsoft/SymCrypt/releases)
+**v103.4.2 or newer**. Its documented targets are Ubuntu and Azure Linux 3
+(AMD64/ARM64) and Windows (AMD64/ARM64); other combinations are unverified.
+For Linux, install the matching official SymCrypt release (or distro package)
+and make `libsymcrypt.so*` available **both** to the build-time linker and
+to the runtime loader. For an unpacked release with `lib/` at `<release>`:
+
+```sh
+export RUSTFLAGS="-L native=<release>/lib"
+export LD_LIBRARY_PATH="<release>/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+cargo test -p ipmi-rs --features symcrypt-backend
+```
+
+Alternatively install the library in a system linker path and refresh the
+loader cache. On Windows, put `symcrypt.lib` in the directory named by
+`SYMCRYPT_LIB_PATH` at build time and ensure the matching `symcrypt.dll` is
+discoverable at runtime (for example beside the executable or in `PATH`).
+The wrapper dynamically links SymCrypt: simply enabling the feature does not
+bundle the native library. CI installs the SHA-256-verified official v103.4.2
+AMD64 release for `--all-features` jobs. The 0.5.1 wrapper does **not** wipe
+its AES expanded-key allocation on drop; our owned passwords and derived
+key buffers are wiped, but this wrapper limitation remains. Selecting a
+provider does **not** by itself make a deployment FIPS-compliant.
+
 | Authentication algorithm | Supported      |
 | :----------------------- | :------------- |
 | RAKP-HMAC-SHA1           | Yes (suite 3)  |

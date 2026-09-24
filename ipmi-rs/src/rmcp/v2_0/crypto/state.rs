@@ -1,53 +1,57 @@
-use ipmi_rs_core::app::auth::AuthenticationAlgorithm;
+use ipmi_rs_core::app::auth::{
+    AuthenticationAlgorithm, ConfidentialityAlgorithm, IntegrityAlgorithm,
+};
 use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::rmcp::{
-    v2_0::{
-        crypto::{sha1::Sha1Hmac, sha256::Sha256Hmac},
-        ReadError, WriteError,
-    },
+    v2_0::{ReadError, WriteError},
     Message, OpenSessionResponse as OSR, RakpMessage1 as RM1, RakpMessage2 as RM2,
 };
 
-use super::{keys::Keys, SubState};
+use super::{keys::Keys, CryptoBackendError, CryptoProvider, HashAlgorithm, SubState};
 
 pub struct CryptoState {
     password: Vec<u8>,
     kg: Option<Vec<u8>>,
+    provider: CryptoProvider,
     state: SubState,
 }
 
 impl core::fmt::Debug for CryptoState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CryptoState")
-            .field("password", &"<redacted>")
-            .field("kg", &"<redacted>")
+            .field("provider", &self.provider)
             .field("state", &self.state)
             .finish()
     }
 }
 
-impl Default for CryptoState {
-    fn default() -> Self {
-        Self {
-            password: Vec::new(),
-            kg: None,
-            state: SubState::empty(),
+impl Drop for CryptoState {
+    fn drop(&mut self) {
+        self.password.zeroize();
+        if let Some(kg) = &mut self.kg {
+            kg.zeroize();
         }
     }
 }
 
-impl CryptoState {
-    fn kg(&self) -> &[u8] {
-        self.kg.as_ref().map_or(self.password.as_ref(), |v| &v[..])
+impl Default for CryptoState {
+    fn default() -> Self {
+        Self::new(None, &[])
     }
 }
 
 impl CryptoState {
     pub fn new(kg: Option<&[u8]>, password: &[u8]) -> Self {
+        Self::new_with_provider(kg, password, CryptoProvider::RustCrypto)
+    }
+
+    pub fn new_with_provider(kg: Option<&[u8]>, password: &[u8], provider: CryptoProvider) -> Self {
         Self {
             kg: kg.map(ToOwned::to_owned),
             password: password.to_vec(),
+            provider,
             state: SubState::empty(),
         }
     }
@@ -57,12 +61,82 @@ impl CryptoState {
         osr: &OSR,
         m1: &RM1,
         m2: &RM2,
-    ) -> Result<Option<Vec<u8>>, AuthenticationAlgorithm> {
-        match osr.authentication_payload {
-            AuthenticationAlgorithm::RakpHmacSha1 => Ok(self.validate_hmac_sha1(osr, m1, m2)),
-            AuthenticationAlgorithm::RakpHmacSha256 => Ok(self.validate_hmac_sha256(osr, m1, m2)),
-            unsupported => Err(unsupported),
+    ) -> Result<Option<Vec<u8>>, CryptoBackendError> {
+        let hash = match (
+            osr.authentication_payload,
+            osr.integrity_payload,
+            osr.confidentiality_payload,
+        ) {
+            (
+                AuthenticationAlgorithm::RakpHmacSha1,
+                IntegrityAlgorithm::HmacSha1_96,
+                ConfidentialityAlgorithm::AesCbc128,
+            ) => HashAlgorithm::Sha1,
+            (
+                AuthenticationAlgorithm::RakpHmacSha256,
+                IntegrityAlgorithm::HmacSha256_128,
+                ConfidentialityAlgorithm::AesCbc128,
+            ) => HashAlgorithm::Sha256,
+            _ => return Ok(None),
+        };
+
+        let role = [
+            u8::from(m1.requested_maximum_privilege_level),
+            m1.username.len(),
+        ];
+        let remote_id = m2.remote_console_session_id.get().to_le_bytes();
+        let managed_id = m1.managed_system_session_id.get().to_le_bytes();
+        let expected = Zeroizing::new(self.provider.hmac(
+            hash,
+            &self.password,
+            &[
+                &remote_id,
+                &managed_id,
+                &m1.remote_console_random_number,
+                &m2.managed_system_random_number,
+                &m2.managed_system_guid,
+                &role,
+                m1.username,
+            ],
+        )?);
+
+        if m2.key_exchange_auth_code.len() != hash.digest_len()
+            || !bool::from(m2.key_exchange_auth_code.ct_eq(expected.as_slice()))
+        {
+            return Ok(None);
         }
+
+        let sik = Zeroizing::new(self.provider.hmac(
+            hash,
+            self.kg.as_deref().unwrap_or(&self.password),
+            &[
+                &m1.remote_console_random_number,
+                &m2.managed_system_random_number,
+                &role,
+                m1.username,
+            ],
+        )?);
+
+        let output = Zeroizing::new(self.provider.hmac(
+            hash,
+            &self.password,
+            &[
+                &m2.managed_system_random_number,
+                &remote_id,
+                &role,
+                m1.username,
+            ],
+        )?);
+        self.state = SubState {
+            keys: Keys::derive(self.provider, hash, &sik)?,
+            confidentiality_algorithm: osr.confidentiality_payload,
+            integrity_algorithm: osr.integrity_payload,
+        };
+        self.password.zeroize();
+        if let Some(kg) = &mut self.kg {
+            kg.zeroize();
+        }
+        Ok(Some(output.to_vec()))
     }
 
     pub fn verify(
@@ -72,121 +146,33 @@ impl CryptoState {
         managed_system_session_id: u32,
         managed_system_guid: &[u8; 16],
         integrity_check_value: &[u8],
-    ) -> Result<bool, AuthenticationAlgorithm> {
-        match algorithm {
-            AuthenticationAlgorithm::RakpHmacSha1 => {
-                let integrity = &Sha1Hmac::new(&self.state.keys.sik)
-                    .feed(remote_console_random_number)
-                    .feed(&managed_system_session_id.to_le_bytes())
-                    .feed(managed_system_guid)
-                    .finalize()[..12];
-
-                Ok(integrity_check_value.len() == integrity.len()
-                    && integrity_check_value.ct_eq(integrity).unwrap_u8() == 1)
-            }
-            AuthenticationAlgorithm::RakpHmacSha256 => {
-                let integrity = Sha256Hmac::new(&self.state.keys.sik)
-                    .feed(remote_console_random_number)
-                    .feed(&managed_system_session_id.to_le_bytes())
-                    .feed(managed_system_guid)
-                    .finalize();
-
-                Ok(integrity_check_value.len() == 16
-                    && integrity_check_value.ct_eq(&integrity[..16]).unwrap_u8() == 1)
-            }
-            unsupported => Err(unsupported),
-        }
-    }
-
-    fn validate_hmac_sha1(&mut self, osr: &OSR, m1: &RM1, m2: &RM2) -> Option<Vec<u8>> {
-        let privilege_level_byte = u8::from(m1.requested_maximum_privilege_level);
-
-        let hmac_output = Sha1Hmac::new(&self.password)
-            .feed(&m2.remote_console_session_id.get().to_le_bytes())
-            .feed(&m1.managed_system_session_id.get().to_le_bytes())
-            .feed(&m1.remote_console_random_number)
-            .feed(&m2.managed_system_random_number)
-            .feed(&m2.managed_system_guid)
-            .feed(&[privilege_level_byte, m1.username.len()])
-            .feed(m1.username)
-            .finalize();
-
-        if m2.key_exchange_auth_code.len() == hmac_output.len()
-            && m2.key_exchange_auth_code.ct_eq(&hmac_output).unwrap_u8() == 1
-        {
-            let sik = Sha1Hmac::new(self.kg())
-                .feed(&m1.remote_console_random_number)
-                .feed(&m2.managed_system_random_number)
-                .feed(&[privilege_level_byte, m1.username.len()])
-                .feed(m1.username)
-                .finalize();
-
-            let output = Sha1Hmac::new(&self.password)
-                .feed(&m2.managed_system_random_number)
-                .feed(&m2.remote_console_session_id.get().to_le_bytes())
-                .feed(&[privilege_level_byte, m1.username.len()])
-                .feed(m1.username)
-                .finalize();
-
-            let new_state = SubState {
-                keys: Keys::from_sik(sik),
-                confidentiality_algorithm: osr.confidentiality_payload,
-                integrity_algorithm: osr.integrity_payload,
-            };
-
-            self.state = new_state;
-
-            Some(output.to_vec())
-        } else {
-            None
-        }
-    }
-
-    fn validate_hmac_sha256(&mut self, osr: &OSR, m1: &RM1, m2: &RM2) -> Option<Vec<u8>> {
-        let privilege_level_byte = u8::from(m1.requested_maximum_privilege_level);
-        let role_and_username_len = [privilege_level_byte, m1.username.len()];
-
-        let hmac_output = Sha256Hmac::new(&self.password)
-            .feed(&m2.remote_console_session_id.get().to_le_bytes())
-            .feed(&m1.managed_system_session_id.get().to_le_bytes())
-            .feed(&m1.remote_console_random_number)
-            .feed(&m2.managed_system_random_number)
-            .feed(&m2.managed_system_guid)
-            .feed(&role_and_username_len)
-            .feed(m1.username)
-            .finalize();
-
-        if m2.key_exchange_auth_code.len() != hmac_output.len()
-            || !bool::from(m2.key_exchange_auth_code.ct_eq(&hmac_output[..]))
-        {
-            return None;
-        }
-
-        let sik = Sha256Hmac::new(self.kg())
-            .feed(&m1.remote_console_random_number)
-            .feed(&m2.managed_system_random_number)
-            .feed(&role_and_username_len)
-            .feed(m1.username)
-            .finalize();
-
-        let output = Sha256Hmac::new(&self.password)
-            .feed(&m2.managed_system_random_number)
-            .feed(&m2.remote_console_session_id.get().to_le_bytes())
-            .feed(&role_and_username_len)
-            .feed(m1.username)
-            .finalize();
-
-        self.state = SubState {
-            keys: Keys::from_sha256_sik(sik),
-            confidentiality_algorithm: osr.confidentiality_payload,
-            integrity_algorithm: osr.integrity_payload,
+    ) -> Result<bool, CryptoBackendError> {
+        let hash = match algorithm {
+            AuthenticationAlgorithm::RakpHmacSha1 => HashAlgorithm::Sha1,
+            AuthenticationAlgorithm::RakpHmacSha256 => HashAlgorithm::Sha256,
+            _ => return Ok(false),
         };
-
-        Some(output.to_vec())
+        if hash != self.state.keys.hash || self.state.keys.sik.is_empty() {
+            return Ok(false);
+        }
+        let session_id = managed_system_session_id.to_le_bytes();
+        let integrity = Zeroizing::new(self.provider.hmac(
+            hash,
+            &self.state.keys.sik,
+            &[
+                remote_console_random_number,
+                &session_id,
+                managed_system_guid,
+            ],
+        )?);
+        let tag_len = match hash {
+            HashAlgorithm::Sha1 => 12,
+            HashAlgorithm::Sha256 => 16,
+        };
+        Ok(integrity_check_value.len() == tag_len
+            && bool::from(integrity_check_value.ct_eq(&integrity[..tag_len])))
     }
-}
 
-impl CryptoState {
     pub fn read_payload(&mut self, data: &mut [u8]) -> Result<Message, ReadError> {
         self.state.read_payload(data)
     }
