@@ -1,7 +1,7 @@
 //! Quanta QCT platform discovery used by OEM memory SEL decoding.
 
 use crate::connection::{Message, NetFn};
-use crate::storage::sel::Entry;
+use crate::storage::sel::{Entry, SelEntryInfo};
 
 use super::OemCommand;
 
@@ -30,19 +30,19 @@ pub struct MemoryLocation {
 }
 
 impl MemoryLocation {
-    /// Decode a Purley memory SEL record, after checking the target's identity
-    /// and querying its platform with `Ipmi::send_oem(GetPlatformId)`.
+    /// Decode a Purley memory SEL record returned by `GetSelEntry`, after
+    /// checking the target's identity and querying its platform with
+    /// `Ipmi::send_oem(GetPlatformId)`.
     ///
     /// Grantley has no memory-location mapping in the ipmitool source.
     /// Standard SEL records do not carry a manufacturer ID; the caller must
     /// supply a platform obtained from the same Quanta device as the record.
-    pub fn from_sel_entry(platform: Platform, entry: &Entry) -> Option<Self> {
+    pub fn from_sel_entry(platform: Platform, info: &SelEntryInfo) -> Option<Self> {
         let Entry::System {
             sensor_type: 0x0C,
             event_type: 0x6F,
-            raw_event_data,
             ..
-        } = entry
+        } = &info.entry
         else {
             return None;
         };
@@ -51,7 +51,7 @@ impl MemoryLocation {
             return None;
         }
 
-        let location = raw_event_data[2];
+        let location = info.raw[15];
         Some(Self {
             cpu: (location >> 6) & 0x03,
             channel: (location >> 3) & 0x07,

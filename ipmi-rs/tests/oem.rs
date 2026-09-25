@@ -329,38 +329,60 @@ fn quanta_purley_memory_location_decodes_sel_fixture_without_cli_text() {
             channel: location[1],
             dimm: location[2],
         };
-        let entry = GetSelEntry::parse_success_response(&quanta_fixture(fixture))
-            .unwrap()
-            .entry;
+        let info = GetSelEntry::parse_success_response(&quanta_fixture(fixture)).unwrap();
         assert_eq!(
-            MemoryLocation::from_sel_entry(Platform::Purley, &entry),
+            MemoryLocation::from_sel_entry(Platform::Purley, &info),
             Some(expected)
         );
         assert_eq!(
-            MemoryLocation::from_sel_entry(Platform::Grantley, &entry),
+            MemoryLocation::from_sel_entry(Platform::Grantley, &info),
             None
         );
         if fixture == "sel_cpu3_h7" {
-            assert!(matches!(
-                entry,
-                Entry::System {
-                    raw_event_data: [0, 0x11, 0xFF],
-                    ..
-                }
-            ));
+            assert_eq!(info.raw[13..], [0, 0x11, 0xFF]);
         }
     }
 
     for fixture in ["sel_temperature", "sel_other_event"] {
-        let entry = GetSelEntry::parse_success_response(&quanta_fixture(fixture))
-            .unwrap()
-            .entry;
+        let info = GetSelEntry::parse_success_response(&quanta_fixture(fixture)).unwrap();
         assert_eq!(
-            MemoryLocation::from_sel_entry(Platform::Purley, &entry),
+            MemoryLocation::from_sel_entry(Platform::Purley, &info),
             None
         );
     }
     assert!(GetSelEntry::parse_success_response(&[0, 0, 1]).is_err());
+}
+
+#[test]
+fn existing_sel_system_variant_supports_exhaustive_match_and_construction() {
+    let info = GetSelEntry::parse_success_response(&quanta_fixture("sel_cpu3_h7")).unwrap();
+    let original = info.entry.clone();
+    let Entry::System {
+        record_id,
+        timestamp,
+        generator_id,
+        event_message_format,
+        sensor_type,
+        sensor_number,
+        event_direction,
+        event_type,
+        event_data,
+    } = info.entry
+    else {
+        panic!("expected standard SEL entry");
+    };
+    let reconstructed = Entry::System {
+        record_id,
+        timestamp,
+        generator_id,
+        event_message_format,
+        sensor_type,
+        sensor_number,
+        event_direction,
+        event_type,
+        event_data,
+    };
+    assert_eq!(reconstructed, original);
 }
 
 #[test]

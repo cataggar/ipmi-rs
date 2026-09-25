@@ -283,11 +283,12 @@ ipmitool dispatch paths and fixture-backed tests.
 [coverage matrix]: ../docs/group-extensions.md
 
 For Quanta (IANA 7244), `oem::quanta::GetPlatformId` checks the BMC identity
-before requesting the platform: Grantley (1) or Purley (2). Given a SEL `Entry`
-read from that **same device**, `oem::quanta::MemoryLocation::from_sel_entry`
-returns structured zero-based CPU, channel (0 = A through 7 = H), and DIMM
-numbers for Purley sensor-specific memory records, or `None` otherwise.
-Raw SEL event bytes are retained so location `0xFF` remains decodable.
+before requesting the platform: Grantley (1) or Purley (2). Given a
+`SelEntryInfo` read from that **same device** using `GetSelEntry`,
+`oem::quanta::MemoryLocation::from_sel_entry` returns structured zero-based
+CPU, channel (0 = A through 7 = H), and DIMM numbers for Purley sensor-specific
+memory records, or `None` otherwise. The existing `SelEntryInfo::raw` record
+retains byte `0xFF` without changing the public `Entry::System` shape.
 This is a read-only decode, not automatic platform discovery per SEL entry.
 The CLI's `CPU0_A0` display string is not part of the typed API; no live Quanta
 hardware has been verified.
