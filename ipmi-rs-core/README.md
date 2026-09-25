@@ -245,6 +245,8 @@ start (0x06), stop (0x02), and keystroke (0x03) commands. A `TsolEndpoint`
 encodes an IPv4 callback address followed by a big-endian UDP port; a
 `TsolKeystroke` holds 1–14 bytes with a one-byte sequence. These sans-IO
 commands do **not** validate the target manufacturer or channel on their own.
+`app::auth::SetSessionPrivilegeLevel` models App `0x3B` and returns the
+echoed *active* privilege, distinct from Activate Session's maximum.
 Use the opt-in, identity-checked `ipmi_rs::rmcp::Rmcp` TSOL lifecycle rather
 than sending commands directly to unknown devices. TSOL is not RMCP+ SOL or
 Intel ISOL.

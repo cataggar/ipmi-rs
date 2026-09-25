@@ -1002,15 +1002,19 @@ capture.close().map_err(|error| format!("{error:?}"))?;
 ```
 
 The preflight requires an active authenticated IPMI 1.5 session whose BMC
-reported **administrator** privilege and MD2/MD5 session authentication,
+reported **administrator** as the *maximum* permitted privilege and MD2/MD5
+session authentication,
 Get Device ID manufacturer **6653**, IPv4 control route, IPMI 1.5 channel
 capabilities with per-message/user authentication, and an available,
 session-based 802.3 LAN/IPMB channel permitting administrator access.
-Failure sends no OEM mutation. The receiver binds the local IPv4 address on
-that same control route before Start; nonlocal/NAT callback addresses and IPv6
-are not supported. Port `6230` matches ipmitool's default; port `0` lets the OS
-assign a free port, inspectable through `receiver_addr()`. Bind failures
-never send Start.
+It then sends App `0x3B` (Set Session Privilege Level) and requires the BMC
+to echo **administrator** as the *active* privilege before Start; a rejection,
+lower echo or lost reply stops without sending an OEM mutation. Activating
+IPMI 1.5 alone does not elevate active privilege. The receiver binds the local
+IPv4 address on that same control route before Start; nonlocal/NAT callback
+addresses and IPv6 are not supported. Port `6230` matches ipmitool's default;
+port `0` lets the OS assign a free port, inspectable through `receiver_addr()`.
+Bind failures never send Start.
 
 The typed Start/Stop payload is IPv4 octets followed by the **big-endian**
 receiver port. Interactive `send_input` accepts 1–14 explicit bytes per call,
@@ -1026,8 +1030,14 @@ its Debug implementation does not print console bytes. Each read has a
 monotonic deadline, cancellation is checked at most every 50 ms, and
 received datagrams are limited to 4096 bytes and 32 unrelated/empty
 datagrams per read. The four bytes of the legacy UDP header are skipped;
-short and oversized datagrams interrupt the session. No terminal raw
-mode, escape handling or CLI terminal presentation is provided. If an
+short and oversized datagrams interrupt the session. While the application
+continues reading or sending input, the library sends an authenticated
+Get Device ID keepalive after 30 seconds without control-session activity;
+successful input and keepalive reset this monotonic timer. It shares the
+call's absolute deadline and cancellation; failure interrupts TSOL and
+attempts bounded Stop, without sending or replaying any keystrokes.
+There is no background keepalive when an application stops polling. No
+terminal raw mode, escape handling or CLI terminal presentation is provided. If an
 application changes terminal state, it must restore it on *all* exits
 (including errors and cancellation), e.g. with a scope guard.
 

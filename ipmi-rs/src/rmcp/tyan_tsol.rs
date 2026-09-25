@@ -8,7 +8,10 @@ use std::{
 
 use crate::{
     app::{
-        auth::{GetChannelAuthenticationCapabilities, PrivilegeLevel},
+        auth::{
+            GetChannelAuthenticationCapabilities, PrivilegeLevel, SetSessionPrivilegeError,
+            SetSessionPrivilegeLevel,
+        },
         tyan_tsol::{TsolEndpoint, TsolKeystroke, TsolStart, TsolStop, UnexpectedTsolResponse},
         ChannelAccessMode, ChannelMediumType, ChannelPrivilegeLevel, ChannelProtocolType,
         ChannelSessionSupport, GetChannelAccess, GetChannelInfo, GetDeviceId,
@@ -26,9 +29,11 @@ pub const TYAN_TSOL_DEFAULT_PORT: u16 = 6230;
 const MAX_UNRELATED: usize = 32;
 const POLL: Duration = Duration::from_millis(50);
 const CLEANUP_WAIT: Duration = Duration::from_millis(250);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 type CommandError = IpmiError<RmcpIpmiError, UnexpectedTsolResponse>;
 type ProbeError = IpmiError<RmcpIpmiError, crate::connection::NotEnoughData>;
+type PrivilegeError = IpmiError<RmcpIpmiError, SetSessionPrivilegeError>;
 
 /// A bounded receive failure; the session stops on every such failure.
 #[derive(Debug)]
@@ -45,6 +50,7 @@ pub enum TsolReceiveError {
 #[derive(Debug)]
 pub enum TsolInterruptionReason {
     Receive(TsolReceiveError),
+    Keepalive(ProbeError),
     Keystroke(CommandError),
     Stop(CommandError),
     ClosedWithBufferedOutput,
@@ -96,6 +102,8 @@ pub enum TsolError {
     ChannelInfo(ProbeError),
     ChannelAccess(ProbeError),
     UnsupportedChannel,
+    SetSessionPrivilege(PrivilegeError),
+    ActivePrivilegeMismatch(PrivilegeLevel),
     InvalidInputLength,
     Closed,
     Start {
@@ -117,20 +125,30 @@ struct TsolSession<'a> {
     endpoint: TsolEndpoint,
     peer: Ipv4Addr,
     active: bool,
+    last_control_activity: Instant,
     key_sequence: u8,
     buffer: Box<[u8; MAX_DATAGRAM + 1]>,
     pending: std::ops::Range<usize>,
 }
 
-fn authenticated_v15(connection: &mut Rmcp) -> Result<&mut super::v1_5::State, TsolError> {
+fn eligible_v15(connection: &mut Rmcp) -> Result<&mut super::v1_5::State, TsolError> {
     match connection
         .active_state
         .as_mut()
         .map(|active| active.state_mut())
     {
-        Some(Active::V1_5(state)) if state.tsol_capable() => Ok(state),
+        Some(Active::V1_5(state)) if state.tsol_eligible() => Ok(state),
         Some(Active::V1_5(_)) => Err(TsolError::AuthenticatedAdministratorRequired),
         _ => Err(TsolError::Ipmi15Required),
+    }
+}
+
+fn authenticated_v15(connection: &mut Rmcp) -> Result<&mut super::v1_5::State, TsolError> {
+    let state = eligible_v15(connection)?;
+    if state.tsol_capable() {
+        Ok(state)
+    } else {
+        Err(TsolError::AuthenticatedAdministratorRequired)
     }
 }
 
@@ -170,7 +188,7 @@ impl Rmcp {
             SocketAddr::V4(remote) => *remote.ip(),
             SocketAddr::V6(_) => return Err(TsolError::Ipv4LanRequired),
         };
-        let (local, peer) = authenticated_v15(self)?
+        let (local, peer) = eligible_v15(self)?
             .tsol_route()
             .map_err(|_| TsolError::Ipv4LanRequired)?;
         if peer != remote || TsolEndpoint::new(local, 1).is_none() {
@@ -220,6 +238,17 @@ impl Rmcp {
         {
             return Err(TsolError::UnsupportedChannel);
         }
+
+        eligible_v15(ipmi.inner_mut())?.set_tsol_active_privilege(None);
+        let active = ipmi
+            .send_recv(SetSessionPrivilegeLevel {
+                privilege: PrivilegeLevel::Administrator,
+            })
+            .map_err(TsolError::SetSessionPrivilege)?;
+        if active != PrivilegeLevel::Administrator {
+            return Err(TsolError::ActivePrivilegeMismatch(active));
+        }
+        eligible_v15(self)?.set_tsol_active_privilege(Some(active));
         Ok((local, remote))
     }
 
@@ -242,6 +271,7 @@ impl Rmcp {
             endpoint,
             peer,
             active: true,
+            last_control_activity: Instant::now(),
             key_sequence: 0,
             buffer: Box::new([0; MAX_DATAGRAM + 1]),
             pending: 0..0,
@@ -251,8 +281,10 @@ impl Rmcp {
     /// Opt into Tyan TSOL on an authenticated IPMI 1.5 LAN session. The
     /// receiver binds the connection's IPv4 route; `port == 0` picks an
     /// ephemeral port, otherwise 6230 is ipmitool's conventional default.
-    /// Requires a Tyan device, authenticated administrator session and
-    /// an enabled, session-based LAN channel. Never falls back to RMCP+ SOL.
+    /// Requires a Tyan device, an authenticated IPMI 1.5 session able to
+    /// become administrator and an enabled LAN channel. Explicitly sets
+    /// and confirms administrator as the active session privilege before
+    /// sending Start. Never falls back to RMCP+ SOL.
     pub fn open_tyan_tsol_capture(&mut self, port: u16) -> Result<TsolCapture<'_>, TsolError> {
         self.open_tyan_tsol(port).map(TsolCapture)
     }
@@ -275,6 +307,13 @@ impl TsolSession<'_> {
         let output = BufferedTsolOutput(self.buffer[self.pending.clone()].to_vec());
         self.pending = 0..0;
         output
+    }
+
+    fn read_pending(&mut self, out: &mut [u8]) -> usize {
+        let count = out.len().min(self.pending.len());
+        out[..count].copy_from_slice(&self.buffer[self.pending.start..self.pending.start + count]);
+        self.pending.start += count;
+        count
     }
 
     fn interrupt(
@@ -321,6 +360,38 @@ impl TsolSession<'_> {
         Ok(())
     }
 
+    fn keepalive_if_due(&mut self, deadline: Instant) -> Result<(), TsolError> {
+        if self.last_control_activity.elapsed() < KEEPALIVE_INTERVAL {
+            return Ok(());
+        }
+        if self.connection.cancellation_token().is_cancelled() {
+            return Err(self.interrupt(
+                TsolInterruptionReason::Receive(TsolReceiveError::Cancelled),
+                false,
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(self.interrupt(
+                TsolInterruptionReason::Receive(TsolReceiveError::Timeout),
+                false,
+            ));
+        }
+        let previous = authenticated_v15(self.connection)?
+            .socket
+            .limit_deadline(deadline);
+        let result = Ipmi::new(&mut *self.connection).send_recv(GetDeviceId);
+        if let Ok(state) = authenticated_v15(self.connection) {
+            state.socket.restore_deadline(previous);
+        }
+        match result {
+            Ok(_) => {
+                self.last_control_activity = Instant::now();
+                Ok(())
+            }
+            Err(error) => Err(self.interrupt(TsolInterruptionReason::Keepalive(error), false)),
+        }
+    }
+
     fn read_until(&mut self, out: &mut [u8], deadline: Instant) -> Result<usize, TsolError> {
         if !self.active {
             return Err(TsolError::Closed);
@@ -328,14 +399,18 @@ impl TsolSession<'_> {
         if out.is_empty() {
             return Ok(0);
         }
+        let deadline = deadline.min(self.connection.unbound_state.policy().deadline());
         let mut unrelated = 0;
         loop {
+            if !self.pending.is_empty()
+                && (Instant::now() >= deadline
+                    || self.connection.cancellation_token().is_cancelled())
+            {
+                return Ok(self.read_pending(out));
+            }
+            self.keepalive_if_due(deadline)?;
             if !self.pending.is_empty() {
-                let count = out.len().min(self.pending.len());
-                out[..count]
-                    .copy_from_slice(&self.buffer[self.pending.start..self.pending.start + count]);
-                self.pending.start += count;
-                return Ok(count);
+                return Ok(self.read_pending(out));
             }
             if self.connection.cancellation_token().is_cancelled() {
                 return Err(self.interrupt(
@@ -343,9 +418,7 @@ impl TsolSession<'_> {
                     false,
                 ));
             }
-            let remaining = deadline
-                .min(self.connection.unbound_state.policy().deadline())
-                .saturating_duration_since(Instant::now());
+            let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(self.interrupt(
                     TsolInterruptionReason::Receive(TsolReceiveError::Timeout),
@@ -425,9 +498,21 @@ impl TsolSession<'_> {
                 false,
             ));
         }
+        let deadline = self.connection.unbound_state.policy().deadline();
+        self.keepalive_if_due(deadline)?;
         self.key_sequence = self.key_sequence.wrapping_add(1);
-        match Ipmi::new(&mut *self.connection).send_recv(command) {
-            Ok(()) => Ok(bytes.len()),
+        let previous = authenticated_v15(self.connection)?
+            .socket
+            .limit_deadline(deadline);
+        let result = Ipmi::new(&mut *self.connection).send_recv(command);
+        if let Ok(state) = authenticated_v15(self.connection) {
+            state.socket.restore_deadline(previous);
+        }
+        match result {
+            Ok(()) => {
+                self.last_control_activity = Instant::now();
+                Ok(bytes.len())
+            }
             Err(error) => {
                 let uncertain = may_have_executed(&error);
                 Err(self.interrupt(TsolInterruptionReason::Keystroke(error), uncertain))

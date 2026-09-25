@@ -74,7 +74,8 @@ pub struct State {
     session_sequence: u32,
     last_inbound_sequence: Option<u32>,
     activated: bool,
-    negotiated_privilege: Option<PrivilegeLevel>,
+    maximum_privilege: Option<PrivilegeLevel>,
+    active_privilege: Option<PrivilegeLevel>,
     negotiated_auth: Option<AuthType>,
 }
 
@@ -151,7 +152,8 @@ impl State {
         state.session_id = NonZeroU32::new(0x1234);
         state.session_sequence = 1;
         state.activated = true;
-        state.negotiated_privilege = Some(privilege);
+        state.maximum_privilege = Some(privilege);
+        state.active_privilege = None;
         state.negotiated_auth = Some(auth_type);
         state.auth_type = auth_type;
         state.password = Some([9; 16]);
@@ -172,17 +174,26 @@ impl State {
             session_sequence: 0,
             last_inbound_sequence: None,
             activated: false,
-            negotiated_privilege: None,
+            maximum_privilege: None,
+            active_privilege: None,
             negotiated_auth: None,
         }
     }
 
-    pub(super) fn tsol_capable(&self) -> bool {
+    pub(super) fn tsol_eligible(&self) -> bool {
         self.activated
-            && self.negotiated_privilege == Some(PrivilegeLevel::Administrator)
+            && self.maximum_privilege == Some(PrivilegeLevel::Administrator)
             && self.negotiated_auth == Some(self.auth_type)
             && matches!(self.auth_type, AuthType::MD2 | AuthType::MD5)
             && self.password.is_some()
+    }
+
+    pub(super) fn tsol_capable(&self) -> bool {
+        self.tsol_eligible() && self.active_privilege == Some(PrivilegeLevel::Administrator)
+    }
+
+    pub(super) fn set_tsol_active_privilege(&mut self, privilege: Option<PrivilegeLevel>) {
+        self.active_privilege = privilege;
     }
 
     pub(super) fn tsol_route(&self) -> std::io::Result<(Ipv4Addr, Ipv4Addr)> {
@@ -269,7 +280,8 @@ impl State {
         self.session_sequence = activation_info.initial_sequence_number;
         self.session_id = Some(activation_info.session_id);
         self.last_inbound_sequence = None;
-        self.negotiated_privilege = Some(activation_info.maximum_privilege_level);
+        self.maximum_privilege = Some(activation_info.maximum_privilege_level);
+        self.active_privilege = None;
         self.negotiated_auth = Some(activation_info.auth_type);
         self.activated = true;
         self.socket.clear_activation_deadline();

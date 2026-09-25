@@ -149,6 +149,16 @@ impl RmcpIpmiSocket {
             .unwrap_or_else(|| self.policy.deadline())
     }
 
+    /// Bound an IPMI transaction by its caller's absolute operation deadline.
+    pub(crate) fn limit_deadline(&mut self, deadline: Instant) -> Option<Instant> {
+        self.activation_deadline
+            .replace(self.deadline().min(deadline))
+    }
+
+    pub(crate) fn restore_deadline(&mut self, previous: Option<Instant>) {
+        self.activation_deadline = previous;
+    }
+
     pub fn cancellation_token(&self) -> CancellationToken {
         self.policy.cancellation.clone()
     }
