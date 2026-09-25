@@ -12,6 +12,10 @@ pub mod connection;
 /// Opt-in, identity-checked vendor-specific IPMI commands.
 pub mod oem;
 
+pub mod dcmi;
+
+pub mod node_manager;
+
 pub mod storage;
 
 pub mod sensor_event;

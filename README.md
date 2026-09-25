@@ -140,6 +140,28 @@ Never automatically resend a power command, even for a "node busy" response.
 A later status read is useful for observation but cannot prove whether a cycle
 or reset occurred.
 
+## DCMI and Node Manager
+
+`ipmi-rs` re-exports the typed `dcmi` and `node_manager` modules. For
+example, `ipmi.send_recv(dcmi::GetPowerReading(dcmi::PowerSample::Standard))`
+reads watts, and `dcmi::read_string(dcmi::StringKind::AssetTag,
+|request| ipmi.send_recv(request))` reads a bounded asset tag. NM commands
+require an explicit `node_manager::NodeManager::opt_in()` or matching Intel
+`GetDeviceId` manufacturer ID; nothing probes the OEM NetFn on connection.
+See the `ipmi-rs-core` README for supported subsets, units, privileges,
+pagination and uncertain mutation outcomes.
+
+## DCMI and Node Manager
+
+The typed [`dcmi`](ipmi-rs-core/src/dcmi.rs) and
+[`node_manager`](ipmi-rs-core/src/node_manager.rs) modules cover DCMI
+capability discovery, power, thermal, asset/configuration data, and Intel
+Node Manager policy, alert and threshold operations. NM requires explicit
+Intel vendor detection or an explicit OEM opt-in; requests are not sent
+until called. See the [`ipmi-rs-core` README](ipmi-rs-core/README.md) for
+supported command subsets, units, privileges, bounds and safe handling of
+unknown mutation outcomes.
+
 # Project structure
 
 This project contains three crates:
@@ -178,6 +200,8 @@ The following IPMI commands are currently supported in `ipmi-rs-core`:
 | Set SOL Configuration Parameters        | 26.2                  |
 | Get SOL Configuration Parameters        | 26.3                  |
 | Activate / Deactivate Payload (SOL)     | 24.1 / 24.2           |
+| DCMI capabilities / power / thermal / asset / configuration | DCMI 1.0–1.5, NetFn 0x2c |
+| Intel Node Manager policies / alerts / thresholds | Intel NM 1.0–3.0, OEM NetFn 0x2e |
 | Get SEL Info                            | 31.2                  |
 | Get SEL Allocation Info                 | 31.3                  |
 | Reserve SEL                             | 31.4                  |
