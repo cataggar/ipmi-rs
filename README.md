@@ -158,9 +158,20 @@ interrupt its own response. After a timeout or lost connection the outcome is
 **unknown**: neither retry the mutation automatically nor assume that an offline
 BMC proves success or failure.
 
-The core `ipmi_rs::chassis` boot-option commands support only parameters 0
-(set-in-progress), 3 (valid-bit clearing), 4 (boot-info acknowledgement), and 5
-(boot flags). For example, using an existing `Ipmi` connection:
+The core `ipmi_rs::chassis` module also exposes explicit host diagnostic
+interrupt (`PowerAction::DiagnosticInterrupt`) and ACPI soft shutdown
+(`PowerAction::AcpiSoftShutdown`) actions, `ChassisIdentify` (default interval,
+seconds/zero to stop, or optional force-on), restore-policy support query and
+typed policy write, and read-only restart cause and power-on-hours counters.
+Restore-policy writes affect the behavior after a future AC outage, not the
+host's current power state. Unsupported controller features return their
+completion code; force identify may be rejected by older controllers.
+
+Typed boot-option reads cover parameters 0 through 6: set-in-progress, service
+partition selector/scan, valid-bit clearing, boot-info acknowledgement, boot
+flags, and boot initiator info. Typed writes are explicit per parameter;
+service-partition scan writes only the request bit, never the BIOS-discovered
+bit. For example, using an existing `Ipmi` connection:
 
 ```rust
 use ipmi_rs::chassis::{
@@ -183,8 +194,16 @@ flags rather than performing a get/merge/set. EFI and clear-CMOS default to off;
 other boot-flag fields are sent as zero. It does not modify parameters 0, 3,
 or 4 implicitly, and does **not** restart the host. If coordination is needed,
 set those parameters explicitly. Get checks the parameter version, echoed
-selector, valid/unlocked state, lengths, and supported bits; unmodelled
-readbacks and unsupported writes fail instead of silently changing meaning.
+selector, valid/unlocked state and lengths. `BootFlags::Unknown` retains all
+five unmodelled readback bytes without treating them as an active override;
+unknown bits/devices cannot be written. `GetRawBootOption` can inspect unknown
+selectors, versions and locked values without providing a corresponding raw
+write.
+Parameter 7 uses `GetBootMailboxBlock::<N>` and `SetBootMailboxBlock::new`
+to read/write one specified block: block zero carries a 24-bit IANA PEN and
+at most 13 payload bytes, other blocks carry at most 16. The caller chooses
+each block explicitly; `0xc9` may signal end of mailbox. No bulk write,
+implicit commit, acknowledgement clearing, or host restart is performed.
 Boot-option support varies by controller and BIOS; completion codes (including
 `0x80` unsupported, `0x81` already in progress, `0x82` read-only) are surfaced,
 not worked around. Remote mutations should wait for the transport hardening

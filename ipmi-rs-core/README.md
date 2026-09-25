@@ -10,7 +10,11 @@ on top of `ipmi-rs-core`.
 
 The [`chassis`] module provides read-only `GetChassisStatus` and explicit
 `ChassisControl::new(PowerAction)` commands for **host** power (off, on, cycle, hard
-reset), distinct from BMC controller reset. Status parsing reports a typed error
+reset, diagnostic interrupt, ACPI soft shutdown), distinct from BMC controller
+reset. Explicit `ChassisIdentify`, policy-support query and restore-policy
+write, `GetSystemRestartCause`, and `GetPowerOnHours` cover additional standard
+chassis operations. The restore policy applies to a future AC power recovery,
+not the current host state. Status parsing reports a typed error
 for short responses and preserves unknown power restore policies. Failed
 commands retain their completion codes in the `ipmi-rs` connection error.
 Never automatically resend a chassis control request after a lost or ambiguous
@@ -19,12 +23,18 @@ response; a subsequent status read cannot prove whether a cycle/reset happened.
 [`chassis`]: https://docs.rs/ipmi-rs-core/latest/ipmi_rs_core/chassis/
 
 `app::{WarmReset, ColdReset}` resets the BMC, not the host. The typed
-`chassis::{GetSystemBootOptions, SetSystemBootOptions}` commands cover only
-boot-option parameters 0, 3, 4, and 5. Setting boot flags explicitly replaces
+`chassis::{GetSystemBootOptions, SetSystemBootOptions}` commands cover
+boot-option parameters 0 through 6 (including service partitions and boot
+initiator info). Parameter 7 is handled one block at a time by
+`GetBootMailboxBlock::<N>` and `SetBootMailboxBlock`, with strict bounds and
+block-zero IANA validation. Raw reads retain unknown selectors and locked
+values, but do not enable raw writes. Unknown boot flags are retained read-only.
+Setting boot flags explicitly replaces
 all five bytes; optional EFI/clear-CMOS and persistence require explicit
 selection. These commands never implicitly update other parameters, reset the
-host, or retry when the outcome is unknown after a timeout. Unsupported
-controllers or readback fields return errors.
+host, or retry when the outcome is unknown after a timeout. Controllers/BIOS
+may not support optional identify force-on, mailbox, service partitions or
+individual policies; completion errors remain visible.
 
 SOL commands are in `app::sol` (`ActivateSol`, `DeactivateSol`,
 `SolInstance`) and `transport` (`GetSolConfig`, `SetSolConfig`,
