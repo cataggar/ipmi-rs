@@ -46,11 +46,14 @@ pub trait OemCommand {
     }
 
     /// A bridged destination; `None` targets the session BMC.
+    ///
+    /// The checked sender snapshots this once for identity lookup and dispatch.
     fn target(&self) -> Option<(Address, Channel)> {
         None
     }
 
     /// The OEM command's logical unit; identity discovery always uses LUN zero.
+    /// The checked sender snapshots this once before the identity lookup.
     fn lun(&self) -> LogicalUnit {
         LogicalUnit::Zero
     }

@@ -58,11 +58,15 @@ impl IpmiCommand for TargetDeviceId {
     }
 }
 
-struct Checked<C>(C);
+struct Checked<C> {
+    command: C,
+    target: Option<(Address, Channel)>,
+    lun: LogicalUnit,
+}
 
 impl<C: OemCommand> From<Checked<C>> for Message {
     fn from(command: Checked<C>) -> Self {
-        command.0.into_message()
+        command.command.into_message()
     }
 }
 
@@ -79,11 +83,11 @@ impl<C: OemCommand> IpmiCommand for Checked<C> {
     }
 
     fn target(&self) -> Option<(Address, Channel)> {
-        self.0.target()
+        self.target
     }
 
     fn target_lun(&self) -> LogicalUnit {
-        self.0.lun()
+        self.lun
     }
 }
 
@@ -98,8 +102,10 @@ impl<CON: IpmiConnection> Ipmi<CON> {
         &mut self,
         command: C,
     ) -> Result<C::Output, OemError<CON::Error, C::Error>> {
+        let target = command.target();
+        let lun = command.lun();
         let device = self
-            .send_recv(TargetDeviceId(command.target()))
+            .send_recv(TargetDeviceId(target))
             .map_err(OemError::Identity)?;
         if device.manufacturer_id != C::MANUFACTURER_ID
             || C::PRODUCT_ID.is_some_and(|product| device.product_id != product)
@@ -113,6 +119,11 @@ impl<CON: IpmiConnection> Ipmi<CON> {
             });
         }
 
-        self.send_recv(Checked(command)).map_err(OemError::Command)
+        self.send_recv(Checked {
+            command,
+            target,
+            lun,
+        })
+        .map_err(OemError::Command)
     }
 }

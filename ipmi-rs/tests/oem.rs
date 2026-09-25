@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, num::NonZeroU8};
+use std::{cell::Cell, collections::VecDeque, num::NonZeroU8, rc::Rc};
 
 use ipmi_rs::{
     connection::{
@@ -359,6 +359,71 @@ fn bridged_identity_and_oem_command_target_same_device() {
             Channel::Numbered(ChannelNumber::new(NonZeroU8::new(2).unwrap()).unwrap()),
             LogicalUnit::Zero,
         )
+    );
+}
+
+#[test]
+fn mutable_command_cannot_change_target_or_lun_after_identity_check() {
+    struct Retargeting {
+        target: Cell<Option<(Address, Channel)>>,
+        lun: Cell<LogicalUnit>,
+        target_reads: Rc<Cell<usize>>,
+    }
+
+    impl OemCommand for Retargeting {
+        type Output = <GetVersion as OemCommand>::Output;
+        type Error = <GetVersion as OemCommand>::Error;
+        const MANUFACTURER_ID: u32 = 42;
+
+        fn into_message(self) -> Message {
+            GetVersion.into_message()
+        }
+
+        fn parse_success_response(data: &[u8]) -> Result<Self::Output, Self::Error> {
+            GetVersion::parse_success_response(data)
+        }
+
+        fn target(&self) -> Option<(Address, Channel)> {
+            self.target_reads.set(self.target_reads.get() + 1);
+            self.target.get()
+        }
+
+        fn lun(&self) -> LogicalUnit {
+            self.lun.get()
+        }
+
+        fn supports(&self, _: &ipmi_rs::app::DeviceId) -> bool {
+            self.target.set(Some((Address(0x84), Channel::Primary)));
+            self.lun.set(LogicalUnit::Zero);
+            true
+        }
+    }
+
+    let original_target = (
+        Address(0x82),
+        Channel::Numbered(ChannelNumber::new(NonZeroU8::new(2).unwrap()).unwrap()),
+    );
+    let target_reads = Rc::new(Cell::new(0));
+    let command = Retargeting {
+        target: Cell::new(Some(original_target)),
+        lun: Cell::new(LogicalUnit::Three),
+        target_reads: target_reads.clone(),
+    };
+    let mut mock = Mock::default();
+    mock.identity(42, 1);
+    mock.reply(0x2E, 0x24, 0, &[0; 65]);
+    let mut ipmi = Ipmi::new(mock);
+
+    assert!(ipmi.send_oem(command).is_ok());
+    assert_eq!(target_reads.get(), 1);
+    let requests = ipmi.release().sent;
+    assert_eq!(
+        requests[0].target,
+        RequestTargetAddress::BmcOrIpmb(original_target.0, original_target.1, LogicalUnit::Zero),
+    );
+    assert_eq!(
+        requests[1].target,
+        RequestTargetAddress::BmcOrIpmb(original_target.0, original_target.1, LogicalUnit::Three),
     );
 }
 
