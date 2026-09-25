@@ -115,6 +115,7 @@ pub enum RmcpIpmiSendError {
     BridgePayloadTooLarge(usize),
     InvalidNetfn(u8),
     IpmbSequenceExhausted,
+    IpmbSequenceReserved,
     SessionSequenceExhausted,
     SolFrame,
     Cancelled,
@@ -488,6 +489,26 @@ impl IpmiConnection for Rmcp {
         let result = active.send_recv(request);
         active.state_mut().socket_mut().end_bounded(previous);
         result
+    }
+
+    fn ipmb_sequence_budget(&self) -> Option<usize> {
+        Some(
+            self.active_state
+                .as_ref()
+                .map_or(0, RmcpWithState::ipmb_sequence_budget),
+        )
+    }
+
+    fn reserve_ipmb_sequences(&mut self, minimum: usize) -> bool {
+        self.active_state
+            .as_mut()
+            .is_some_and(|active| active.reserve_ipmb_sequences(minimum))
+    }
+
+    fn release_ipmb_sequences(&mut self) {
+        if let Some(active) = &mut self.active_state {
+            active.release_ipmb_sequences();
+        }
     }
 }
 

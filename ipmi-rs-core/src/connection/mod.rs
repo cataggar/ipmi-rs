@@ -232,6 +232,24 @@ pub trait IpmiConnection {
     ) -> Result<Response, Self::Error> {
         self.send_recv(request)
     }
+
+    /// Remaining non-reusable IPMB sequences in the active transport session.
+    /// `None` means the budget is **unknown**, not unlimited. Callers may
+    /// instead allow an explicitly audited unlimited transport via
+    /// [`Self::supports_long_mutation_workflows`].
+    fn ipmb_sequence_budget(&self) -> Option<usize> {
+        None
+    }
+
+    /// Reserve a minimum number of sequences for future requests in an
+    /// explicitly checked operation. Polling must not consume this floor.
+    /// An explicitly audited unlimited transport need not implement this.
+    fn reserve_ipmb_sequences(&mut self, _minimum: usize) -> bool {
+        false
+    }
+
+    /// End the reservation made with [`Self::reserve_ipmb_sequences`].
+    fn release_ipmb_sequences(&mut self) {}
 }
 
 impl<T: IpmiConnection + ?Sized> IpmiConnection for &mut T {
@@ -259,6 +277,18 @@ impl<T: IpmiConnection + ?Sized> IpmiConnection for &mut T {
         cancellation: &CancellationToken,
     ) -> Result<Response, Self::Error> {
         (**self).send_recv_deadline(request, deadline, cancellation)
+    }
+
+    fn ipmb_sequence_budget(&self) -> Option<usize> {
+        (**self).ipmb_sequence_budget()
+    }
+
+    fn reserve_ipmb_sequences(&mut self, minimum: usize) -> bool {
+        (**self).reserve_ipmb_sequences(minimum)
+    }
+
+    fn release_ipmb_sequences(&mut self) {
+        (**self).release_ipmb_sequences()
     }
 }
 

@@ -45,6 +45,7 @@ pub struct PendingRequest {
     queue_channel: u8,
     queue_available: bool,
     pub deadline: Instant,
+    poll_blocked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +59,7 @@ pub struct IpmbState {
     // after a request has timed out, even if a different request is pending.
     retired_sequences: [bool; 64],
     get_message_supported: bool,
+    reserved_sequences: Option<usize>,
 }
 
 impl Default for IpmbState {
@@ -70,6 +72,7 @@ impl Default for IpmbState {
             pending: None,
             retired_sequences: [false; 64],
             get_message_supported: true,
+            reserved_sequences: None,
         }
     }
 }
@@ -98,6 +101,27 @@ pub(super) struct RmcpWithState<T>(T);
 impl RmcpWithState<Active> {
     pub(super) fn is_rmcp_plus(&self) -> bool {
         matches!(self.state(), Active::V2_0(_))
+    }
+
+    pub(super) fn ipmb_sequence_budget(&self) -> usize {
+        match self.state() {
+            Active::V1_5(state) => state.ipmb_sequence_budget(),
+            Active::V2_0(state) => state.ipmb_sequence_budget(),
+        }
+    }
+
+    pub(super) fn reserve_ipmb_sequences(&mut self, minimum: usize) -> bool {
+        match self.state_mut() {
+            Active::V1_5(state) => state.reserve_ipmb_sequences(minimum),
+            Active::V2_0(state) => state.reserve_ipmb_sequences(minimum),
+        }
+    }
+
+    pub(super) fn release_ipmb_sequences(&mut self) {
+        match self.state_mut() {
+            Active::V1_5(state) => state.release_ipmb_sequences(),
+            Active::V2_0(state) => state.release_ipmb_sequences(),
+        }
     }
 }
 
@@ -465,6 +489,29 @@ fn correlate(data: &[u8], expected: ExpectedReply) -> Result<Response, RmcpIpmiR
 }
 
 impl IpmbState {
+    pub fn remaining_sequences(&self) -> usize {
+        (0..64)
+            .take_while(|index| {
+                !self.retired_sequences[(self.ipmb_sequence as usize + index) & 0x3f]
+            })
+            .count()
+    }
+
+    pub fn reserve_sequences(&mut self, minimum: usize) -> bool {
+        if self.pending.is_some()
+            || self.reserved_sequences.is_some()
+            || self.remaining_sequences() < minimum
+        {
+            return false;
+        }
+        self.reserved_sequences = Some(minimum);
+        true
+    }
+
+    pub fn release_sequences(&mut self) {
+        self.reserved_sequences = None;
+    }
+
     pub fn retire_pending(&mut self) {
         self.pending = None;
     }
@@ -535,8 +582,17 @@ impl IpmbState {
         } else {
             1
         };
+        if self
+            .reserved_sequences
+            .is_some_and(|minimum| minimum < needed)
+        {
+            return Err(RmcpIpmiSendError::IpmbSequenceExhausted);
+        }
         if (0..needed).any(|i| self.retired_sequences[(self.ipmb_sequence as usize + i) & 0x3f]) {
             return Err(RmcpIpmiSendError::IpmbSequenceExhausted);
+        }
+        if let Some(minimum) = &mut self.reserved_sequences {
+            *minimum -= needed;
         }
         let (payload, final_reply, send_acks, queue_channel) = if let Some((target, transit)) =
             target
@@ -605,13 +661,18 @@ impl IpmbState {
             queue_channel,
             queue_available: false,
             deadline,
+            poll_blocked: false,
         });
         Ok(payload)
     }
 
     pub fn needs_poll(&self) -> bool {
         self.pending.as_ref().is_some_and(|p| {
-            self.get_message_supported && p.send_acks[0].is_some() && p.acked[0] && p.poll.is_none()
+            self.get_message_supported
+                && !p.poll_blocked
+                && p.send_acks[0].is_some()
+                && p.acked[0]
+                && p.poll.is_none()
         })
     }
 
@@ -628,6 +689,13 @@ impl IpmbState {
             return Err(RmcpIpmiSendError::RequestPending);
         }
         let seq = self.ipmb_sequence as usize;
+        if self
+            .reserved_sequences
+            .is_some_and(|minimum| self.remaining_sequences() <= minimum)
+        {
+            self.pending.as_mut().expect("needs_poll").poll_blocked = true;
+            return Err(RmcpIpmiSendError::IpmbSequenceReserved);
+        }
         if self.retired_sequences[seq] {
             return Err(RmcpIpmiSendError::IpmbSequenceExhausted);
         }
@@ -849,6 +917,41 @@ mod tests {
         data[2] = Checksum::from_iter(data[..2].iter().copied());
         data.push(Checksum::from_iter(data[3..].iter().copied()));
         data
+    }
+
+    #[test]
+    fn reserved_bridge_sequences_survive_polls_and_never_wrap_or_reuse() {
+        let mut state = IpmbState::default();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert!(state.reserve_sequences(64));
+        assert!(!state.reserve_sequences(1));
+        let bridged_request = bridge(None);
+        state.begin(&bridged_request, deadline).unwrap();
+        assert_eq!(state.remaining_sequences(), 62);
+        let pending = state.pending.as_ref().unwrap();
+        let ack = pending.send_acks[0].unwrap();
+        let final_reply = pending.final_reply;
+        assert!(state.receive(&answer(ack, 0, &[])).unwrap().is_none());
+        assert!(matches!(
+            state.poll_message(),
+            Err(RmcpIpmiSendError::IpmbSequenceReserved)
+        ));
+        assert_eq!(state.remaining_sequences(), 62);
+        assert!(!state.needs_poll());
+        assert!(state
+            .receive(&answer(final_reply, 0, &[]))
+            .unwrap()
+            .is_some());
+        state.release_sequences();
+        for _ in 0..62 {
+            state.begin(&request(), deadline).unwrap();
+            state.retire_pending();
+        }
+        assert_eq!(state.remaining_sequences(), 0);
+        assert!(matches!(
+            state.begin(&request(), deadline),
+            Err(RmcpIpmiSendError::IpmbSequenceExhausted)
+        ));
     }
 
     #[test]
