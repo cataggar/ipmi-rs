@@ -217,11 +217,11 @@ impl core::fmt::Debug for Message {
 }
 
 impl Message {
-    /// Whether this message is a Set User Password request or response.
+    /// Whether this message may contain credentials, CLI input, or private ILOM data.
     ///
     /// Debug redacts these payloads; callers must not dump `data()` themselves.
     pub fn is_sensitive(&self) -> bool {
-        self.netfn() == NetFn::App && self.cmd == 0x47
+        (self.netfn() == NetFn::App && self.cmd == 0x47) || self.netfn().request_value() == 0x2E
     }
 
     /// Create a new request message with the provided `netfn`, `cmd` and `data`.

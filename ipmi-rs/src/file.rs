@@ -29,7 +29,8 @@ impl IpmiMessage {
     }
 
     fn is_password_command(&self) -> bool {
-        NetFn::from(self.netfn) == NetFn::App && self.cmd == 0x47
+        (NetFn::from(self.netfn) == NetFn::App && self.cmd == 0x47)
+            || NetFn::from(self.netfn).request_value() == 0x2E
     }
 
     fn trace_data(&self) -> String {
@@ -77,6 +78,15 @@ mod password_log_tests {
         };
         assert!(!msg.is_password_command());
         assert_ne!(msg.trace_data(), "[REDACTED]");
+        for netfn in [0x2e, 0x2f] {
+            let msg = IpmiMessage {
+                netfn,
+                cmd: 0x01,
+                data_len: secret.len() as u16,
+                data: secret.as_mut_ptr(),
+            };
+            assert_eq!(msg.trace_data(), "[REDACTED]");
+        }
     }
 }
 
