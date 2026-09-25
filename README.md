@@ -292,6 +292,9 @@ The following IPMI commands are currently supported in `ipmi-rs-core`:
 | Get SDR Repository Info                 | 33.9                  |
 | Get SDR Repository Allocation Info      | 33.10                 |
 | Get SDR                                 | 33.12                 |
+| HPM.1 Target Upgrade Capabilities        | PICMG HPM.1 `0x2e`   |
+| HPM.1 Component Properties               | PICMG HPM.1 `0x2f`   |
+| HPM.1 Upgrade / Rollback / Self-test Status | PICMG HPM.1 `0x34` / `0x37` / `0x36` |
 | Get FRU Inventory Area Info             | Storage command 0x10  |
 | Read FRU Data                           | Storage command 0x11  |
 | Write FRU Data                          | Storage command 0x12  |
@@ -406,6 +409,91 @@ read appears unchanged. Invalid lengths/addresses and short or extra successful
 responses fail instead of being silently padded or truncated. Remote devices
 behind satellite controllers additionally require bridged RMCP routing
 (issue #13); this work does not provide that routing.
+
+## HPM.1 firmware inventory and upgrades
+
+`ipmi_rs::hpm::read_inventory(&mut ipmi)` reads Device ID, HPM.1 capabilities,
+and the general properties, description and current version of every present
+component. It reads rollback and deferred versions only when a component
+advertises those capabilities. A supported component can still have no image
+in an optional slot: HPM.1 `0x81` (not supported), `0x83` (invalid property
+selector) and IPMI `0xcb` (requested data absent) on only these two queries
+yield `None` for that version. Other completion codes, lost responses and
+malformed data fail inventory; required properties always remain mandatory.
+Inventory and the typed status commands in
+`ipmi_rs::hpm` / `ipmi_rs_core::hpm` do not require an update feature and never
+write firmware. HPM.1 is **not** vendor-specific FWUM or IME.
+
+Firmware mutation requires the opt-in `hpm-update` feature:
+
+```sh
+cargo add ipmi-rs --features hpm-update
+```
+
+An existing `Ipmi` connection can use the following **explicit** sequence.
+Inspect the target inventory and obtain the update file from a trusted source;
+parse it in memory *before* constructing an updater:
+
+```rust,ignore
+use ipmi_rs::hpm::{read_inventory, package::Package, update::{Updater, UpdateOptions}};
+
+let package = Package::parse(&image_bytes)?;
+let inventory = read_inventory(&mut ipmi)?;
+let options = UpdateOptions::new(23, 100_000, false).expect("valid limits");
+let mut updater = Updater::new(&mut ipmi, &package, &inventory, options)?;
+updater.upload(|state| {
+    println!("component {:?}: {} / {} confirmed bytes",
+             state.component, state.confirmed_bytes, state.total_bytes);
+    !cancel_requested
+})?;
+// Upload does not activate. Only if explicitly approved:
+updater.activate()?;
+// Observe status with caller-managed deadlines/pacing:
+let status = updater.upgrade_status()?;
+let self_test = updater.self_test_result()?;
+```
+
+`Package::parse` checks signature, version, header and action checksums,
+entire-file MD5, OEM length, action types, nonempty and declared component
+masks, exactly-one-component upload records, nonzero image lengths, image
+bounds and full coverage. Package size is limited to 64 MiB and records to
+256. The MD5 is **only a file-integrity check**, not a signature or
+authentication: verify the trusted vendor/source independently. `Updater::new`
+rejects device/manufacturer/product or earliest-compatible-revision mismatch,
+unsupported components/actions, an undesirable update, unacknowledged
+service interruption, or a package exceeding the configured block budget.
+An image with `services_affected` (or a target advertising service disruption)
+requires `allow_service_disruption: true` in the explicitly provided options.
+No force-override for device identity is provided.
+
+Each block carries at most 23 firmware bytes (25 PICMG request bytes); the
+caller chooses a smaller size if required by the transport. The block number
+wraps after 255 per HPM.1. `max_blocks` bounds **all** blocks before the first
+write. Confirmed bytes advance only for successful, well-formed block replies.
+The workflow does not guess at an offset/length directive that would require
+skipping, overlapping or repeating image bytes.
+
+**Recovery:** a timeout, lost response, malformed acknowledgement, `0x80`
+in-progress completion or other ambiguous mutation error returns
+`UpdateError::Uncertain { state, source }`. Inspect `state.uncertain` (the
+attempted command/block/offset), `state.confirmed_bytes` and
+`state.finished_images`. No mutation is ever retried automatically, including
+initiate/finish/activate/rollback, and the updater refuses to continue an
+unresolved upload. A read-only `upgrade_status`, `rollback_status`, or
+`self_test_result` can aid manual investigation; upgrade status alone cannot
+prove whether **a particular upload block** was committed. Do not restart
+from a guessed offset. After checking the target and vendor recovery procedure,
+choose explicitly whether to abort (`ipmi_rs::hpm::AbortUpgrade`, feature-gated),
+roll back (`Updater::rollback()` if no operation is uncertain, or an explicit
+manual rollback command after external reconciliation), or recover by a
+device-specific procedure. Dropping or cancelling an updater never activates,
+aborts, retries, or rolls back; cancellation is checked *between* commands.
+After an acknowledged activation, check upgrade and self-test status yourself;
+after an acknowledged rollback check rollback status (`0x81` reports failure).
+Poll status at HPM.1-compliant intervals (at least 1 second for upgrade
+status, at least 100 ms for self-test/rollback) with a caller-imposed deadline;
+the library performs one read per call and never automatically reconnects or
+polls indefinitely. An acknowledged command can still be processing.
 
 ## BMC reset and boot overrides
 

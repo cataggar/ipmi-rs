@@ -45,6 +45,8 @@ serial = [ "dep:serialport" ]
 ami-usb = [ "dep:libc" ]
 symcrypt-backend = [ "dep:symcrypt" ]
 kontron-fwum-update = [ "ipmi-rs-core/kontron-fwum-update" ]
+md5 = [ "dep:md5" ]
+hpm-update = [ "md5", "ipmi-rs-core/hpm-update" ]
 
 [dev-dependencies]
 pretty_env_logger = "0.5"
