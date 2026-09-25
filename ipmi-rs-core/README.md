@@ -267,3 +267,17 @@ implicit retries; see the [HPM.1 usage and recovery guide][hpm].
 [hpm]: ../ipmi-rs/README.md#hpm1-firmware-inventory-and-upgrades
 
 [`ipmi-rs`]: https://crates.io/crates/ipmi-rs
+
+PICMG/ATCA and VITA 46.11 extension commands are opt-in with the
+`group-extensions` feature: see [`picmg`] and [`vita`]. Discover capability
+and version before other operations; there is no implicit discovery, routing,
+or mutation. Every response is checked for the correct group identifier and
+bounded length, including write acknowledgements. A timeout on a write has
+an unknown outcome and must not trigger automatic retry. For remote shelf,
+slot, or FRU addressing, use explicit bridged IPMB routing in RMCP/RMCP+;
+the typed commands target the local BMC by default. The [coverage matrix] lists the exact
+ipmitool dispatch paths and fixture-backed tests.
+
+[`picmg`]: https://docs.rs/ipmi-rs-core/latest/ipmi_rs_core/picmg/
+[`vita`]: https://docs.rs/ipmi-rs-core/latest/ipmi_rs_core/vita/
+[coverage matrix]: ../docs/group-extensions.md

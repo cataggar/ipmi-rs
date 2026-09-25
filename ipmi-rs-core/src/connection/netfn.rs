@@ -59,6 +59,14 @@ netfn!(
     Transport => [0x0C | 0x0D]
 );
 
+#[test]
+fn group_extension_preserves_raw_request_and_response_identity() {
+    assert_eq!(NetFn::from(0x2c), NetFn::Reserved(0x2c));
+    assert_eq!(NetFn::from(0x2d), NetFn::Reserved(0x2d));
+    assert_eq!(NetFn::Reserved(0x2c).request_value(), 0x2c);
+    assert_eq!(NetFn::Reserved(0x2c).response_value(), 0x2d);
+}
+
 impl NetFn {
     /// Check whether `v` is a response value.
     pub fn is_response_value(v: u8) -> bool {
