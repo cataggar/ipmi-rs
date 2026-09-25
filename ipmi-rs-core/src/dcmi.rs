@@ -100,6 +100,14 @@ impl CapabilitySelector {
             Self::ManagementAccess => 4,
         }
     }
+
+    fn data_len(self) -> usize {
+        match self {
+            Self::Platform | Self::ManagementAccess => 3,
+            Self::MandatoryAttributes => 4,
+            Self::OptionalAttributes => 2,
+        }
+    }
 }
 
 /// Get DCMI Capabilities (0x01); an unsupported controller returns a completion error.
@@ -112,68 +120,90 @@ impl From<GetCapabilities> for Message {
     }
 }
 
-/// A capability page: flags beyond the known bits and trailing OEM data remain raw.
+/// A capability page: standard and trailing OEM data remain raw until the
+/// original request's selector is supplied to [`CapabilityPage::decode`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CapabilityPage {
     /// DCMI conformance code, 0x0001 / 0x0101 / 0x0501 (1.0 / 1.1 / 1.5).
     pub conformance: u16,
     /// Known capability revision, 1 or 2.
     pub revision: u8,
-    /// Four uninterpreted selector-specific bytes.
-    pub data: [u8; 4],
-    /// Vendor-defined or future trailing bytes, never interpreted as standard.
-    pub extension: Vec<u8>,
+    /// Selector-specific bytes (2–4 standard bytes, possibly followed by OEM data).
+    pub data: Vec<u8>,
 }
 
 impl CapabilityPage {
-    /// Interpret this page only when it was requested with `Platform`.
-    pub fn platform(&self, selector: CapabilitySelector) -> Option<PlatformCapabilities> {
-        (selector == CapabilitySelector::Platform).then_some(PlatformCapabilities {
-            identification: self.data[0] & 1 != 0,
-            sel: self.data[0] & 2 != 0,
-            chassis_power: self.data[0] & 4 != 0,
-            temperature: self.data[0] & 8 != 0,
-            power_management: self.data[1] & 1 != 0,
-            unknown_mandatory: self.data[0] & !0x0f,
-            unknown_optional: self.data[1] & !1,
-            management_access: self.data[2],
-        })
+    fn standard_data(&self, selector: CapabilitySelector) -> Result<&[u8], DcmiError> {
+        let len = selector.data_len();
+        if self.data.len() < len {
+            return Err(DcmiError::Length {
+                expected: 4 + len,
+                actual: 4 + self.data.len(),
+            });
+        }
+        Ok(&self.data[..len])
+    }
+
+    /// Trailing OEM/future bytes after the requested selector's standard fields.
+    pub fn extension(&self, selector: CapabilitySelector) -> Result<&[u8], DcmiError> {
+        self.standard_data(selector)?;
+        Ok(&self.data[selector.data_len()..])
+    }
+
+    /// Interpret the page only if it was requested with `Platform`.
+    pub fn platform(
+        &self,
+        selector: CapabilitySelector,
+    ) -> Result<Option<PlatformCapabilities>, DcmiError> {
+        if selector != CapabilitySelector::Platform {
+            return Ok(None);
+        }
+        match self.decode(selector)? {
+            CapabilityDetails::Platform(platform) => Ok(Some(platform)),
+            _ => unreachable!(),
+        }
     }
 
     /// Decode the explicitly requested selector. Raw bytes always remain
     /// available; unrecognized bits and trailing OEM data are not discarded.
-    pub fn decode(&self, selector: CapabilitySelector) -> CapabilityDetails {
-        match selector {
-            CapabilitySelector::Platform => {
-                CapabilityDetails::Platform(self.platform(selector).unwrap())
-            }
+    pub fn decode(&self, selector: CapabilitySelector) -> Result<CapabilityDetails, DcmiError> {
+        let data = self.standard_data(selector)?;
+        Ok(match selector {
+            CapabilitySelector::Platform => CapabilityDetails::Platform(PlatformCapabilities {
+                identification: data[0] & 1 != 0,
+                sel: data[0] & 2 != 0,
+                chassis_power: data[0] & 4 != 0,
+                temperature: data[0] & 8 != 0,
+                power_management: data[1] & 1 != 0,
+                unknown_mandatory: data[0] & !0x0f,
+                unknown_optional: data[1] & !1,
+                management_access: data[2],
+            }),
             CapabilitySelector::MandatoryAttributes => {
-                let sel_flags = u16::from_le_bytes([self.data[0], self.data[1]]);
+                let sel_flags = u16::from_le_bytes([data[0], data[1]]);
                 CapabilityDetails::Mandatory(MandatoryAttributes {
                     sel_entries: sel_flags & 0x0fff,
-                    sel_rollover: self.data[1] & 0x80 != 0,
+                    sel_rollover: data[1] & 0x80 != 0,
                     reserved_sel_flags: sel_flags & 0x7000,
-                    identification_flags: self.data[2],
-                    temperature_flags: self.data[3],
+                    identification_flags: data[2],
+                    temperature_flags: data[3],
                 })
             }
             CapabilitySelector::OptionalAttributes => {
                 CapabilityDetails::Optional(OptionalAttributes {
-                    power_device_address: self.data[0],
-                    channel: self.data[1] >> 4,
-                    device_revision: self.data[1] & 0x0f,
-                    extra: [self.data[2], self.data[3]],
+                    power_device_address: data[0],
+                    channel: data[1] >> 4,
+                    device_revision: data[1] & 0x0f,
                 })
             }
             CapabilitySelector::ManagementAccess => {
                 CapabilityDetails::Management(ManagementAccess {
-                    primary_lan: (self.data[0] != 0xff).then_some(self.data[0]),
-                    secondary_lan: (self.data[1] != 0xff).then_some(self.data[1]),
-                    serial: (self.data[2] != 0xff).then_some(self.data[2]),
-                    extra: self.data[3],
+                    primary_lan: (data[0] != 0xff).then_some(data[0]),
+                    secondary_lan: (data[1] != 0xff).then_some(data[1]),
+                    serial: (data[2] != 0xff).then_some(data[2]),
                 })
             }
-        }
+        })
     }
 }
 
@@ -215,8 +245,6 @@ pub struct OptionalAttributes {
     pub channel: u8,
     /// Low-nibble revision.
     pub device_revision: u8,
-    /// Reserved or OEM bytes, not decoded as standard fields.
-    pub extra: [u8; 2],
 }
 
 /// Access channels; 0xff means the respective channel is unavailable.
@@ -228,8 +256,6 @@ pub struct ManagementAccess {
     pub secondary_lan: Option<u8>,
     /// Serial channel.
     pub serial: Option<u8>,
-    /// Reserved/OEM byte.
-    pub extra: u8,
 }
 
 /// The standardized platform feature bits; unrecognized bits are not discarded.
@@ -258,7 +284,7 @@ impl IpmiCommand for GetCapabilities {
     type Error = DcmiError;
 
     fn parse_success_response(data: &[u8]) -> Result<Self::Output, Self::Error> {
-        checked(data, 8)?;
+        checked(data, 4)?;
         if data.len() > MAX_CAPABILITY_BYTES {
             return Err(DcmiError::Bounds);
         }
@@ -272,8 +298,7 @@ impl IpmiCommand for GetCapabilities {
         Ok(CapabilityPage {
             conformance,
             revision: data[3],
-            data: [data[4], data[5], data[6], data[7]],
-            extension: data[8..].to_vec(),
+            data: data[4..].to_vec(),
         })
     }
 }
@@ -1190,38 +1215,100 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_discovery_preserves_extensions_and_rejects_unsupported() {
+    fn capabilities_discovery_decodes_each_selector_without_padding() {
         wire(GetCapabilities(CapabilitySelector::Platform), 1, &[1]);
-        let response = GetCapabilities::parse_success_response(&[
-            0xdc, 0x01, 0x05, 2, 0x9f, 0x81, 0x42, 0, 0xfe,
-        ])
-        .unwrap();
-        assert_eq!(response.conformance, 0x0501);
-        assert_eq!(response.extension, [0xfe]);
-        let flags = response.platform(CapabilitySelector::Platform).unwrap();
+        let platform =
+            GetCapabilities::parse_success_response(&[0xdc, 0x01, 0x05, 2, 0x9f, 0x81, 0x42])
+                .unwrap();
+        assert_eq!(platform.conformance, 0x0501);
+        assert_eq!(
+            platform.extension(CapabilitySelector::Platform),
+            Ok(&[][..])
+        );
+        let flags = platform
+            .platform(CapabilitySelector::Platform)
+            .unwrap()
+            .unwrap();
         assert!(flags.identification && flags.power_management && flags.temperature);
         assert_eq!(flags.unknown_mandatory, 0x90);
         assert_eq!(flags.unknown_optional, 0x80);
-        assert!(response
+        assert!(platform
             .platform(CapabilitySelector::MandatoryAttributes)
+            .unwrap()
             .is_none());
-        let mandatory = response.decode(CapabilitySelector::MandatoryAttributes);
+
+        let mandatory =
+            GetCapabilities::parse_success_response(&[0xdc, 0x01, 0x05, 2, 0x9f, 0x81, 0x42, 0x07])
+                .unwrap();
         assert!(matches!(
-            mandatory,
-            CapabilityDetails::Mandatory(MandatoryAttributes {
+            mandatory.decode(CapabilitySelector::MandatoryAttributes),
+            Ok(CapabilityDetails::Mandatory(MandatoryAttributes {
                 sel_entries: 0x19f,
                 sel_rollover: true,
+                temperature_flags: 7,
                 ..
-            })
+            }))
         ));
+
+        wire(
+            GetCapabilities(CapabilitySelector::OptionalAttributes),
+            1,
+            &[3],
+        );
+        let optional =
+            GetCapabilities::parse_success_response(&[0xdc, 1, 5, 2, 0x40, 0x21]).unwrap();
+        assert_eq!(
+            optional.decode(CapabilitySelector::OptionalAttributes),
+            Ok(CapabilityDetails::Optional(OptionalAttributes {
+                power_device_address: 0x40,
+                channel: 2,
+                device_revision: 1,
+            }))
+        );
+        let optional_oem =
+            GetCapabilities::parse_success_response(&[0xdc, 1, 5, 2, 0x40, 0x21, 0xa1, 0xb2])
+                .unwrap();
+        assert_eq!(
+            optional_oem.extension(CapabilitySelector::OptionalAttributes),
+            Ok(&[0xa1, 0xb2][..])
+        );
+
+        let management =
+            GetCapabilities::parse_success_response(&[0xdc, 1, 5, 2, 0xff, 2, 0xff, 0xfe]).unwrap();
         assert!(matches!(
-            response.decode(CapabilitySelector::ManagementAccess),
-            CapabilityDetails::Management(ManagementAccess {
-                primary_lan: Some(0x9f),
-                secondary_lan: Some(0x81),
-                ..
-            })
+            management.decode(CapabilitySelector::ManagementAccess),
+            Ok(CapabilityDetails::Management(ManagementAccess {
+                primary_lan: None,
+                secondary_lan: Some(2),
+                serial: None,
+            }))
         ));
+        assert_eq!(
+            management.extension(CapabilitySelector::ManagementAccess),
+            Ok(&[0xfe][..])
+        );
+
+        for (selector, expected) in [
+            (CapabilitySelector::Platform, 7),
+            (CapabilitySelector::MandatoryAttributes, 8),
+            (CapabilitySelector::OptionalAttributes, 6),
+            (CapabilitySelector::ManagementAccess, 7),
+        ] {
+            let mut truncated = vec![0xdc, 1, 5, 2];
+            truncated.resize(expected - 1, 0);
+            let page = GetCapabilities::parse_success_response(&truncated).unwrap();
+            assert_eq!(
+                page.decode(selector),
+                Err(DcmiError::Length {
+                    expected,
+                    actual: expected - 1,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn capability_discovery_rejects_invalid_conformance_revision_and_group() {
         assert_eq!(
             GetCapabilities::parse_success_response(&[0xdc; 41]),
             Err(DcmiError::Bounds)

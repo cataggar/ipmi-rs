@@ -142,8 +142,12 @@ verification limits. Ordinary raw `Message`/`Request` use remains possible.
 and activation, thermal policy, temperature and sensor-ID paging, asset tag
 and management-controller identifier, and configuration parameters 1–5.
 Call `GetCapabilities(CapabilitySelector::Platform)` first; its
-`CapabilityPage::decode(selector)` interprets only the selector you requested,
-preserving reserved bits and up to 32 trailing OEM bytes. Nonstandard
+`CapabilityPage::decode(selector)` validates that selector's standard length
+(platform 3, mandatory 4, optional 2, access 3 bytes after the common
+four-byte header); `CapabilityPage::extension(selector)` exposes any
+additional OEM bytes separately. Always decode with the selector originally
+requested: a raw `Ipmi::send_recv(GetCapabilities(selector))` page alone
+cannot determine which selector's bytes it contains. Nonstandard
 conformance/revisions and malformed payloads are errors, not guesses.
 Temperature readings are signed °C, power limits/readings are watts,
 correction times are milliseconds, and sample/exception/configuration

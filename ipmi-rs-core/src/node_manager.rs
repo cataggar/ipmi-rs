@@ -295,7 +295,7 @@ pub struct Discover {
 
 impl From<Discover> for Message {
     fn from(_: Discover) -> Self {
-        request(0xca, &[1, 0])
+        request(0xca, &[])
     }
 }
 
@@ -786,7 +786,7 @@ mod tests {
         device.manufacturer_id = 0x4242;
         assert!(NodeManager::from_device_id(&device).is_none());
         let nm = NodeManager::opt_in();
-        wire(nm.discover(), 0xca, &[1, 0]);
+        wire(nm.discover(), 0xca, &[]);
         assert_eq!(
             Discover::parse_success_response(&[0x57, 1, 0, 3, 0x20, 5, 2, 0x14])
                 .unwrap()

@@ -164,6 +164,40 @@ fn successful_oem_completion_still_requires_matching_vendor_header() {
             ..
         })
     ));
+    assert_eq!(ipmi.inner_mut().sent, [(0x2e, 0xca, vec![0x57, 1, 0])]);
+}
+
+#[test]
+fn short_capability_pages_decode_by_original_request_selector() {
+    let mut ipmi = Ipmi::new(Scripted::new([
+        Ok((0, vec![0xdc, 1, 5, 2, 0x0f, 1, 0x03])),
+        Ok((0, vec![0xdc, 1, 5, 2, 0x40, 0x21])),
+    ]));
+    let platform = ipmi
+        .send_recv(GetCapabilities(CapabilitySelector::Platform))
+        .unwrap();
+    assert!(
+        platform
+            .platform(CapabilitySelector::Platform)
+            .unwrap()
+            .unwrap()
+            .power_management
+    );
+    let optional = ipmi
+        .send_recv(GetCapabilities(CapabilitySelector::OptionalAttributes))
+        .unwrap();
+    assert!(matches!(
+        optional.decode(CapabilitySelector::OptionalAttributes),
+        Ok(dcmi::CapabilityDetails::Optional(
+            dcmi::OptionalAttributes {
+                power_device_address: 0x40,
+                channel: 2,
+                device_revision: 1,
+            }
+        ))
+    ));
+    assert_eq!(ipmi.inner_mut().sent[0].2, [0xdc, 1]);
+    assert_eq!(ipmi.inner_mut().sent[1].2, [0xdc, 3]);
 }
 
 #[test]
