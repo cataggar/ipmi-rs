@@ -196,14 +196,34 @@ impl<T: IpmiConnection + ?Sized> IpmiConnection for &mut T {
 }
 
 /// The wire representation of an IPMI message.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Message {
     netfn: u8,
     cmd: u8,
     data: Vec<u8>,
 }
 
+impl core::fmt::Debug for Message {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut debug = f.debug_struct("Message");
+        debug.field("netfn", &self.netfn).field("cmd", &self.cmd);
+        if self.is_sensitive() {
+            debug.field("data", &"[REDACTED]");
+        } else {
+            debug.field("data", &self.data);
+        }
+        debug.finish()
+    }
+}
+
 impl Message {
+    /// Whether this message is a Set User Password request or response.
+    ///
+    /// Debug redacts these payloads; callers must not dump `data()` themselves.
+    pub fn is_sensitive(&self) -> bool {
+        self.netfn() == NetFn::App && self.cmd == 0x47
+    }
+
     /// Create a new request message with the provided `netfn`, `cmd` and `data`.
     pub fn new_request(netfn: NetFn, cmd: u8, data: Vec<u8>) -> Self {
         Self {

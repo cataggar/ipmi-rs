@@ -84,6 +84,10 @@ The following IPMI commands are currently supported in `ipmi-rs-core`:
 | Activate Session                        | 22.17                 |
 | Get Channel Access                      | 22.23                 |
 | Get Channel Info                        | 22.24                 |
+| Set Channel Access                      | App command 0x40      |
+| Get User Summary / Access / Name        | App commands 0x44/0x46 |
+| Set User Access / Privilege / Name      | App commands 0x43/0x45 |
+| Enable / Disable / Set / Test User Password | App command 0x47  |
 | Set / Get System Boot Options            | Chassis commands 0x08/0x09 |
 | Set LAN Configuration Parameters        | 23.1                  |
 | Get LAN Configuration Parameters        | 23.2                  |
@@ -141,6 +145,54 @@ Boot-option support varies by controller and BIOS; completion codes (including
 `0x80` unsupported, `0x81` already in progress, `0x82` read-only) are surfaced,
 not worked around. Remote mutations should wait for the transport hardening
 tracked in issue #6.
+
+## BMC user and channel access management
+
+`ipmi_rs::app::{GetUserSummary, GetUserAccess, GetUserName, UserList}` expose
+read-only user counts, per-channel ACLs, and 16-byte names. After sending
+`GetUserSummary::new(channel)` with an existing `Ipmi` connection, use
+`UserList::new(channel, summary)` to enumerate bounded IDs (1–63); each item
+contains a `GetUserAccess` and `GetUserName` command **to send separately**.
+Some controllers reject Get User Name for unnamed slots: inspect the returned
+completion code rather than mistaking that failure for an empty name. Raw
+username bytes and unknown privilege nibbles are retained on readback.
+
+Writes require explicit construction: `SetUserName`, `SetUserAccess` (replaces
+all flags, privilege and session limit), `SetUserPrivilege` (changes only the
+privilege), and `SetUserPassword::{enable, disable, set, test}`. A user ID must
+be 1–63; use `Channel::new` for supported channels and `UserPrivilege::new`
+for assignable privilege levels (1–5 or 15 = no access). Names and passwords
+are validated as printable US-ASCII; names are at most 16 bytes, passwords
+at most the explicitly selected `PasswordLength::Bytes16` or `Bytes20` and
+NUL-padded. An empty name clears it; an empty password **removes** password
+protection where supported. Never use an empty password unintentionally.
+20-byte passwords require compatible IPMI 2.0 support; test returns completion
+code `0x80` for mismatch and `0x81` for wrong length. No test/set/enable call
+is inferred from any read or another write.
+
+`SetChannelAccess::new(channel, access, privilege)` takes two **independent**
+optional updates; each explicitly selects `ChannelAccessType::NonVolatile`
+(persistent across reset) or `Volatile` (active settings). An omitted field is
+not changed. Setting an access mode, disabling authentication, reducing a
+channel's privilege limit, or changing your own administrative user can
+immediately lock out all remote administrators. Verify your BMC/channel,
+retain a local recovery path, and observe controller-specific behavior before
+modifying a production interface.
+
+User and channel configuration generally requires an **Administrator-level**
+session and a controller that permits the operation; read permissions vary by
+BMC, channel and firmware. Prefer a confidential RMCP+ session (cipher suite
+3 or 17), or a trusted local interface: IPMI 1.5 does **not** encrypt passwords
+on the wire. The command and message `Debug` implementations redact password
+contents, and the local file transport omits password bytes from trace logs;
+**raw wire data accessors are not redacted**, so do not log request/response
+bytes or credentials yourself. Completion codes, including insufficient
+privilege (`0xD4`) and command-specific rejections, remain available from
+`IpmiError`; password-command error response bytes are suppressed in case a
+controller echoes the secret. The library never retries these writes. On
+timeout, disconnection, or any ambiguous send result, the outcome is
+**unknown**: check status through an independent read or recovery access, but
+never blindly repeat a mutation (even after `NodeBusy`).
 
 # Supported interfaces
 

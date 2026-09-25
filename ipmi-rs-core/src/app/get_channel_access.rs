@@ -1,4 +1,7 @@
-use crate::connection::{Channel, IpmiCommand, Message, NetFn, NotEnoughData};
+use crate::{
+    app::user::UserPrivilege,
+    connection::{Channel, IpmiCommand, Message, NetFn, NotEnoughData},
+};
 
 /// The Get Channel Access command.
 ///
@@ -62,6 +65,125 @@ pub enum ChannelAccessType {
     NonVolatile,
     /// Get volatile (currently active) settings.
     Volatile,
+}
+
+/// A supported access mode for a Set Channel Access request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetChannelAccessMode {
+    /// Disable this channel.
+    Disabled,
+    /// Enable this channel only during pre-boot.
+    PreBootOnly,
+    /// Make this channel always available.
+    AlwaysAvailable,
+    /// Enable shared access.
+    Shared,
+}
+
+impl SetChannelAccessMode {
+    fn value(self) -> u8 {
+        match self {
+            Self::Disabled => 0,
+            Self::PreBootOnly => 1,
+            Self::AlwaysAvailable => 2,
+            Self::Shared => 3,
+        }
+    }
+}
+
+/// Complete set of access flags for a channel access update.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChannelAccessSettings {
+    /// The channel's access mode.
+    pub mode: SetChannelAccessMode,
+    /// Disable alerting across this channel.
+    pub alerting_disabled: bool,
+    /// Disable per-message authentication.
+    pub per_msg_auth_disabled: bool,
+    /// Disable user-level authentication.
+    pub user_level_auth_disabled: bool,
+}
+
+/// Explicitly set channel access, privilege limit, or both (App command 0x40).
+///
+/// Each updated field independently selects non-volatile (persistent) or
+/// volatile (active until reset) settings. `None` means leave that field alone.
+/// A lost acknowledgement has an unknown outcome: never automatically retry.
+#[derive(Clone, Copy, Debug)]
+pub struct SetChannelAccess {
+    channel: Channel,
+    access: Option<(ChannelAccessType, ChannelAccessSettings)>,
+    privilege: Option<(ChannelAccessType, UserPrivilege)>,
+}
+
+/// A Set Channel Access request with no selected fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetChannelAccessError {
+    /// Neither access flags nor the privilege limit was selected for update.
+    NoChanges,
+    /// A successful response unexpectedly contained data.
+    ResponseLength(usize),
+}
+
+impl SetChannelAccess {
+    /// Require at least one field; choose volatile/persistent scope for each.
+    pub fn new(
+        channel: Channel,
+        access: Option<(ChannelAccessType, ChannelAccessSettings)>,
+        privilege: Option<(ChannelAccessType, UserPrivilege)>,
+    ) -> Result<Self, SetChannelAccessError> {
+        if access.is_none() && privilege.is_none() {
+            return Err(SetChannelAccessError::NoChanges);
+        }
+        Ok(Self {
+            channel,
+            access,
+            privilege,
+        })
+    }
+}
+
+impl From<SetChannelAccess> for Message {
+    fn from(cmd: SetChannelAccess) -> Self {
+        let (access, flags) = cmd.access.map_or((0, 0), |(scope, settings)| {
+            let mode = settings.mode.value();
+            let bits = (u8::from(settings.alerting_disabled) << 5)
+                | (u8::from(settings.per_msg_auth_disabled) << 4)
+                | (u8::from(settings.user_level_auth_disabled) << 3)
+                | mode;
+            (scope.write_bits(), bits)
+        });
+        let (privilege, limit) = cmd
+            .privilege
+            .map_or((0, 0), |(scope, limit)| (scope.write_bits(), limit.value()));
+        Message::new_request(
+            NetFn::App,
+            0x40,
+            vec![cmd.channel.value(), access | flags, privilege | limit],
+        )
+    }
+}
+
+impl IpmiCommand for SetChannelAccess {
+    type Output = ();
+    type Error = SetChannelAccessError;
+
+    fn parse_success_response(data: &[u8]) -> Result<Self::Output, Self::Error> {
+        if data.is_empty() {
+            Ok(())
+        } else {
+            Err(SetChannelAccessError::ResponseLength(data.len()))
+        }
+    }
+}
+
+impl ChannelAccessType {
+    fn write_bits(self) -> u8 {
+        match self {
+            Self::NonVolatile => 0x40,
+            Self::Volatile => 0x80,
+        }
+    }
 }
 
 /// Channel access information returned by the BMC.
@@ -168,6 +290,8 @@ pub enum ChannelPrivilegeLevel {
     Administrator,
     /// OEM proprietary privilege level.
     Oem,
+    /// No access permitted on this channel.
+    NoAccess,
     /// Unknown value.
     Unknown(u8),
 }
@@ -181,6 +305,7 @@ impl From<u8> for ChannelPrivilegeLevel {
             0x03 => Self::Operator,
             0x04 => Self::Administrator,
             0x05 => Self::Oem,
+            0x0F => Self::NoAccess,
             v => Self::Unknown(v),
         }
     }
@@ -195,6 +320,7 @@ impl core::fmt::Display for ChannelPrivilegeLevel {
             ChannelPrivilegeLevel::Operator => write!(f, "Operator"),
             ChannelPrivilegeLevel::Administrator => write!(f, "Administrator"),
             ChannelPrivilegeLevel::Oem => write!(f, "OEM"),
+            ChannelPrivilegeLevel::NoAccess => write!(f, "No Access"),
             ChannelPrivilegeLevel::Unknown(value) => write!(f, "Unknown (0x{value:02X})"),
         }
     }

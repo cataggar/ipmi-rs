@@ -155,12 +155,28 @@ pub enum PayloadType {
     RakpMessage4,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Message {
     pub ty: PayloadType,
     pub session_id: u32,
     pub session_sequence_number: u32,
     pub payload: Vec<u8>,
+}
+
+impl core::fmt::Debug for Message {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut debug = f.debug_struct("Message");
+        debug
+            .field("ty", &self.ty)
+            .field("session_id", &self.session_id)
+            .field("session_sequence_number", &self.session_sequence_number);
+        if self.ty == PayloadType::IpmiMessage && super::is_password_ipmb(&self.payload) {
+            debug.field("payload", &"[REDACTED]");
+        } else {
+            debug.field("payload", &self.payload);
+        }
+        debug.finish()
+    }
 }
 
 impl TryFrom<u8> for PayloadType {

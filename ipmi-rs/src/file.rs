@@ -27,6 +27,18 @@ impl IpmiMessage {
     fn data(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(self.data, self.data_len as usize) }
     }
+
+    fn is_password_command(&self) -> bool {
+        NetFn::from(self.netfn) == NetFn::App && self.cmd == 0x47
+    }
+
+    fn trace_data(&self) -> String {
+        if self.is_password_command() {
+            "[REDACTED]".into()
+        } else {
+            format!("{:02X?}", self.data())
+        }
+    }
 }
 
 impl IpmiMessage {
@@ -35,8 +47,36 @@ impl IpmiMessage {
         log::log!(level, "  Command    = 0x{:02X}", self.cmd);
         log::log!(level, "  Data len   = {}", self.data_len);
         if self.data_len > 0 {
-            log::log!(level, "  Data       = {:02X?}", self.data());
+            log::log!(level, "  Data       = {}", self.trace_data());
         }
+    }
+}
+
+#[cfg(test)]
+mod password_log_tests {
+    use super::*;
+
+    #[test]
+    fn local_trace_detects_password_requests_and_responses() {
+        let mut secret = *b"never-log-secret";
+        for netfn in [0x06, 0x07] {
+            let msg = IpmiMessage {
+                netfn,
+                cmd: 0x47,
+                data_len: secret.len() as u16,
+                data: secret.as_mut_ptr(),
+            };
+            assert!(msg.is_password_command());
+            assert_eq!(msg.trace_data(), "[REDACTED]");
+        }
+        let msg = IpmiMessage {
+            netfn: 0x06,
+            cmd: 0x44,
+            data_len: secret.len() as u16,
+            data: secret.as_mut_ptr(),
+        };
+        assert!(!msg.is_password_command());
+        assert_ne!(msg.trace_data(), "[REDACTED]");
     }
 }
 
