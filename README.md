@@ -171,6 +171,60 @@ or selects any different authentication, integrity, or confidentiality algorithm
 it never falls back to suite 3 or IPMI 1.5. Suites other than 3 and 17
 are rejected before activation.
 
+### IPMB bridging over RMCP / RMCP+
+
+Local-BMC requests are unchanged. `RequestTargetAddress::BmcOrIpmb` routes
+non-local, even IPMB slave addresses through a **single** Send Message hop.
+For an explicit one- or two-hop route, use `RequestTargetAddress::Bridged`:
+
+```rust,no_run
+use ipmi_rs::{
+    connection::{
+        Address, Channel, IpmbTarget, IpmiConnection, LogicalUnit, Message, NetFn,
+        Request, RequestTargetAddress,
+    },
+    rmcp::Rmcp,
+};
+use std::time::Duration;
+
+let mut connection = Rmcp::new("192.0.2.10:623", Duration::from_secs(3))?;
+connection.require_rmcp_plus(true);
+connection.activate(true, Some("operator"), Some(b"secret"))?;
+let target = IpmbTarget::new(Address(0x52), Channel::Primary, LogicalUnit::Zero);
+let transit = IpmbTarget::new(Address(0x30), Channel::Primary, LogicalUnit::Zero);
+let mut request = Request::new(
+    Message::new_request(NetFn::Chassis, 0x01, vec![]),
+    RequestTargetAddress::Bridged { target, transit: Some(transit) },
+);
+let response = connection.send_recv(&mut request)?;
+// For a single hop, specify `transit: None`.
+```
+
+The first channel is the BMC-to-transit (or BMC-to-target) IPMB channel;
+the target's channel is the transit-to-target channel for two hops.
+Only primary and numbered channels (1–11), even unicast slave addresses,
+and one optional transit hop are supported. Transit must not be the local BMC
+or the same target on the same channel. The BMC uses slave address `0x20`
+and the remote software ID `0x81`. Controllers may use different IPMB
+addresses or not support tracked Send Message, transit routing, embedded
+responses, or Get Message receive queues; check the hardware's channel map
+and privilege policy. The Linux device-file interface still uses its kernel
+IPMB routing; explicit `Bridged` routes are RMCP-only.
+
+The transport validates both IPMB checksums, responder/requester addresses
+and LUNs, per-hop sequence, netfn and command, as well as the RMCP session
+identity and replay sequence. It waits for each successful Send Message
+acknowledgement before reporting the final response; the response may be
+embedded or retrieved with Get Message. Get Message polling is bounded by
+the operation deadline and a 64-sequence-per-session budget (including
+bridge hops and polls); open a **new session** when exhausted. Only one
+operation can be pending. Cancellation and timeouts retire its sequences,
+so late replies cannot satisfy the next request. A receive/poll failure
+is `OutcomeUnknown`, and an ambiguous network send is
+`SendOutcomeUnknown`: **never automatically resend a power or configuration
+mutation**. RMCP 1.5 without authentication cannot guarantee peer
+authenticity; prefer authenticated RMCP+ for remote changes.
+
 ### Optional SymCrypt RMCP+ backend
 
 The default build uses RustCrypto and does not need a native library. To

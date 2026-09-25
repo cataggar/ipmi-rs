@@ -78,3 +78,20 @@ fn operational_activation_refuses_ipmi15_fallback() {
     ));
     server.join().unwrap();
 }
+
+#[test]
+fn ambiguous_network_send_is_never_reported_as_safe_to_retry() {
+    let io = || std::io::Error::new(std::io::ErrorKind::TimedOut, "send timed out");
+    assert!(matches!(
+        RmcpIpmiSendError::V1_5(V1_5WriteError::Io(io())).into_operation_error(),
+        RmcpIpmiError::SendOutcomeUnknown(_)
+    ));
+    assert!(matches!(
+        RmcpIpmiSendError::V2_0(V2_0WriteError::Io(io())).into_operation_error(),
+        RmcpIpmiError::SendOutcomeUnknown(_)
+    ));
+    assert!(matches!(
+        RmcpIpmiSendError::InvalidBridgeTarget.into_operation_error(),
+        RmcpIpmiError::Send(RmcpIpmiSendError::InvalidBridgeTarget)
+    ));
+}

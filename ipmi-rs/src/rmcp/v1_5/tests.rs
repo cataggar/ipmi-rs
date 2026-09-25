@@ -1,7 +1,8 @@
 use super::*;
 use crate::{
     connection::{
-        IpmiConnection, LogicalUnit, Message as IpmiMessage, NetFn, RequestTargetAddress,
+        Address, Channel, IpmbTarget, IpmiConnection, LogicalUnit, Message as IpmiMessage, NetFn,
+        RequestTargetAddress,
     },
     rmcp::{checksum::Checksum, socket::TransportPolicy, RmcpHeader},
 };
@@ -29,6 +30,10 @@ fn reply(peer: &UdpSocket, session_sequence_number: u32, ipmb_sequence: u8) {
     let mut payload = vec![0x81, 0x04, 0, 0x20, ipmb_sequence << 2, 2, 0];
     payload[2] = Checksum::from_iter(payload[..2].iter().copied());
     payload.push(Checksum::from_iter(payload[3..].iter().copied()));
+    reply_packet(peer, session_sequence_number, payload);
+}
+
+fn reply_packet(peer: &UdpSocket, session_sequence_number: u32, payload: Vec<u8>) {
     let message = Message {
         auth_type: AuthType::None,
         session_sequence_number,
@@ -41,6 +46,108 @@ fn reply(peer: &UdpSocket, session_sequence_number: u32, ipmb_sequence: u8) {
     peer.send(&wire).unwrap();
 }
 
+fn ipmb_reply(
+    requestor: u8,
+    responder: u8,
+    sequence: u8,
+    netfn: u8,
+    lun: u8,
+    cmd: u8,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut payload = vec![
+        requestor,
+        netfn << 2,
+        0,
+        responder,
+        sequence << 2 | lun,
+        cmd,
+    ];
+    payload[2] = Checksum::from_iter(payload[..2].iter().copied());
+    payload.extend_from_slice(data);
+    payload.push(Checksum::from_iter(payload[3..].iter().copied()));
+    payload
+}
+
+fn target() -> Request {
+    Request::new(
+        IpmiMessage::new_request(NetFn::Chassis, 2, vec![1]),
+        RequestTargetAddress::Bridged {
+            target: IpmbTarget::new(Address(0x52), Channel::Primary, LogicalUnit::One),
+            transit: None,
+        },
+    )
+}
+
+#[test]
+fn bridged_send_ack_get_message_then_target_reply() {
+    let (mut state, peer) = pair(Duration::from_millis(250));
+    let mut req = target();
+    let mut received = [0; 4096];
+    state.send(&mut req).unwrap();
+    let len = peer.recv(&mut received).unwrap();
+    let outgoing = Message::from_data(None, &received[4..len]).unwrap();
+    assert_eq!(
+        (
+            outgoing.payload[5],
+            outgoing.payload[6],
+            outgoing.payload[7]
+        ),
+        (0x34, 0x40, 0x52)
+    );
+    let ack = ipmb_reply(0x81, 0x20, 0, 7, 0, 0x34, &[0]);
+    reply_packet(&peer, 1, ack);
+    let final_reply = ipmb_reply(0x81, 0x52, 1, 1, 1, 2, &[0, 0xa5]);
+    let peer_thread = std::thread::spawn(move || {
+        let len = peer.recv(&mut received).unwrap();
+        let get = Message::from_data(None, &received[4..len]).unwrap();
+        assert_eq!((get.payload[5], get.payload[4] >> 2), (0x33, 2));
+        let mut body = vec![0, 0]; // Get Message completion, primary channel
+        body.extend_from_slice(&final_reply[1..]);
+        reply_packet(&peer, 2, ipmb_reply(0x81, 0x20, 2, 7, 0, 0x33, &body));
+    });
+    assert_eq!(state.recv().unwrap().data(), &[0xa5]);
+    peer_thread.join().unwrap();
+}
+
+#[test]
+fn bridged_out_of_order_session_packets_are_correlated_before_advancing_replay() {
+    let (mut state, peer) = pair(Duration::from_millis(100));
+    let mut req = target();
+    state.send(&mut req).unwrap();
+    peer.recv(&mut [0; 4096]).unwrap();
+    let final_reply = ipmb_reply(0x81, 0x52, 1, 1, 1, 2, &[0, 0x55]);
+    reply_packet(&peer, 2, final_reply.clone());
+    reply_packet(&peer, 2, final_reply);
+    reply_packet(&peer, 1, ipmb_reply(0x81, 0x20, 0, 7, 0, 0x34, &[0]));
+    assert_eq!(state.recv().unwrap().data(), &[0x55]);
+    assert_eq!(state.last_inbound_sequence, Some(2));
+}
+
+#[test]
+fn bridged_timeout_cancellation_and_late_reply_are_not_retried() {
+    let (mut state, peer) = pair(Duration::from_millis(90));
+    let mut req = target();
+    let mut received = [0; 4096];
+    state.send(&mut req).unwrap();
+    peer.recv(&mut received).unwrap();
+    assert!(matches!(state.recv(), Err(RmcpIpmiReceiveError::Timeout)));
+    let token = state.socket.cancellation_token();
+    state.send(&mut req).unwrap();
+    peer.recv(&mut received).unwrap();
+    reply_packet(&peer, 1, ipmb_reply(0x81, 0x20, 0, 7, 0, 0x34, &[0]));
+    token.cancel();
+    assert!(matches!(state.recv(), Err(RmcpIpmiReceiveError::Cancelled)));
+    token.reset();
+    state.send(&mut req).unwrap();
+    peer.recv(&mut received).unwrap();
+    reply_packet(&peer, 2, ipmb_reply(0x81, 0x52, 1, 1, 1, 2, &[0]));
+    assert!(matches!(
+        state.recv(),
+        Err(RmcpIpmiReceiveError::IpmbResponseMismatch)
+    ));
+    assert!(state.ipmb_state.pending.is_none());
+}
 #[test]
 fn late_reply_is_drained_without_poisoning_following_transactions() {
     let (mut state, peer) = pair(Duration::from_millis(70));

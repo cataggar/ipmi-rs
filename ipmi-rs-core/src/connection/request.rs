@@ -1,6 +1,6 @@
-use crate::connection::{LogicalUnit, NetFn};
+use crate::connection::{Address, Channel, LogicalUnit, NetFn};
 
-use super::{Address, Channel, Message};
+use super::Message;
 
 /// An IPMI request message.
 pub struct Request {
@@ -58,6 +58,38 @@ pub enum RequestTargetAddress {
     Bmc(LogicalUnit),
     /// An address on the BMC or IPMB.
     BmcOrIpmb(Address, Channel, LogicalUnit),
+    /// Route through the BMC to an IPMB target, optionally via a second controller.
+    ///
+    /// Unlike `BmcOrIpmb`, this route always uses Send Message, even if the
+    /// target's address is the BMC's own address.
+    Bridged {
+        /// Destination of the original command.
+        target: IpmbTarget,
+        /// Optional first hop; it forwards to `target` on `target.channel`.
+        transit: Option<IpmbTarget>,
+    },
+}
+
+/// An IPMB address, outgoing channel, and responder LUN for one bridge hop.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct IpmbTarget {
+    /// Even, unicast IPMB slave address.
+    pub address: Address,
+    /// IPMB channel used to reach this hop (primary or numbered).
+    pub channel: Channel,
+    /// Responder LUN for this hop.
+    pub lun: LogicalUnit,
+}
+
+impl IpmbTarget {
+    /// Construct a bridge hop without choosing a transport.
+    pub const fn new(address: Address, channel: Channel, lun: LogicalUnit) -> Self {
+        Self {
+            address,
+            channel,
+            lun,
+        }
+    }
 }
 
 impl RequestTargetAddress {
@@ -65,6 +97,7 @@ impl RequestTargetAddress {
     pub fn lun(&self) -> LogicalUnit {
         match self {
             RequestTargetAddress::Bmc(lun) | RequestTargetAddress::BmcOrIpmb(_, _, lun) => *lun,
+            RequestTargetAddress::Bridged { target, .. } => target.lun,
         }
     }
 }
