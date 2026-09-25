@@ -47,7 +47,7 @@ macro_rules! group_command {
         impl From<$name> for $crate::connection::Message {
             fn from($value: $name) -> Self {
                 $crate::connection::Message::new_request(
-                    $crate::connection::NetFn::GroupExtension,
+                    $crate::connection::NetFn::Reserved(0x2c),
                     $cmd,
                     $payload,
                 )

@@ -13,6 +13,7 @@ struct TransportError;
 struct Mock {
     reply: Option<Vec<u8>>,
     sends: usize,
+    response_netfn: NetFn,
 }
 impl IpmiConnection for Mock {
     type SendError = TransportError;
@@ -34,7 +35,7 @@ impl IpmiConnection for Mock {
         );
         Ok(Response::new(
             Message::new_response(
-                NetFn::GroupExtension,
+                self.response_netfn,
                 request.cmd(),
                 self.reply.take().ok_or(TransportError)?,
             ),
@@ -49,10 +50,23 @@ fn extension_replies_and_errors_traverse_public_ipmi_api() {
     let mut ipmi = Ipmi::new(Mock {
         reply: Some(vec![0, 3, 0x21, 0x10, 0, 0x21, 15, 2]),
         sends: 0,
+        response_netfn: NetFn::Reserved(0x2c),
     });
     let caps = ipmi.send_recv(vita::GetVitaCapabilities).unwrap();
     assert_eq!(caps.require_supported().unwrap().fru_id, 2);
     assert_eq!(ipmi.inner_mut().sends, 1);
+
+    ipmi.inner_mut().response_netfn = NetFn::Reserved(0x30);
+    ipmi.inner_mut().reply = Some(vec![0, 0, 3]);
+    assert!(matches!(
+        ipmi.send_recv(picmg::GetPicmgPolicy { fru_id: 2 }),
+        Err(IpmiError::UnexpectedResponse {
+            netfn_sent: NetFn::Reserved(0x2c),
+            netfn_recvd: NetFn::Reserved(0x31),
+            ..
+        })
+    ));
+    ipmi.inner_mut().response_netfn = NetFn::Reserved(0x2c);
 
     ipmi.inner_mut().reply = Some(vec![0, 0]);
     assert!(matches!(
@@ -90,6 +104,7 @@ fn an_ambiguous_activation_result_is_not_retried() {
     let mut ipmi = Ipmi::new(Mock {
         reply: None,
         sends: 0,
+        response_netfn: NetFn::Reserved(0x2c),
     });
     assert!(matches!(
         ipmi.send_recv(picmg::SetPicmgActivation {
@@ -106,6 +121,7 @@ fn fru_control_with_trailing_ack_data_is_not_reported_as_failed_or_retried() {
     let mut ipmi = Ipmi::new(Mock {
         reply: Some(vec![0, 0, 0x01, 0x44]),
         sends: 0,
+        response_netfn: NetFn::Reserved(0x2c),
     });
     assert_eq!(
         ipmi.send_recv(picmg::PicmgFruControl {

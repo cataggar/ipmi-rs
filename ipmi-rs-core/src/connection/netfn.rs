@@ -56,16 +56,15 @@ netfn!(
     App => [0x06 | 0x07],
     Firmware => [0x08 | 0x09],
     Storage => [0x0A | 0x0B],
-    Transport => [0x0C | 0x0D],
-    GroupExtension => [0x2C | 0x2D]
+    Transport => [0x0C | 0x0D]
 );
 
 #[test]
-fn group_extension_request_and_reply_have_one_identity() {
-    assert_eq!(NetFn::from(0x2c), NetFn::GroupExtension);
-    assert_eq!(NetFn::from(0x2d), NetFn::GroupExtension);
-    assert_eq!(NetFn::GroupExtension.request_value(), 0x2c);
-    assert_eq!(NetFn::GroupExtension.response_value(), 0x2d);
+fn group_extension_preserves_raw_request_and_response_identity() {
+    assert_eq!(NetFn::from(0x2c), NetFn::Reserved(0x2c));
+    assert_eq!(NetFn::from(0x2d), NetFn::Reserved(0x2d));
+    assert_eq!(NetFn::Reserved(0x2c).request_value(), 0x2c);
+    assert_eq!(NetFn::Reserved(0x2c).response_value(), 0x2d);
 }
 
 impl NetFn {

@@ -22,7 +22,7 @@ fn exercise<C: IpmiCommand<Error = p::GroupError>>(
     malformed: &[u8],
 ) {
     let message: Message = command.into();
-    assert_eq!(message.netfn_raw(), NetFn::GroupExtension.request_value());
+    assert_eq!(message.netfn_raw(), NetFn::Reserved(0x2c).request_value());
     assert_eq!(message.cmd(), cmd);
     assert_eq!(message.data(), request);
     C::parse_success_response(response)
