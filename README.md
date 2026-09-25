@@ -217,9 +217,12 @@ identity and replay sequence. It waits for each successful Send Message
 acknowledgement before reporting the final response; the response may be
 embedded, pushed over LAN, or retrieved with Get Message. Get Message is
 requested only when Get Message Flags reports a receive-queue entry. If
-the BMC rejects either queue command, the transport stops querying the
-queue for that session and waits for a correlated pushed reply until the
-original operation deadline; if none arrives, the outcome is unknown.
+the BMC reports either queue command as unsupported, the transport stops
+querying the queue for that session and waits for a correlated pushed reply
+until the original operation deadline. Transient queue failures (such as
+Node Busy) only recheck the read-only queue, with backoff; unexpected
+completion codes are returned as errors. The original bridged command is
+never resent. If no correlated reply arrives, the outcome is unknown.
 Queue checks use bounded backoff and a 64-sequence-per-session budget
 (including bridge hops and polls). When that budget is exhausted, the
 current operation still waits for a pushed reply until its deadline;

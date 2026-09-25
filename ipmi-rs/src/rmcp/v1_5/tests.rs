@@ -142,6 +142,48 @@ fn rejected_get_message_keeps_waiting_for_pushed_reply() {
 }
 
 #[test]
+fn busy_queue_flags_recover_without_replaying_bridged_command() {
+    let (mut state, peer) = pair(Duration::from_millis(350));
+    peer.set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
+    let mut req = target();
+    state.send(&mut req).unwrap();
+    let mut received = [0; 4096];
+    let len = peer.recv(&mut received).unwrap();
+    assert_eq!(
+        Message::from_data(None, &received[4..len]).unwrap().payload[5],
+        0x34
+    );
+    reply_packet(&peer, 1, ipmb_reply(0x81, 0x20, 0, 7, 0, 0x34, &[0]));
+    let server = std::thread::spawn(move || {
+        for (seq, code, data) in [(2, 0xc0, &[][..]), (3, 0, &[1][..])] {
+            let len = peer.recv(&mut received).unwrap();
+            let flags = Message::from_data(None, &received[4..len]).unwrap();
+            assert_eq!((flags.payload[5], flags.payload[4] >> 2), (0x31, seq));
+            let mut body = vec![code];
+            body.extend_from_slice(data);
+            reply_packet(
+                &peer,
+                u32::from(seq),
+                ipmb_reply(0x81, 0x20, seq, 7, 0, 0x31, &body),
+            );
+        }
+        let len = peer.recv(&mut received).unwrap();
+        let get = Message::from_data(None, &received[4..len]).unwrap();
+        assert_eq!((get.payload[5], get.payload[4] >> 2), (0x33, 4));
+        let final_reply = ipmb_reply(0x81, 0x52, 1, 1, 1, 2, &[0, 0xa5]);
+        let mut body = vec![0, 0];
+        body.extend_from_slice(&final_reply[1..]);
+        reply_packet(&peer, 4, ipmb_reply(0x81, 0x20, 4, 7, 0, 0x33, &body));
+    });
+    let start = Instant::now();
+    assert_eq!(state.recv().unwrap().data(), &[0xa5]);
+    assert!(start.elapsed() < Duration::from_millis(350));
+    assert_eq!(state.last_inbound_sequence, Some(4));
+    server.join().unwrap();
+}
+
+#[test]
 fn unsupported_queue_timeout_retires_late_reply_without_resending() {
     let (mut state, peer) = pair(Duration::from_millis(130));
     peer.set_read_timeout(Some(Duration::from_millis(60)))

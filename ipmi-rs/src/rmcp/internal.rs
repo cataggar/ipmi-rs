@@ -629,11 +629,29 @@ impl IpmbState {
             if correlate(data, poll).is_ok() {
                 let response = correlate(data, poll)?;
                 pending.poll = None;
-                if poll.cmd == GET_MESSAGE_FLAGS {
-                    if response.cc() != 0 {
+                match response.cc() {
+                    0 => {}
+                    0x80 if poll.cmd == GET_MESSAGE => {
+                        pending.queue_available = false;
+                        return Ok(None);
+                    }
+                    0xc1 | 0xc2 | 0xd6 => {
                         *get_message_supported = false;
                         return Ok(None);
                     }
+                    // Retry only read-only queue probes, never the original command.
+                    0xc0 | 0xc3 | 0xce | 0xd0..=0xd2 | 0xd5 => {
+                        pending.queue_available = false;
+                        return Ok(None);
+                    }
+                    code => {
+                        return Err(RmcpIpmiReceiveError::BridgeQueueCompletion {
+                            command: poll.cmd,
+                            code,
+                        });
+                    }
+                }
+                if poll.cmd == GET_MESSAGE_FLAGS {
                     if response.data().len() != 1 {
                         return Err(RmcpIpmiReceiveError::NotEnoughData);
                     }
@@ -641,13 +659,6 @@ impl IpmbState {
                     return Ok(None);
                 }
                 pending.queue_available = false;
-                if response.cc() == 0x80 {
-                    return Ok(None);
-                }
-                if response.cc() != 0 {
-                    *get_message_supported = false;
-                    return Ok(None);
-                }
                 let body = response.data();
                 if body.len() < 8 {
                     return Err(RmcpIpmiReceiveError::NotEnoughData);
@@ -978,6 +989,41 @@ mod tests {
     }
 
     #[test]
+    fn transient_queue_busy_rechecks_flags_without_resending_target() {
+        for busy_command in [GET_MESSAGE_FLAGS, GET_MESSAGE] {
+            let mut state = IpmbState::default();
+            state.begin(&bridge(None), Instant::now()).unwrap();
+            let p = state.pending.as_ref().unwrap();
+            let ack = answer(p.send_acks[0].unwrap(), 0, &[]);
+            let final_reply = answer(p.final_reply, 0, &[0x55]);
+            state.receive(&ack).unwrap();
+            let busy = if busy_command == GET_MESSAGE_FLAGS {
+                state.poll_message().unwrap();
+                state.pending.as_ref().unwrap().poll.unwrap()
+            } else {
+                poll_available(&mut state)
+            };
+            assert_eq!(busy.cmd, busy_command);
+            assert!(state.receive(&answer(busy, 0xc0, &[])).unwrap().is_none());
+            assert!(state.needs_poll());
+            assert!(!state.queue_available());
+            let poll = poll_available(&mut state);
+            assert_ne!(busy.sequence, poll.sequence);
+            let mut body = vec![2];
+            body.extend_from_slice(&final_reply[1..]);
+            assert_eq!(
+                state
+                    .receive(&answer(poll, 0, &body))
+                    .unwrap()
+                    .unwrap()
+                    .data(),
+                &[0x55]
+            );
+            assert!(state.get_message_supported);
+        }
+    }
+
+    #[test]
     fn dual_hop_nested_and_out_of_order_replies() {
         let transit = hop(0x30, 1, LogicalUnit::One);
         let mut state = IpmbState::default();
@@ -1199,9 +1245,25 @@ mod tests {
         let ack = state.pending.as_ref().unwrap().send_acks[0].unwrap();
         state.receive(&answer(ack, 0, &[])).unwrap();
         let poll = poll_available(&mut state);
-        assert!(state.receive(&answer(poll, 0xcc, &[])).unwrap().is_none());
-        assert!(!state.needs_poll());
-        let target = answer(state.pending.as_ref().unwrap().final_reply, 0, &[0x42]);
-        assert_eq!(state.receive(&target).unwrap().unwrap().data(), &[0x42]);
+        assert!(matches!(
+            state.receive(&answer(poll, 0xcc, &[])),
+            Err(RmcpIpmiReceiveError::BridgeQueueCompletion {
+                command: GET_MESSAGE,
+                code: 0xcc
+            })
+        ));
+        state.retire_pending();
+        state.begin(&bridge(None), Instant::now()).unwrap();
+        let ack = state.pending.as_ref().unwrap().send_acks[0].unwrap();
+        state.receive(&answer(ack, 0, &[])).unwrap();
+        state.poll_message().unwrap();
+        let flags = state.pending.as_ref().unwrap().poll.unwrap();
+        assert!(matches!(
+            state.receive(&answer(flags, 0xcc, &[])),
+            Err(RmcpIpmiReceiveError::BridgeQueueCompletion {
+                command: GET_MESSAGE_FLAGS,
+                code: 0xcc
+            })
+        ));
     }
 }
