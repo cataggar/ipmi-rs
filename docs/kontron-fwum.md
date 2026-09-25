@@ -23,8 +23,12 @@ and busy/transport read retries at three total attempts. No firmware mutation
 is triggered. Product 5002 additionally reports SDR revision from Get Device
 ID's first auxiliary revision byte when present; other products do not.
 
-**Routed firmware updates over RMCP/RMCP+ are not implemented. Issue #36
-remains open; this change does not satisfy its routed-transport requirement.**
+**Routed firmware updates over RMCP/RMCP+ are not implemented.**
+The [parity milestone #31](https://github.com/cataggar/ipmi-rs/issues/31)
+explicitly excludes routed writes; a hardware-verified reconnect/resume
+workflow is tracked in [follow-up #65](https://github.com/cataggar/ipmi-rs/issues/65).
+[FWUM issue #36](https://github.com/cataggar/ipmi-rs/issues/36) covers
+read-only inspection and guarded local updates, not routed writes.
 RMCP/RMCP+ supports read-only inspection but not this update workflow.
 Its request correlator permanently retires all 64 six-bit IPMB sequences.
 Even the smallest valid 1460-byte image requires 57 page-bounded Save Image
