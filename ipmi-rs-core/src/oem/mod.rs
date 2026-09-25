@@ -12,6 +12,7 @@ use crate::{
 };
 
 pub mod dell;
+pub mod ime;
 pub mod kontron;
 pub mod quanta;
 pub mod sun;
