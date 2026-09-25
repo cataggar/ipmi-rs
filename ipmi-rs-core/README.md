@@ -50,12 +50,17 @@ complete alert policy entry. To toggle a policy, read its entry, change only
 `entry.policy.enabled`, then write it using `PefChange::PolicyEntry(entry)`;
 this preserves its policy set, rule, channel, destination and alert string key.
 `pef_write_guarded(|request| ipmi.send_recv(request), change)` attempts
-set-in-progress, the write, commit and set-complete; it attempts cleanup even
-when an earlier request fails, and returns every error. A failed response does
-not prove a write did not take effect; do not blindly retry. If the BMC rejects
-set-in-progress as unsupported (`0x80`), an unguarded `SetPefConfig` requires
-an explicit caller decision. Other completion codes are retained by the
-connection's `IpmiError`.
+set-in-progress, the write, commit and set-complete. A confirmed nonzero
+completion code for Begin (including `0x81`, already in progress) skips
+set-complete so another writer's transaction is not released. A timeout, lost
+response, or malformed success is ambiguous: set-complete is still attempted
+and both errors are retained. Once Begin succeeds, cleanup is attempted after
+write/commit failures as well. Other error types supplied to the helper must
+implement `PefBeginError`, returning `true` only for a confirmed rejection.
+A failed response does not prove a write did not take effect; do not blindly
+retry. If the BMC rejects set-in-progress as unsupported (`0x80`), an
+unguarded `SetPefConfig` requires an explicit caller decision. Completion
+codes are retained by the connection's `IpmiError`.
 
 An alert policy selects a **channel** and four-bit **destination ID**; it does
 not configure the destination's address, type, community or delivery behavior.

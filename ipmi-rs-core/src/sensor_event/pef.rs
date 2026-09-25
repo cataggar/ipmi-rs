@@ -885,14 +885,34 @@ impl From<PefChange> for PefWrite {
     }
 }
 
+/// Classify whether a failed Begin was definitively rejected by the BMC.
+///
+/// Return `true` only for a matching, nonzero completion-code response.
+/// Timeouts, lost responses, malformed successes and transport errors are
+/// ambiguous and must return `false` so cleanup is attempted. Implemented for
+/// [`PefError`] and for `ipmi_rs::IpmiError<_, PefError>` in `ipmi-rs`.
+pub trait PefBeginError {
+    /// Whether the controller definitively rejected Begin without taking the lock.
+    fn confirmed_rejection(&self) -> bool;
+}
+
+impl PefBeginError for PefError {
+    fn confirmed_rejection(&self) -> bool {
+        matches!(self, Self::Rejected(_))
+    }
+}
+
 /// Start, change, commit, and finish a PEF configuration write.
 ///
-/// This helper makes at most four requests and always attempts Set Complete,
-/// including when Begin fails or the write fails. If parameter 0 is unsupported,
-/// it returns the error; callers must explicitly decide whether an unguarded
-/// [`SetPefConfig`] is appropriate for their controller. No discovery/read
-/// operation invokes this helper or writes to the BMC.
-pub fn pef_write_guarded<E>(
+/// This helper makes at most four requests. A Begin rejected by a matching
+/// nonzero completion code is **not** followed by Set Complete, which could
+/// otherwise release another writer's lock. An ambiguous Begin (for example a
+/// timeout) still attempts Set Complete and retains both errors. Once Begin
+/// succeeds, cleanup is always attempted even if the write or commit fails.
+/// If parameter 0 is unsupported, callers must explicitly decide whether an
+/// unguarded [`SetPefConfig`] is appropriate for their controller. No
+/// discovery/read operation invokes this helper or writes to the BMC.
+pub fn pef_write_guarded<E: PefBeginError>(
     mut send: impl FnMut(SetPefConfig) -> Result<(), E>,
     change: PefChange,
 ) -> Result<(), PefWriteError<E>> {
@@ -900,7 +920,11 @@ pub fn pef_write_guarded<E>(
         value: PefWrite::SetInProgress(value),
     };
     if let Err(error) = send(state(PefSetInProgress::InProgress)) {
-        let cleanup = send(state(PefSetInProgress::Complete)).err();
+        let cleanup = if error.confirmed_rejection() {
+            None
+        } else {
+            send(state(PefSetInProgress::Complete)).err()
+        };
         return Err(PefWriteError::Begin { error, cleanup });
     }
     let written = send(SetPefConfig {
@@ -926,11 +950,11 @@ pub fn pef_write_guarded<E>(
 /// A guarded write may have taken effect even when a response was lost.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PefWriteError<E> {
-    /// Begin failed; Set Complete was still attempted.
+    /// Begin failed. Cleanup is attempted only when its outcome is uncertain.
     Begin {
         /// Begin error.
         error: E,
-        /// Cleanup error, if any.
+        /// Set Complete error if cleanup was attempted and failed.
         cleanup: Option<E>,
     },
     /// Write, commit or cleanup failed; all outcomes are retained.
@@ -947,6 +971,21 @@ pub enum PefWriteError<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum MockWriteError {
+        AlreadyInProgress,
+        LostResponse,
+        WriteFailed,
+        CommitFailed,
+        CleanupFailed,
+    }
+
+    impl PefBeginError for MockWriteError {
+        fn confirmed_rejection(&self) -> bool {
+            matches!(self, Self::AlreadyInProgress)
+        }
+    }
 
     const FILTER: [u8; 22] = [
         0x11, 3, 0xc0, 0x21, 2, 8, 0x81, 0xff, 1, 0xff, 0x6f, 0x34, 0x12, 0xff, 1, 2, 0xfe, 3, 4,
@@ -1312,13 +1351,59 @@ mod tests {
         let result = pef_write_guarded(
             |request| {
                 calls.push(request.value);
-                if matches!(
-                    request.value,
-                    PefWrite::SetInProgress(
-                        PefSetInProgress::InProgress | PefSetInProgress::Complete
-                    )
-                ) {
-                    Err("failed")
+                Err::<(), _>(MockWriteError::AlreadyInProgress)
+            },
+            change,
+        );
+        assert_eq!(
+            result,
+            Err(PefWriteError::Begin {
+                error: MockWriteError::AlreadyInProgress,
+                cleanup: None
+            })
+        );
+        assert_eq!(
+            calls,
+            [PefWrite::SetInProgress(PefSetInProgress::InProgress)]
+        );
+        calls.clear();
+
+        let result = pef_write_guarded(
+            |request| {
+                calls.push(request.value);
+                match request.value {
+                    PefWrite::SetInProgress(PefSetInProgress::InProgress) => {
+                        Err(MockWriteError::LostResponse)
+                    }
+                    PefWrite::SetInProgress(PefSetInProgress::Complete) => {
+                        Err(MockWriteError::CleanupFailed)
+                    }
+                    _ => panic!("a failed Begin must not be followed by a write or commit"),
+                }
+            },
+            change,
+        );
+        assert_eq!(
+            result,
+            Err(PefWriteError::Begin {
+                error: MockWriteError::LostResponse,
+                cleanup: Some(MockWriteError::CleanupFailed)
+            })
+        );
+        assert_eq!(
+            calls,
+            [
+                PefWrite::SetInProgress(PefSetInProgress::InProgress),
+                PefWrite::SetInProgress(PefSetInProgress::Complete),
+            ]
+        );
+        calls.clear();
+
+        let result = pef_write_guarded(
+            |request| {
+                calls.push(request.value);
+                if request.value == PefWrite::SetInProgress(PefSetInProgress::InProgress) {
+                    Err(MockWriteError::LostResponse)
                 } else {
                     Ok(())
                 }
@@ -1328,8 +1413,8 @@ mod tests {
         assert_eq!(
             result,
             Err(PefWriteError::Begin {
-                error: "failed",
-                cleanup: Some("failed")
+                error: MockWriteError::LostResponse,
+                cleanup: None,
             })
         );
         assert_eq!(calls.len(), 2);
@@ -1343,7 +1428,11 @@ mod tests {
                     PefWrite::FilterEnabled { .. }
                         | PefWrite::SetInProgress(PefSetInProgress::Complete)
                 ) {
-                    Err("failed")
+                    if matches!(request.value, PefWrite::FilterEnabled { .. }) {
+                        Err(MockWriteError::WriteFailed)
+                    } else {
+                        Err(MockWriteError::CleanupFailed)
+                    }
                 } else {
                     Ok(())
                 }
@@ -1353,9 +1442,9 @@ mod tests {
         assert_eq!(
             result,
             Err(PefWriteError::Uncertain {
-                write: Some("failed"),
+                write: Some(MockWriteError::WriteFailed),
                 commit: None,
-                cleanup: Some("failed"),
+                cleanup: Some(MockWriteError::CleanupFailed),
             })
         );
         assert_eq!(calls.len(), 3);
@@ -1365,7 +1454,7 @@ mod tests {
             |request| {
                 calls.push(request.value);
                 if request.value == PefWrite::SetInProgress(PefSetInProgress::CommitWrite) {
-                    Err("commit failed")
+                    Err(MockWriteError::CommitFailed)
                 } else {
                     Ok(())
                 }
@@ -1376,7 +1465,7 @@ mod tests {
             result,
             Err(PefWriteError::Uncertain {
                 write: None,
-                commit: Some("commit failed"),
+                commit: Some(MockWriteError::CommitFailed),
                 cleanup: None,
             })
         );
@@ -1387,7 +1476,7 @@ mod tests {
                 |request| {
                     calls.push(request.value);
                     if request.value == PefWrite::SetInProgress(PefSetInProgress::Complete) {
-                        Err("cleanup failed")
+                        Err(MockWriteError::CleanupFailed)
                     } else {
                         Ok(())
                     }
@@ -1397,7 +1486,7 @@ mod tests {
             Err(PefWriteError::Uncertain {
                 write: None,
                 commit: None,
-                cleanup: Some("cleanup failed")
+                cleanup: Some(MockWriteError::CleanupFailed)
             })
         );
         assert_eq!(calls.len(), 4);
@@ -1406,7 +1495,7 @@ mod tests {
             pef_write_guarded(
                 |request| {
                     calls.push(request.value);
-                    Ok::<_, ()>(())
+                    Ok::<_, MockWriteError>(())
                 },
                 change
             ),
