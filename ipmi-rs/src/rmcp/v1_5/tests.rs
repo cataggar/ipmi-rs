@@ -184,6 +184,52 @@ fn busy_queue_flags_recover_without_replaying_bridged_command() {
 }
 
 #[test]
+fn short_queue_backoff_accepts_pushed_reply_before_deadline() {
+    let (mut state, peer) = pair(Duration::from_millis(40));
+    peer.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let mut req = target();
+    state.send(&mut req).unwrap();
+    let mut received = [0; 4096];
+    peer.recv(&mut received).unwrap();
+    reply_packet(&peer, 1, ipmb_reply(0x81, 0x20, 0, 7, 0, 0x34, &[0]));
+    let server = std::thread::spawn(move || {
+        let len = peer.recv(&mut received).unwrap();
+        let flags = Message::from_data(None, &received[4..len]).unwrap();
+        assert_eq!((flags.payload[5], flags.payload[4] >> 2), (0x31, 2));
+        reply_packet(&peer, 2, ipmb_reply(0x81, 0x20, 2, 7, 0, 0x31, &[0xc0]));
+        std::thread::sleep(Duration::from_millis(5));
+        reply_packet(&peer, 3, ipmb_reply(0x81, 0x52, 1, 1, 1, 2, &[0, 0x59]));
+        assert!(peer.recv(&mut received).is_err()); // no second probe or original command replay
+    });
+    assert_eq!(state.recv().unwrap().data(), &[0x59]);
+    assert_eq!(state.last_inbound_sequence, Some(3));
+    server.join().unwrap();
+}
+
+#[test]
+fn short_queue_backoff_without_reply_expires_as_timeout() {
+    let (mut state, peer) = pair(Duration::from_millis(40));
+    peer.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let mut req = target();
+    state.send(&mut req).unwrap();
+    let mut received = [0; 4096];
+    peer.recv(&mut received).unwrap();
+    reply_packet(&peer, 1, ipmb_reply(0x81, 0x20, 0, 7, 0, 0x34, &[0]));
+    let server = std::thread::spawn(move || {
+        let len = peer.recv(&mut received).unwrap();
+        let flags = Message::from_data(None, &received[4..len]).unwrap();
+        assert_eq!(flags.payload[5], 0x31);
+        reply_packet(&peer, 2, ipmb_reply(0x81, 0x20, 2, 7, 0, 0x31, &[0xc0]));
+        assert!(peer.recv(&mut received).is_err());
+    });
+    assert!(matches!(state.recv(), Err(RmcpIpmiReceiveError::Timeout)));
+    assert!(state.ipmb_state.pending.is_none());
+    server.join().unwrap();
+}
+
+#[test]
 fn unsupported_queue_timeout_retires_late_reply_without_resending() {
     let (mut state, peer) = pair(Duration::from_millis(130));
     peer.set_read_timeout(Some(Duration::from_millis(60)))

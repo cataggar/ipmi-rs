@@ -422,6 +422,58 @@ fn encrypted_busy_get_message_rechecks_queue_then_receives_target() {
 }
 
 #[test]
+fn encrypted_short_queue_backoff_accepts_pushed_reply_before_deadline() {
+    let (mut state, peer, mut crypto) = pair(Duration::from_millis(40));
+    peer.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let mut req = bridge_request(None);
+    state.send(&mut req).unwrap();
+    assert_eq!(read_secure(&peer, &mut crypto).payload[5], 0x34);
+    let console_id = state.console_session_id.get();
+    send_answer(
+        &peer,
+        &mut crypto,
+        Message {
+            ty: PayloadType::IpmiMessage,
+            session_id: console_id,
+            session_sequence_number: 1,
+            payload: bridge_reply(0x81, 0x20, 0, 7, 0, 0x34, &[0]),
+        },
+    );
+    let server = std::thread::spawn(move || {
+        for (seq, command, body) in [(2, 0x31, vec![0, 1]), (3, 0x33, vec![0xc0])] {
+            let poll = read_secure(&peer, &mut crypto);
+            assert_eq!((poll.payload[5], poll.payload[4] >> 2), (command, seq));
+            send_answer(
+                &peer,
+                &mut crypto,
+                Message {
+                    ty: PayloadType::IpmiMessage,
+                    session_id: console_id,
+                    session_sequence_number: u32::from(seq),
+                    payload: bridge_reply(0x81, 0x20, seq, 7, 0, command, &body),
+                },
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        send_answer(
+            &peer,
+            &mut crypto,
+            Message {
+                ty: PayloadType::IpmiMessage,
+                session_id: console_id,
+                session_sequence_number: 4,
+                payload: bridge_reply(0x81, 0x52, 1, 1, 1, 2, &[0, 0x59]),
+            },
+        );
+        assert!(peer.recv(&mut [0; 4096]).is_err()); // no additional queue/bridged request
+    });
+    assert_eq!(state.recv().unwrap().data(), &[0x59]);
+    assert_eq!(state.last_inbound_sequence, Some(4));
+    server.join().unwrap();
+}
+
+#[test]
 fn encrypted_unsupported_queue_timeout_rejects_late_pushed_reply() {
     let (mut state, peer, mut crypto) = pair(Duration::from_millis(130));
     peer.set_read_timeout(Some(Duration::from_millis(60)))

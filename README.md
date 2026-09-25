@@ -223,7 +223,8 @@ until the original operation deadline. Transient queue failures (such as
 Node Busy) only recheck the read-only queue, with backoff; unexpected
 completion codes are returned as errors. The original bridged command is
 never resent. If no correlated reply arrives, the outcome is unknown.
-Queue checks use bounded backoff and a 64-sequence-per-session budget
+Queue backoff waits for pushed replies instead of sleeping, using the
+original deadline and a 64-sequence-per-session budget
 (including bridge hops and polls). When that budget is exhausted, the
 current operation still waits for a pushed reply until its deadline;
 open a **new session** for subsequent requests. Only one operation can

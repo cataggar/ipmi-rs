@@ -700,14 +700,21 @@ impl State {
             let mut unrelated = 0;
             let mut first_mismatch = None;
             let mut polls = 0;
+            let mut next_probe = None;
             loop {
-                if self.ipmb_state.needs_poll() {
-                    if polls > 0 && !self.ipmb_state.queue_available() {
-                        std::thread::sleep(
-                            std::time::Duration::from_millis(50)
-                                .min(deadline.saturating_duration_since(std::time::Instant::now())),
-                        );
-                    }
+                let needs_poll = self.ipmb_state.needs_poll();
+                let send_poll = if needs_poll && polls > 0 && !self.ipmb_state.queue_available() {
+                    let ready = next_probe.get_or_insert_with(|| {
+                        std::time::Instant::now()
+                            .checked_add(std::time::Duration::from_millis(50))
+                            .unwrap_or(deadline)
+                    });
+                    std::time::Instant::now() >= *ready
+                } else {
+                    needs_poll
+                };
+                if send_poll {
+                    next_probe = None;
                     let poll = match self.ipmb_state.poll_message() {
                         Ok(poll) => poll,
                         Err(RmcpIpmiSendError::IpmbSequenceExhausted) => {
@@ -719,14 +726,18 @@ impl State {
                     self.send_payload(poll, deadline)
                         .map_err(RmcpIpmiReceiveError::BridgePollSend)?;
                     polls += 1;
+                } else if !needs_poll {
+                    next_probe = None;
                 }
-                match self.receive_one(deadline, &mut unrelated, &mut seen) {
+                let receive_deadline = next_probe.unwrap_or(deadline).min(deadline);
+                match self.receive_one(receive_deadline, &mut unrelated, &mut seen) {
                     Ok(Some(response)) => return Ok(response),
                     Ok(None) => {
                         if !self.ipmb_state.needs_poll() {
                             super::socket::count_unrelated(&mut unrelated)?;
                         }
                     }
+                    Err(RmcpIpmiReceiveError::Timeout) if receive_deadline < deadline => continue,
                     Err(RmcpIpmiReceiveError::Timeout) => {
                         return Err(first_mismatch.unwrap_or(RmcpIpmiReceiveError::Timeout));
                     }

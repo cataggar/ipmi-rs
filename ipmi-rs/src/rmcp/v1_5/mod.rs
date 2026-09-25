@@ -266,14 +266,21 @@ impl IpmiConnection for State {
             let mut unrelated = 0;
             let mut first_mismatch = None;
             let mut polls = 0;
+            let mut next_probe = None;
             loop {
-                if self.ipmb_state.needs_poll() {
-                    if polls > 0 && !self.ipmb_state.queue_available() {
-                        std::thread::sleep(
-                            std::time::Duration::from_millis(50)
-                                .min(deadline.saturating_duration_since(Instant::now())),
-                        );
-                    }
+                let needs_poll = self.ipmb_state.needs_poll();
+                let send_poll = if needs_poll && polls > 0 && !self.ipmb_state.queue_available() {
+                    let ready = next_probe.get_or_insert_with(|| {
+                        Instant::now()
+                            .checked_add(std::time::Duration::from_millis(50))
+                            .unwrap_or(deadline)
+                    });
+                    Instant::now() >= *ready
+                } else {
+                    needs_poll
+                };
+                if send_poll {
+                    next_probe = None;
                     let poll = match self.ipmb_state.poll_message() {
                         Ok(poll) => poll,
                         Err(RmcpIpmiSendError::IpmbSequenceExhausted) => {
@@ -285,9 +292,16 @@ impl IpmiConnection for State {
                     self.send_payload(poll, deadline)
                         .map_err(RmcpIpmiReceiveError::BridgePollSend)?;
                     polls += 1;
+                } else if !needs_poll {
+                    next_probe = None;
                 }
-                let data = match self.socket.recv_until_with_budget(deadline, &mut unrelated) {
+                let receive_deadline = next_probe.unwrap_or(deadline).min(deadline);
+                let data = match self
+                    .socket
+                    .recv_until_with_budget(receive_deadline, &mut unrelated)
+                {
                     Ok(data) => data,
+                    Err(RmcpIpmiReceiveError::Timeout) if receive_deadline < deadline => continue,
                     Err(RmcpIpmiReceiveError::Timeout) => {
                         return Err(first_mismatch.unwrap_or(RmcpIpmiReceiveError::Timeout));
                     }
