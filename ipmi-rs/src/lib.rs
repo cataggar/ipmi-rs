@@ -25,6 +25,9 @@ pub mod oem;
 mod spd;
 pub use spd::SpdReadError;
 
+/// Kontron firmware inventory and opt-in guarded update workflow.
+pub mod fwum;
+
 mod error;
 pub use error::IpmiError;
 

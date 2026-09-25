@@ -19,3 +19,4 @@ time = { version = "0.3", optional = true, default-features = false, features = 
 
 [features]
 default = [ "time", "log" ]
+kontron-fwum-update = []
