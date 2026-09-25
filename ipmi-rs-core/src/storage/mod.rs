@@ -1,3 +1,4 @@
+pub mod fru;
 pub mod sel;
 
 use std::num::NonZeroU16;

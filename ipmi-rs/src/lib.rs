@@ -28,6 +28,9 @@ pub use error::IpmiError;
 mod sel;
 pub use sel::{SelIter, SelIterError, SelMutationError};
 
+mod fru;
+pub use fru::{FruReadError, FruWriteError};
+
 use ipmi_rs_core::{
     connection::{CompletionErrorCode, IpmiCommand, Request, RequestTargetAddress},
     storage::sdr::{self, Record as SdrRecord},

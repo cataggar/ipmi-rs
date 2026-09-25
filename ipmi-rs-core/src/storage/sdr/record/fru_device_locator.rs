@@ -52,7 +52,7 @@ impl IdentifiableSensor for FruDeviceLocator {
 
 impl FruDeviceLocator {
     pub fn parse(record_data: &[u8]) -> Result<Self, ParseError> {
-        if record_data.len() < 8 {
+        if record_data.len() < 11 {
             return Err(ParseError::NotEnoughData);
         }
 
