@@ -302,6 +302,22 @@ pub trait IpmiCommand: Into<Message> {
     /// provided `data`, assuming a successful completion code.
     fn parse_success_response(data: &[u8]) -> Result<Self::Output, Self::Error>;
 
+    /// Parse a successful response with access to the original request payload.
+    ///
+    /// Commands with request-dependent response lengths can override this method.
+    fn parse_success_response_for_request(
+        request_data: &[u8],
+        data: &[u8],
+    ) -> Result<Self::Output, Self::Error> {
+        let _ = request_data;
+        Self::parse_success_response(data)
+    }
+
+    /// The target LUN, including when the target is the local BMC.
+    fn target_lun(&self) -> LogicalUnit {
+        LogicalUnit::Zero
+    }
+
     /// Get the intended target [`Address`] and [`Channel`] for this command.
     fn target(&self) -> Option<(Address, Channel)> {
         None

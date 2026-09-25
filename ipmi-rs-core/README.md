@@ -204,4 +204,30 @@ after a successful completion code; a lost reply is an **unknown outcome**.
 Do not automatically retry limits/policies/alerts or string chunks, and do
 not assume a subsequent read conclusively proves that no mutation occurred.
 
+`app::i2c::{I2cBus, I2cAddress, MasterWriteRead}` implements App command 52h.
+Each transfer accepts up to 64 bytes written and 64 bytes read. Addresses are
+**eight-bit even write addresses** (e.g. SPD 0xA0); use `from_7bit` for SDR
+slave addresses. The successful response must contain exactly the requested
+number of bytes. Arbitration loss (81h), bus error (82h), NAK on write (83h),
+and truncated read (84h) have distinct error variants. Other completion codes
+are retained by `IpmiError`. A zero-byte write/read is permitted for
+address-only DDR4 SPD page selection.
+
+`storage::sdr::record::GenericDeviceLocator` provides `read(offset, count)`
+and `write(offset, bytes)`, plus `_at_address` forms for locators with an
+address span. Devices without a one-byte register offset can use
+`read_raw(prefix, count)` or explicit `write_raw(bytes)` instead. These
+build validated I2C commands; merely discovering/parsing
+the locator **never sends a command or mutates a device**. Writes must be
+explicitly sent, and their outcomes can be unknown after a timeout. Never
+automatically retry uncertain writes. Controller addresses and LUNs in SDRs
+are honored; remote satellite controllers require bridged RMCP routing
+(tracked in issue #13), not provided by this API alone.
+
+`app::spd::{Spd, SpdPage}` decodes a complete 256-byte SPD image (or two
+pages for DDR4), preserving every unknown byte and memory type. DDR3/DDR4
+capacity, ECC width, raw manufacturer ID, serial and part-number bytes are
+decoded where available. A DDR4 header declaring 512 bytes needs both pages.
+Decoder output never attempts EEPROM writes.
+
 [`ipmi-rs`]: https://crates.io/crates/ipmi-rs

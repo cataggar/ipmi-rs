@@ -22,6 +22,9 @@ pub mod ami_usb;
 /// Opt-in, identity-checked OEM command execution.
 pub mod oem;
 
+mod spd;
+pub use spd::SpdReadError;
+
 mod error;
 pub use error::IpmiError;
 
@@ -179,7 +182,8 @@ where
             return Err(error);
         }
 
-        CMD::parse_success_response(response.data()).map_err(|err| map_error(None, err))
+        CMD::parse_success_response_for_request(request.data(), response.data())
+            .map_err(|err| map_error(None, err))
     }
 }
 
