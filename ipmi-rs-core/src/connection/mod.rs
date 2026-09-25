@@ -234,14 +234,16 @@ pub trait IpmiConnection {
     }
 
     /// Remaining non-reusable IPMB sequences in the active transport session.
-    /// `None` means the transport does not impose this RMCP session limit.
+    /// `None` means the budget is **unknown**, not unlimited. Callers may
+    /// instead allow an explicitly audited unlimited transport via
+    /// [`Self::supports_long_mutation_workflows`].
     fn ipmb_sequence_budget(&self) -> Option<usize> {
         None
     }
 
     /// Reserve a minimum number of sequences for future requests in an
     /// explicitly checked operation. Polling must not consume this floor.
-    /// A transport without a budget need not implement this method.
+    /// An explicitly audited unlimited transport need not implement this.
     fn reserve_ipmb_sequences(&mut self, _minimum: usize) -> bool {
         false
     }

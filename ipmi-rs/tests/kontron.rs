@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use ipmi_rs::{
     connection::{
@@ -9,6 +9,7 @@ use ipmi_rs::{
         kontron::{BootDevice, GetManufacturingDate, GetSerialNumber, SerialError},
         OemCommand, OemError,
     },
+    rmcp::Rmcp,
     storage::fru::{FruAccess, FruDevice, FruInventory},
     Ipmi, IpmiError, KontronArea, KontronBootError, KontronBufferFailure, KontronBufferStep,
     KontronFruError, KontronWriteApproval, KontronWriteFailure,
@@ -138,6 +139,10 @@ impl IpmiConnection for Mock {
     type SendError = MockError;
     type RecvError = MockError;
     type Error = MockError;
+
+    fn supports_long_mutation_workflows(&self) -> bool {
+        self.sequence_budget.is_none()
+    }
 
     fn send(&mut self, _: &mut Request) -> Result<(), MockError> {
         unreachable!()
@@ -300,6 +305,26 @@ impl IpmiConnection for Mock {
     }
 }
 
+struct PlainForward<T>(T);
+
+impl<T: IpmiConnection> IpmiConnection for PlainForward<T> {
+    type SendError = T::SendError;
+    type RecvError = T::RecvError;
+    type Error = T::Error;
+
+    fn send(&mut self, request: &mut Request) -> Result<(), Self::SendError> {
+        self.0.send(request)
+    }
+
+    fn recv(&mut self) -> Result<Response, Self::RecvError> {
+        self.0.recv()
+    }
+
+    fn send_recv(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
+        self.0.send_recv(request)
+    }
+}
+
 #[test]
 fn source_oem_fixtures_and_cp6012_gate_use_explicit_routing() {
     let target = bridged().target;
@@ -428,6 +453,46 @@ fn remote_128_and_256_byte_images_fail_budget_before_any_write() {
 }
 
 #[test]
+fn opaque_delegating_rmcp_wrapper_fails_closed_before_any_write() {
+    let mut mock = Mock::new();
+    mock.sequence_budget = Some(64);
+    let mut ipmi = Ipmi::new(PlainForward(mock));
+    let change = ipmi.prepare_kontron_serial(bridged()).unwrap();
+    assert!(matches!(
+        ipmi.apply_kontron_fru_change(&change, approve()),
+        Err(KontronFruError::UnverifiedSequenceBudget)
+    ));
+    let wrapper = ipmi.release();
+    assert_eq!(wrapper.0.count(0x0a, 0x12), 0);
+    assert_eq!(wrapper.0.sequence_budget, Some(36));
+
+    let rmcp = Rmcp::new("127.0.0.1:623", Duration::from_millis(10)).unwrap();
+    let mut ipmi = Ipmi::new(PlainForward(rmcp));
+    assert!(matches!(
+        ipmi.apply_kontron_fru_change(&change, approve()),
+        Err(KontronFruError::UnverifiedSequenceBudget)
+    ));
+    assert!(!ipmi.release().0.is_active());
+}
+
+#[test]
+fn unknown_budget_blocks_boot_and_buffer_without_even_an_identity_probe() {
+    let mut ipmi = Ipmi::new(PlainForward(Mock::new()));
+    assert!(matches!(
+        ipmi.kontron_set_next_boot(None, BootDevice::Bios, approve()),
+        Err(KontronBootError::UnverifiedSequenceBudget)
+    ));
+    assert!(matches!(
+        ipmi.kontron_set_large_buffer(bridged().target, 64),
+        Err(ipmi_rs::KontronBufferError {
+            source: KontronBufferFailure::UnverifiedSequenceBudget,
+            ..
+        })
+    ));
+    assert!(ipmi.release().0.sent.is_empty());
+}
+
+#[test]
 fn small_bridged_fru_can_write_and_verify_inside_64_sequence_session() {
     let mut mock = Mock::new();
     mock.image = compact_image();
@@ -443,6 +508,16 @@ fn small_bridged_fru_can_write_and_verify_inside_64_sequence_session() {
     assert_eq!(mock.count(0x0a, 0x12), 2);
     assert!(mock.sequence_budget.unwrap() > 0);
     assert!(mock.reserved_sequences.is_none());
+}
+
+#[test]
+fn audited_local_mutation_and_mutable_connection_reference_remain_supported() {
+    let mut mock = Mock::new();
+    let mut ipmi = Ipmi::new(&mut mock);
+    let change = ipmi.prepare_kontron_mfg_date(FruDevice::BUILTIN).unwrap();
+    ipmi.apply_kontron_fru_change(&change, approve()).unwrap();
+    ipmi.release();
+    assert_eq!(mock.count(0x0a, 0x12), 3);
 }
 
 #[test]

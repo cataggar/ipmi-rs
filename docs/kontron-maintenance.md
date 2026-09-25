@@ -58,6 +58,14 @@ No other FRU IDs or LUNs are supported by this workflow.
    similarly reserve sequences before mutations (the buffer calculation
    includes failure cleanup). Rejection requires a fresh connection/session
    or a smaller FRU; there is **no mid-write session renewal or sequence reuse**.
+   A transport or delegating wrapper returning `None` for the budget is
+   **unknown, never implicitly unlimited**: the workflow rejects it without
+   sending a mutation. Only transports explicitly audited via
+   `IpmiConnection::supports_long_mutation_workflows()` opt into unbounded
+   transfers (the Linux device-file and local AMI USB paths). `&mut T`
+   forwards both capabilities; other wrappers must verify and explicitly
+   expose the underlying capability. This uses the same fail-closed opt-in
+   pattern as the separately tracked Kontron FWUM workflow in PR #62.
 4. If a chunk fails, **stop**: its error gives the area, byte offset,
    previously acknowledged bytes and best-effort raw observation (which may
    itself fail). Even a completion-code rejection or short acknowledgement
@@ -91,7 +99,10 @@ identity/image, lost/short/rejected partial writes, readback mismatch,
 explicit recovery, ambiguous boot, and buffer failure/restoration. A
 64-sequence bridged-session fixture rejects 128-/256-byte FRUs before
 writes; a compact 40-byte, source-format FRU completes on a push-reply
-session without recycling sequence numbers.
+session without recycling sequence numbers. A plain delegating wrapper
+that does **not** expose its inner RMCP budget fails closed with zero writes,
+while an explicitly audited local connection and a compact, budgeted bridge
+retain the supported path.
 
 The upstream [Kontron SEL transcript](https://github.com/cataggar/ipmitool/blob/33f3a0a1b895e3effabb0ec8d180a0a2f1536128/tests/transcripts/sel_kontron.tr)
 identifies a manufacturer in SEL data; it **does not capture these commands

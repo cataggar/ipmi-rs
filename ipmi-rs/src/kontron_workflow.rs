@@ -100,6 +100,8 @@ pub enum KontronWriteFailure<E> {
 /// CP6012 boot write rejected before dispatch, or attempted exactly once.
 #[derive(Debug)]
 pub enum KontronBootError<E> {
+    /// Transport does not report a budget or explicitly support long mutations.
+    UnverifiedSequenceBudget,
     /// Insufficient RMCP session sequences for identity and boot write.
     SequenceBudget {
         /// Sequences needed by the two commands.
@@ -136,6 +138,9 @@ pub enum KontronFruError<E> {
     Inventory(FruParseError),
     /// FRU size/access or the full Get Device ID changed since preparation.
     TargetChanged,
+    /// Transport or wrapper provides neither a known budget nor an explicit
+    /// audited unlimited-mutation capability. No write was sent.
+    UnverifiedSequenceBudget,
     /// Too few non-reusable transport sequences remain for the complete
     /// checked operation. No FRU write was sent.
     SequenceBudget {
@@ -230,7 +235,11 @@ impl<C: IpmiConnection> Ipmi<C> {
         needed: usize,
     ) -> Result<bool, KontronFruError<C::Error>> {
         let Some(available) = self.inner_mut().ipmb_sequence_budget() else {
-            return Ok(false);
+            return if self.inner_mut().supports_long_mutation_workflows() {
+                Ok(false)
+            } else {
+                Err(KontronFruError::UnverifiedSequenceBudget)
+            };
         };
         if available < needed || !self.inner_mut().reserve_ipmb_sequences(needed) {
             return Err(KontronFruError::SequenceBudget { needed, available });
@@ -525,6 +534,9 @@ impl<C: IpmiConnection> Ipmi<C> {
             }
             true
         } else {
+            if !self.inner_mut().supports_long_mutation_workflows() {
+                return Err(KontronBootError::UnverifiedSequenceBudget);
+            }
             false
         };
         let result = self
@@ -557,6 +569,13 @@ impl<C: IpmiConnection> Ipmi<C> {
             }
             true
         } else {
+            if !self.inner_mut().supports_long_mutation_workflows() {
+                return Err(KontronBufferError {
+                    step: KontronBufferStep::LocalCurrent,
+                    source: KontronBufferFailure::UnverifiedSequenceBudget,
+                    restore: Vec::new(),
+                });
+            }
             false
         };
         let result = self.configure_kontron_buffer(target, size);
@@ -684,6 +703,8 @@ pub struct KontronBufferError<E> {
 /// Reason a buffer negotiation failed before or after dispatch.
 #[derive(Debug)]
 pub enum KontronBufferFailure<E> {
+    /// Transport or wrapper has no verified sequence budget or unlimited opt-in.
+    UnverifiedSequenceBudget,
     /// Insufficient RMCP session sequences to reserve both setup and cleanup.
     SequenceBudget {
         /// Sequences needed for setup and possible cleanup.
