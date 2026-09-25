@@ -1,4 +1,8 @@
-use std::{net::UdpSocket, num::NonZeroU32, time::Instant};
+use std::{
+    net::{Ipv4Addr, SocketAddr, UdpSocket},
+    num::NonZeroU32,
+    time::Instant,
+};
 
 use crate::{
     app::auth::{
@@ -62,7 +66,7 @@ pub enum ReadError {
 }
 
 pub struct State {
-    socket: RmcpIpmiSocket,
+    pub(super) socket: RmcpIpmiSocket,
     ipmb_state: IpmbState,
     session_id: Option<NonZeroU32>,
     auth_type: crate::app::auth::AuthType,
@@ -70,6 +74,8 @@ pub struct State {
     session_sequence: u32,
     last_inbound_sequence: Option<u32>,
     activated: bool,
+    negotiated_privilege: Option<PrivilegeLevel>,
+    negotiated_auth: Option<AuthType>,
 }
 
 impl core::fmt::Debug for State {
@@ -134,6 +140,24 @@ impl State {
         &mut self.socket
     }
 
+    #[cfg(test)]
+    pub(super) fn test_authenticated(
+        socket: UdpSocket,
+        privilege: PrivilegeLevel,
+        auth_type: AuthType,
+        timeout: std::time::Duration,
+    ) -> Self {
+        let mut state = Self::new(socket, TransportPolicy::new(timeout), None);
+        state.session_id = NonZeroU32::new(0x1234);
+        state.session_sequence = 1;
+        state.activated = true;
+        state.negotiated_privilege = Some(privilege);
+        state.negotiated_auth = Some(auth_type);
+        state.auth_type = auth_type;
+        state.password = Some([9; 16]);
+        state
+    }
+
     pub fn new(
         socket: UdpSocket,
         policy: TransportPolicy,
@@ -148,7 +172,31 @@ impl State {
             session_sequence: 0,
             last_inbound_sequence: None,
             activated: false,
+            negotiated_privilege: None,
+            negotiated_auth: None,
         }
+    }
+
+    pub(super) fn tsol_capable(&self) -> bool {
+        self.activated
+            && self.negotiated_privilege == Some(PrivilegeLevel::Administrator)
+            && self.negotiated_auth == Some(self.auth_type)
+            && matches!(self.auth_type, AuthType::MD2 | AuthType::MD5)
+            && self.password.is_some()
+    }
+
+    pub(super) fn tsol_route(&self) -> std::io::Result<(Ipv4Addr, Ipv4Addr)> {
+        fn ipv4(address: SocketAddr) -> std::io::Result<Ipv4Addr> {
+            let ip = match address {
+                SocketAddr::V4(address) => Some(*address.ip()),
+                SocketAddr::V6(address) => address.ip().to_ipv4_mapped(),
+            };
+            ip.ok_or_else(|| std::io::Error::other("Tyan TSOL requires IPv4 LAN"))
+        }
+        Ok((
+            ipv4(self.socket.local_addr()?)?,
+            ipv4(self.socket.peer_addr()?)?,
+        ))
     }
 
     pub fn release_socket(self) -> RmcpIpmiSocket {
@@ -221,6 +269,8 @@ impl State {
         self.session_sequence = activation_info.initial_sequence_number;
         self.session_id = Some(activation_info.session_id);
         self.last_inbound_sequence = None;
+        self.negotiated_privilege = Some(activation_info.maximum_privilege_level);
+        self.negotiated_auth = Some(activation_info.auth_type);
         self.activated = true;
         self.socket.clear_activation_deadline();
 

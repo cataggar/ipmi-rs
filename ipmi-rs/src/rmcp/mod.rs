@@ -32,6 +32,11 @@ pub use sol::{
     BufferedSolOutput, CaptureGap, SolCapture, SolError, SolInteractive, SolInterruption,
     SolInterruptionReason,
 };
+mod tyan_tsol;
+pub use tyan_tsol::{
+    BufferedTsolOutput, TsolCapture, TsolError, TsolInteractive, TsolInterruption,
+    TsolInterruptionReason, TsolReceiveError, TYAN_TSOL_DEFAULT_PORT,
+};
 mod checksum;
 
 mod header;

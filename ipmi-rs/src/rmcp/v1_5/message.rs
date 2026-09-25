@@ -69,8 +69,8 @@ impl Message {
         let session_sequence = u32::from_le_bytes(data[1..5].try_into().unwrap());
         let session_id = u32::from_le_bytes(data[5..9].try_into().unwrap());
 
-        let (auth_type, data) = if data[0] == 0x00 {
-            (AuthType::None, &data[9..])
+        let (auth_type, auth_code, data) = if data[0] == 0x00 {
+            (AuthType::None, None, &data[9..])
         } else {
             if data.len() < 26 {
                 return Err(ReadError::NotEnoughData);
@@ -87,18 +87,7 @@ impl Message {
 
             let data = &data[25..];
 
-            if !auth::verify(
-                &auth_type,
-                auth_code,
-                password,
-                session_id,
-                session_sequence,
-                data,
-            ) {
-                return Err(ReadError::AuthcodeError);
-            }
-
-            (auth_type, data)
+            (auth_type, Some(auth_code), data)
         };
 
         let data_len = data[0];
@@ -118,6 +107,19 @@ impl Message {
         } else {
             return Err(ReadError::IncorrectPayloadLen);
         };
+
+        if let Some(auth_code) = auth_code {
+            if !auth::verify(
+                &auth_type,
+                auth_code,
+                password,
+                session_id,
+                session_sequence,
+                &payload,
+            ) {
+                return Err(ReadError::AuthcodeError);
+            }
+        }
 
         Ok(Self {
             auth_type,
@@ -183,8 +185,8 @@ mod test {
     #[test]
     pub fn empty_md5() {
         let data = [
-            2, 1, 0, 0, 0, 2, 0, 0, 0, 152, 54, 135, 85, 190, 228, 38, 149, 133, 51, 201, 23, 232,
-            140, 18, 211, 0,
+            2, 1, 0, 0, 0, 2, 0, 0, 0, 195, 79, 254, 176, 78, 164, 164, 224, 87, 31, 152, 197, 2,
+            30, 118, 50, 0,
         ];
         let encapsulated = Message::from_data(Some(b"password\0\0\0\0\0\0\0\0"), &data);
         assert_eq!(
@@ -203,4 +205,28 @@ mod test {
         [2, 0, 0, 0, 1, 0, 0, 0, 2, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1],
         Err(ReadError::NotEnoughData)
     );
+
+    #[test]
+    fn authenticated_message_round_trip_and_tampering() {
+        for auth_type in [AuthType::MD2, AuthType::MD5] {
+            if auth_type == AuthType::MD5 && !cfg!(feature = "md5") {
+                continue;
+            }
+            let message = Message {
+                auth_type,
+                session_sequence_number: 8,
+                session_id: 0x1234,
+                payload: vec![0x81, 0xc4, 0xbb],
+            };
+            let password = [9; 16];
+            let mut wire = Vec::new();
+            message.write_data(Some(&password), &mut wire).unwrap();
+            assert_eq!(Message::from_data(Some(&password), &wire), Ok(message));
+            wire[26] ^= 1;
+            assert_eq!(
+                Message::from_data(Some(&password), &wire),
+                Err(ReadError::AuthcodeError)
+            );
+        }
+    }
 }

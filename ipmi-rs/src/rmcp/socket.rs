@@ -1,6 +1,6 @@
 use std::{
     io::ErrorKind,
-    net::UdpSocket,
+    net::{SocketAddr, UdpSocket},
     time::{Duration, Instant},
 };
 use zeroize::Zeroizing;
@@ -113,6 +113,14 @@ impl RmcpIpmiSocket {
     pub(crate) fn end_bounded(&mut self, previous: (Option<Instant>, Option<CancellationToken>)) {
         self.activation_deadline = previous.0;
         self.policy.operation_cancellation = previous.1;
+    }
+
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.peer_addr()
     }
 
     pub fn new(

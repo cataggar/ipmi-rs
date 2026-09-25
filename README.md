@@ -973,6 +973,75 @@ resets per-session SOL sequence state and returns `CaptureGap`. Reset a cancelle
 token **explicitly** before reconnection. Interactive sessions do not
 automatically reconnect.
 
+### Opt-in Tyan IPMI 1.5 TSOL (OEM)
+
+Tyan TSOL is **not** the RMCP+ SOL implementation above, and is **not**
+Intel ISOL (NetFn 0x34). Obtain authorization to attach to the remote console
+before calling `open_tyan_tsol_capture` or `open_tyan_tsol_interactive`; neither
+method is invoked during normal IPMI operations. Use `activate(false, ...)`
+to request IPMI 1.5 LAN, with administrator credentials, then choose read-only
+capture unless sending keystrokes is explicitly authorized:
+
+```rust,no_run
+use ipmi_rs::rmcp::{Rmcp, TYAN_TSOL_DEFAULT_PORT};
+use std::time::Duration;
+
+let mut connection = Rmcp::new("192.0.2.10:623", Duration::from_secs(2))?;
+let password = std::env::var("IPMI_PASSWORD")?;
+connection.activate(false, Some("operator"), Some(password.as_bytes()))
+    .map_err(|error| format!("{error:?}"))?;
+// Only after obtaining permission to attach to this specific Tyan BMC:
+let mut capture = connection.open_tyan_tsol_capture(TYAN_TSOL_DEFAULT_PORT)
+    .map_err(|error| format!("{error:?}"))?;
+let mut output = [0; 1024];
+let count = capture.read(&mut output).map_err(|error| format!("{error:?}"))?;
+// Consume output[..count] without logging console data or credentials.
+let _ = count;
+capture.close().map_err(|error| format!("{error:?}"))?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+The preflight requires an active authenticated IPMI 1.5 session whose BMC
+reported **administrator** privilege and MD2/MD5 session authentication,
+Get Device ID manufacturer **6653**, IPv4 control route, IPMI 1.5 channel
+capabilities with per-message/user authentication, and an available,
+session-based 802.3 LAN/IPMB channel permitting administrator access.
+Failure sends no OEM mutation. The receiver binds the local IPv4 address on
+that same control route before Start; nonlocal/NAT callback addresses and IPv6
+are not supported. Port `6230` matches ipmitool's default; port `0` lets the OS
+assign a free port, inspectable through `receiver_addr()`. Bind failures
+never send Start.
+
+The typed Start/Stop payload is IPv4 octets followed by the **big-endian**
+receiver port. Interactive `send_input` accepts 1–14 explicit bytes per call,
+encodes their length plus one and a session-local sequence, and sends a
+single IPMI command. It does **not** retry ambiguous sends, reconnect, or
+replay input. A lost keystroke acknowledgment has uncertain delivery: do
+not resend it automatically. Read-only capture has no input method.
+Explicit `close()` reports Stop failure, including uncertain remote
+deactivation; dropping a live session attempts a one-time 250 ms cleanup
+but cannot report its outcome. Failed reads and sends stop the session and
+return unread buffered output through `TsolInterruption::buffered_output`;
+its Debug implementation does not print console bytes. Each read has a
+monotonic deadline, cancellation is checked at most every 50 ms, and
+received datagrams are limited to 4096 bytes and 32 unrelated/empty
+datagrams per read. The four bytes of the legacy UDP header are skipped;
+short and oversized datagrams interrupt the session. No terminal raw
+mode, escape handling or CLI terminal presentation is provided. If an
+application changes terminal state, it must restore it on *all* exits
+(including errors and cancellation), e.g. with a scope guard.
+
+**Security and verification limits:** The TSOL UDP stream has no known
+cryptographic authentication or encryption. Incoming packets are accepted
+only from the control BMC's IPv4 address, but their source port and opaque
+four-byte header cannot authenticate the sender or prevent spoofing from
+that address. Use only a trusted, isolated management network and do not
+treat TSOL as a secure channel. Source-derived synthetic fixtures cover
+the ipmitool payloads, framing, bounds and lost replies; no live TSOL
+captures are checked in. A permissioned Tyan hardware transcript (with
+credentials and console contents redacted) is needed to confirm source
+port/header semantics and real-hardware interoperability.
+
 ## License
 
 All source code (including code snippets) is licensed under either of
