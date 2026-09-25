@@ -215,12 +215,18 @@ The transport validates both IPMB checksums, responder/requester addresses
 and LUNs, per-hop sequence, netfn and command, as well as the RMCP session
 identity and replay sequence. It waits for each successful Send Message
 acknowledgement before reporting the final response; the response may be
-embedded or retrieved with Get Message. Get Message polling is bounded by
-the operation deadline and a 64-sequence-per-session budget (including
-bridge hops and polls); open a **new session** when exhausted. Only one
-operation can be pending. Cancellation and timeouts retire its sequences,
-so late replies cannot satisfy the next request. A receive/poll failure
-is `OutcomeUnknown`, and an ambiguous network send is
+embedded, pushed over LAN, or retrieved with Get Message. Get Message is
+requested only when Get Message Flags reports a receive-queue entry. If
+the BMC rejects either queue command, the transport stops querying the
+queue for that session and waits for a correlated pushed reply until the
+original operation deadline; if none arrives, the outcome is unknown.
+Queue checks use bounded backoff and a 64-sequence-per-session budget
+(including bridge hops and polls). When that budget is exhausted, the
+current operation still waits for a pushed reply until its deadline;
+open a **new session** for subsequent requests. Only one operation can
+be pending. Cancellation and timeouts retire its sequences, so late
+replies cannot satisfy the next request. A receive/poll failure is
+`OutcomeUnknown`, and an ambiguous network send is
 `SendOutcomeUnknown`: **never automatically resend a power or configuration
 mutation**. RMCP 1.5 without authentication cannot guarantee peer
 authenticity; prefer authenticated RMCP+ for remote changes.

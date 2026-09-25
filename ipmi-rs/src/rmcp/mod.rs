@@ -50,7 +50,6 @@ pub enum RmcpIpmiReceiveError {
     IpmbChecksumFailed,
     IpmbResponseMismatch,
     BridgeCompletion { hop: u8, code: u8 },
-    BridgeGetMessageCompletion(u8),
     BridgePollSend(RmcpIpmiSendError),
     NoPendingRequest,
     SessionIdMismatch,

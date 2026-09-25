@@ -100,14 +100,80 @@ fn bridged_send_ack_get_message_then_target_reply() {
     let final_reply = ipmb_reply(0x81, 0x52, 1, 1, 1, 2, &[0, 0xa5]);
     let peer_thread = std::thread::spawn(move || {
         let len = peer.recv(&mut received).unwrap();
+        let flags = Message::from_data(None, &received[4..len]).unwrap();
+        assert_eq!((flags.payload[5], flags.payload[4] >> 2), (0x31, 2));
+        reply_packet(&peer, 2, ipmb_reply(0x81, 0x20, 2, 7, 0, 0x31, &[0, 1]));
+        let len = peer.recv(&mut received).unwrap();
         let get = Message::from_data(None, &received[4..len]).unwrap();
-        assert_eq!((get.payload[5], get.payload[4] >> 2), (0x33, 2));
+        assert_eq!((get.payload[5], get.payload[4] >> 2), (0x33, 3));
         let mut body = vec![0, 0]; // Get Message completion, primary channel
         body.extend_from_slice(&final_reply[1..]);
-        reply_packet(&peer, 2, ipmb_reply(0x81, 0x20, 2, 7, 0, 0x33, &body));
+        reply_packet(&peer, 3, ipmb_reply(0x81, 0x20, 3, 7, 0, 0x33, &body));
     });
     assert_eq!(state.recv().unwrap().data(), &[0xa5]);
     peer_thread.join().unwrap();
+}
+
+#[test]
+fn rejected_get_message_keeps_waiting_for_pushed_reply() {
+    let (mut state, peer) = pair(Duration::from_millis(250));
+    peer.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let mut req = target();
+    state.send(&mut req).unwrap();
+    let mut received = [0; 4096];
+    peer.recv(&mut received).unwrap();
+    reply_packet(&peer, 1, ipmb_reply(0x81, 0x20, 0, 7, 0, 0x34, &[0]));
+    let server = std::thread::spawn(move || {
+        let len = peer.recv(&mut received).unwrap();
+        let flags = Message::from_data(None, &received[4..len]).unwrap();
+        assert_eq!(flags.payload[5], 0x31);
+        reply_packet(&peer, 2, ipmb_reply(0x81, 0x20, 2, 7, 0, 0x31, &[0, 1]));
+        let len = peer.recv(&mut received).unwrap();
+        let get = Message::from_data(None, &received[4..len]).unwrap();
+        assert_eq!(get.payload[5], 0x33);
+        reply_packet(&peer, 3, ipmb_reply(0x81, 0x20, 3, 7, 0, 0x33, &[0xc1]));
+        std::thread::sleep(Duration::from_millis(25));
+        reply_packet(&peer, 4, ipmb_reply(0x81, 0x52, 1, 1, 1, 2, &[0, 0xa5]));
+        assert!(peer.recv(&mut received).is_err()); // no more queue polling
+    });
+    assert_eq!(state.recv().unwrap().data(), &[0xa5]);
+    server.join().unwrap();
+}
+
+#[test]
+fn unsupported_queue_timeout_retires_late_reply_without_resending() {
+    let (mut state, peer) = pair(Duration::from_millis(130));
+    peer.set_read_timeout(Some(Duration::from_millis(60)))
+        .unwrap();
+    let mut req = target();
+    state.send(&mut req).unwrap();
+    let mut received = [0; 4096];
+    peer.recv(&mut received).unwrap();
+    reply_packet(&peer, 1, ipmb_reply(0x81, 0x20, 0, 7, 0, 0x34, &[0]));
+    let server = std::thread::spawn(move || {
+        let len = peer.recv(&mut received).unwrap();
+        let flags = Message::from_data(None, &received[4..len]).unwrap();
+        assert_eq!(flags.payload[5], 0x31);
+        reply_packet(&peer, 2, ipmb_reply(0x81, 0x20, 2, 7, 0, 0x31, &[0, 1]));
+        let len = peer.recv(&mut received).unwrap();
+        let get = Message::from_data(None, &received[4..len]).unwrap();
+        assert_eq!(get.payload[5], 0x33);
+        reply_packet(&peer, 3, ipmb_reply(0x81, 0x20, 3, 7, 0, 0x33, &[0xc1]));
+        assert!(peer.recv(&mut received).is_err());
+        (peer, received)
+    });
+    let start = Instant::now();
+    assert!(matches!(state.recv(), Err(RmcpIpmiReceiveError::Timeout)));
+    assert!(start.elapsed() < Duration::from_millis(300));
+    let (peer, mut received) = server.join().unwrap();
+    state.send(&mut req).unwrap();
+    peer.recv(&mut received).unwrap();
+    reply_packet(&peer, 4, ipmb_reply(0x81, 0x52, 1, 1, 1, 2, &[0, 0xff]));
+    reply_packet(&peer, 5, ipmb_reply(0x81, 0x20, 4, 7, 0, 0x34, &[0]));
+    reply_packet(&peer, 6, ipmb_reply(0x81, 0x52, 5, 1, 1, 2, &[0, 0x55]));
+    assert_eq!(state.recv().unwrap().data(), &[0x55]);
+    assert!(peer.recv(&mut received).is_err()); // unsupported capability is cached
 }
 
 #[test]

@@ -43,6 +43,7 @@ pub struct PendingRequest {
     poll: Option<ExpectedReply>,
     deferred: Option<Response>,
     queue_channel: u8,
+    queue_available: bool,
     pub deadline: Instant,
 }
 
@@ -56,6 +57,7 @@ pub struct IpmbState {
     // Never reuse a sequence within this session: late IPMB replies can arrive
     // after a request has timed out, even if a different request is pending.
     retired_sequences: [bool; 64],
+    get_message_supported: bool,
 }
 
 impl Default for IpmbState {
@@ -67,6 +69,7 @@ impl Default for IpmbState {
             ipmb_sequence: 0,
             pending: None,
             retired_sequences: [false; 64],
+            get_message_supported: true,
         }
     }
 }
@@ -361,6 +364,7 @@ pub(super) fn record_unrelated(
 const APP_NETFN: u8 = 6;
 const SEND_MESSAGE: u8 = 0x34;
 const GET_MESSAGE: u8 = 0x33;
+const GET_MESSAGE_FLAGS: u8 = 0x31;
 const TRACK_REQUEST: u8 = 0x40;
 
 fn ipmb_request(expected: ExpectedReply, data: &[u8]) -> Vec<u8> {
@@ -557,15 +561,24 @@ impl IpmbState {
             poll: None,
             deferred: None,
             queue_channel,
+            queue_available: false,
             deadline,
         });
         Ok(payload)
     }
 
     pub fn needs_poll(&self) -> bool {
-        self.pending
-            .as_ref()
-            .is_some_and(|p| p.send_acks[0].is_some() && p.acked[0] && p.poll.is_none())
+        self.pending.as_ref().is_some_and(|p| {
+            self.get_message_supported && p.send_acks[0].is_some() && p.acked[0] && p.poll.is_none()
+        })
+    }
+
+    pub fn queue_available(&self) -> bool {
+        self.pending.as_ref().is_some_and(|p| p.queue_available)
+    }
+
+    pub fn stop_polling(&mut self) {
+        self.get_message_supported = false;
     }
 
     pub fn poll_message(&mut self) -> Result<Vec<u8>, RmcpIpmiSendError> {
@@ -578,7 +591,11 @@ impl IpmbState {
         }
         let reply = self.next_reply(
             APP_NETFN,
-            GET_MESSAGE,
+            if self.queue_available() {
+                GET_MESSAGE
+            } else {
+                GET_MESSAGE_FLAGS
+            },
             self.responder_addr,
             LogicalUnit::Zero,
             self.requestor_addr,
@@ -592,7 +609,7 @@ impl IpmbState {
             .pending
             .as_mut()
             .ok_or(RmcpIpmiReceiveError::NoPendingRequest)?;
-        let response = Self::receive_nested(pending, data, 0)?;
+        let response = Self::receive_nested(pending, data, 0, &mut self.get_message_supported)?;
         if response.is_some() {
             self.pending = None;
         }
@@ -603,6 +620,7 @@ impl IpmbState {
         pending: &mut PendingRequest,
         data: &[u8],
         depth: u8,
+        get_message_supported: &mut bool,
     ) -> Result<Option<Response>, RmcpIpmiReceiveError> {
         if depth > 2 {
             return Err(RmcpIpmiReceiveError::IpmbResponseMismatch);
@@ -611,13 +629,24 @@ impl IpmbState {
             if correlate(data, poll).is_ok() {
                 let response = correlate(data, poll)?;
                 pending.poll = None;
+                if poll.cmd == GET_MESSAGE_FLAGS {
+                    if response.cc() != 0 {
+                        *get_message_supported = false;
+                        return Ok(None);
+                    }
+                    if response.data().len() != 1 {
+                        return Err(RmcpIpmiReceiveError::NotEnoughData);
+                    }
+                    pending.queue_available = response.data()[0] & 1 != 0;
+                    return Ok(None);
+                }
+                pending.queue_available = false;
                 if response.cc() == 0x80 {
                     return Ok(None);
                 }
                 if response.cc() != 0 {
-                    return Err(RmcpIpmiReceiveError::BridgeGetMessageCompletion(
-                        response.cc(),
-                    ));
+                    *get_message_supported = false;
+                    return Ok(None);
                 }
                 let body = response.data();
                 if body.len() < 8 {
@@ -640,7 +669,7 @@ impl IpmbState {
                     }
                     full
                 };
-                return Self::receive_nested(pending, &packet, depth + 1);
+                return Self::receive_nested(pending, &packet, depth + 1, get_message_supported);
             }
         }
         for hop in 0..2 {
@@ -658,7 +687,12 @@ impl IpmbState {
                     }
                     pending.acked[hop] = true;
                     if !response.data().is_empty() {
-                        return Self::receive_nested(pending, response.data(), depth + 1);
+                        return Self::receive_nested(
+                            pending,
+                            response.data(),
+                            depth + 1,
+                            get_message_supported,
+                        );
                     }
                     if pending.acked[0] && (pending.send_acks[1].is_none() || pending.acked[1]) {
                         return Ok(pending.deferred.take());
@@ -737,6 +771,17 @@ mod tests {
             second.into_iter().chain(body.iter().copied()),
         ));
         result
+    }
+
+    fn poll_available(state: &mut IpmbState) -> ExpectedReply {
+        let flags = state.poll_message().unwrap();
+        assert_eq!(flags[5], GET_MESSAGE_FLAGS);
+        let expected = state.pending.as_ref().unwrap().poll.unwrap();
+        assert!(state.receive(&answer(expected, 0, &[1])).unwrap().is_none());
+        assert!(state.queue_available());
+        let get = state.poll_message().unwrap();
+        assert_eq!(get[5], GET_MESSAGE);
+        state.pending.as_ref().unwrap().poll.unwrap()
     }
 
     fn request() -> Request {
@@ -845,13 +890,12 @@ mod tests {
         let final_reply = answer(pending.final_reply, 0, &[0xab]);
         assert!(state.receive(&ack).unwrap().is_none());
         assert!(state.needs_poll());
-        let get = state.poll_message().unwrap();
-        assert_eq!((get[5], get[4] >> 2), (0x33, 2));
-        let poll = state.pending.as_ref().unwrap().poll.unwrap();
+        let poll = poll_available(&mut state);
+        assert_eq!(poll.sequence, 3);
         assert!(state.receive(&answer(poll, 0x80, &[])).unwrap().is_none());
         assert!(state.needs_poll());
-        state.poll_message().unwrap();
-        let poll = state.pending.as_ref().unwrap().poll.unwrap();
+        assert!(!state.queue_available());
+        let poll = poll_available(&mut state);
         let mut wrong = final_reply.clone();
         wrong[4] ^= 4;
         let last = wrong.len() - 1;
@@ -881,8 +925,7 @@ mod tests {
         let ack = answer(p.send_acks[0].unwrap(), 0, &[]);
         let final_reply = answer(p.final_reply, 0, &[]);
         state.receive(&ack).unwrap();
-        state.poll_message().unwrap();
-        let poll = state.pending.as_ref().unwrap().poll.unwrap();
+        let poll = poll_available(&mut state);
         let mut bad = final_reply.clone();
         let checksum = bad.len() - 1;
         bad[checksum] ^= 1;
@@ -899,11 +942,39 @@ mod tests {
         let ack = answer(p.send_acks[0].unwrap(), 0, &[]);
         let final_reply = answer(p.final_reply, 0, &[]);
         state.receive(&ack).unwrap();
-        state.poll_message().unwrap();
-        let poll = state.pending.as_ref().unwrap().poll.unwrap();
+        let poll = poll_available(&mut state);
         let mut body = vec![2];
         body.extend_from_slice(&final_reply);
         assert!(state.receive(&answer(poll, 0, &body)).unwrap().is_some());
+    }
+
+    #[test]
+    fn unsupported_queue_commands_switch_to_pushed_replies_for_the_session() {
+        for unsupported in [GET_MESSAGE_FLAGS, GET_MESSAGE] {
+            let mut state = IpmbState::default();
+            state.begin(&bridge(None), Instant::now()).unwrap();
+            let pending = state.pending.as_ref().unwrap();
+            let ack = answer(pending.send_acks[0].unwrap(), 0, &[]);
+            let target = answer(pending.final_reply, 0, &[0xa5]);
+            state.receive(&ack).unwrap();
+            let poll = if unsupported == GET_MESSAGE_FLAGS {
+                state.poll_message().unwrap();
+                state.pending.as_ref().unwrap().poll.unwrap()
+            } else {
+                poll_available(&mut state)
+            };
+            assert_eq!(poll.cmd, unsupported);
+            assert!(state.receive(&answer(poll, 0xc1, &[])).unwrap().is_none());
+            assert!(state.pending.is_some());
+            assert!(!state.needs_poll());
+            assert_eq!(state.receive(&target).unwrap().unwrap().data(), &[0xa5]);
+
+            state.begin(&bridge(None), Instant::now()).unwrap();
+            let ack = state.pending.as_ref().unwrap().send_acks[0].unwrap();
+            state.receive(&answer(ack, 0, &[])).unwrap();
+            assert!(!state.needs_poll());
+            state.retire_pending();
+        }
     }
 
     #[test]
@@ -968,8 +1039,7 @@ mod tests {
             Err(RmcpIpmiReceiveError::IpmbResponseMismatch)
         ));
         assert!(state.receive(&outer).unwrap().is_none());
-        state.poll_message().unwrap();
-        let poll = state.pending.as_ref().unwrap().poll.unwrap();
+        let poll = poll_available(&mut state);
         let unrelated = answer(
             ExpectedReply {
                 responder_addr: 0x54,
@@ -984,8 +1054,7 @@ mod tests {
             state.receive(&answer(poll, 0, &body)),
             Err(RmcpIpmiReceiveError::IpmbResponseMismatch)
         ));
-        state.poll_message().unwrap();
-        let poll = state.pending.as_ref().unwrap().poll.unwrap();
+        let poll = poll_available(&mut state);
         let mut body = vec![2]; // target channel is 2; BMC receive queue is on transit channel 1
         body.extend_from_slice(&transit[1..]);
         assert!(matches!(
@@ -993,15 +1062,13 @@ mod tests {
             Err(RmcpIpmiReceiveError::IpmbResponseMismatch)
         ));
         body[0] = 1;
-        state.poll_message().unwrap();
-        let poll = state.pending.as_ref().unwrap().poll.unwrap();
+        let poll = poll_available(&mut state);
         assert!(state.receive(&answer(poll, 0, &body)).unwrap().is_none());
         assert!(matches!(
             state.receive(&transit),
             Err(RmcpIpmiReceiveError::IpmbResponseMismatch)
         ));
-        state.poll_message().unwrap();
-        let poll = state.pending.as_ref().unwrap().poll.unwrap();
+        let poll = poll_available(&mut state);
         body.truncate(1);
         body.extend_from_slice(&final_reply[1..]);
         assert!(state.receive(&answer(poll, 0, &body)).unwrap().is_some());
@@ -1096,14 +1163,18 @@ mod tests {
                 Ok(_) => {
                     polls += 1;
                     let reply = state.pending.as_ref().unwrap().poll.unwrap();
-                    assert!(state.receive(&answer(reply, 0x80, &[])).unwrap().is_none());
+                    assert_eq!(reply.cmd, GET_MESSAGE_FLAGS);
+                    assert!(state.receive(&answer(reply, 0, &[0])).unwrap().is_none());
                 }
                 Err(RmcpIpmiSendError::IpmbSequenceExhausted) => break,
                 other => panic!("unexpected poll result: {other:?}"),
             }
         }
         assert_eq!(polls, 62);
-        state.retire_pending();
+        state.stop_polling();
+        assert!(!state.needs_poll());
+        let target = answer(state.pending.as_ref().unwrap().final_reply, 0, &[0xa5]);
+        assert_eq!(state.receive(&target).unwrap().unwrap().data(), &[0xa5]);
         assert!(matches!(
             state.begin(&bridge(None), Instant::now()),
             Err(RmcpIpmiSendError::IpmbSequenceExhausted)
@@ -1127,11 +1198,10 @@ mod tests {
         state.begin(&bridge(None), Instant::now()).unwrap();
         let ack = state.pending.as_ref().unwrap().send_acks[0].unwrap();
         state.receive(&answer(ack, 0, &[])).unwrap();
-        state.poll_message().unwrap();
-        let poll = state.pending.as_ref().unwrap().poll.unwrap();
-        assert!(matches!(
-            state.receive(&answer(poll, 0xc1, &[])),
-            Err(RmcpIpmiReceiveError::BridgeGetMessageCompletion(0xc1))
-        ));
+        let poll = poll_available(&mut state);
+        assert!(state.receive(&answer(poll, 0xcc, &[])).unwrap().is_none());
+        assert!(!state.needs_poll());
+        let target = answer(state.pending.as_ref().unwrap().final_reply, 0, &[0x42]);
+        assert_eq!(state.receive(&target).unwrap().unwrap().data(), &[0x42]);
     }
 }

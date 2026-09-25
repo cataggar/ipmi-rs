@@ -25,7 +25,7 @@ use self::crypto::CryptoUnwrapError;
 
 use super::{
     internal::IpmbState, socket::RmcpIpmiSocket, v1_5, RmcpIpmiError, RmcpIpmiReceiveError,
-    UnwrapSessionError,
+    RmcpIpmiSendError, UnwrapSessionError,
 };
 
 #[derive(Debug)]
@@ -702,16 +702,20 @@ impl State {
             let mut polls = 0;
             loop {
                 if self.ipmb_state.needs_poll() {
-                    if polls > 0 {
+                    if polls > 0 && !self.ipmb_state.queue_available() {
                         std::thread::sleep(
                             std::time::Duration::from_millis(50)
                                 .min(deadline.saturating_duration_since(std::time::Instant::now())),
                         );
                     }
-                    let poll = self
-                        .ipmb_state
-                        .poll_message()
-                        .map_err(RmcpIpmiReceiveError::BridgePollSend)?;
+                    let poll = match self.ipmb_state.poll_message() {
+                        Ok(poll) => poll,
+                        Err(RmcpIpmiSendError::IpmbSequenceExhausted) => {
+                            self.ipmb_state.stop_polling();
+                            continue;
+                        }
+                        Err(error) => return Err(RmcpIpmiReceiveError::BridgePollSend(error)),
+                    };
                     self.send_payload(poll, deadline)
                         .map_err(RmcpIpmiReceiveError::BridgePollSend)?;
                     polls += 1;
