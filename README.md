@@ -683,6 +683,40 @@ replies cannot satisfy the next request. A receive/poll failure is
 mutation**. RMCP 1.5 without authentication cannot guarantee peer
 authenticity; prefer authenticated RMCP+ for remote changes.
 
+To request a **non-administrator role**, supply a **separate Kg key**, or opt
+into channel discovery, use `SessionConfig`:
+
+```rust,no_run
+use ipmi_rs::rmcp::{ActivationError, CipherSuitePolicy, PrivilegeLevel, Rmcp, SessionConfig};
+
+fn activate(connection: &mut Rmcp, password: &[u8], kg: &[u8]) -> Result<(), ActivationError> {
+    connection.activate_with_session_config(
+        SessionConfig::new(Some("operator"), Some(password))
+            .with_privilege(PrivilegeLevel::Operator)
+            .with_kg(kg)
+            .with_cipher_suite_policy(CipherSuitePolicy::BestAvailable),
+    )
+}
+```
+
+`BestAvailable` queries the current channel's IPMI cipher-suite records
+before opening a session. It chooses suite 17 if advertised, otherwise suite 3
+if advertised. A failed/incomplete query, an unsupported list, a malformed
+record, or a peer-negotiated privilege/algorithm mismatch **fails activation**:
+it never guesses suite 3 or falls back to IPMI 1.5. The advertisement is
+unauthenticated, so an on-path attacker could suppress suite 17; use
+`CipherSuitePolicy::Exact(CipherSuite::Id17)` to require SHA-256 instead.
+Only suites 3 and 17 are implemented; weak MD5/xRC4/no-integrity suites
+are never selected. `activate_with_cipher_suite` and `activate_with_provider`
+still require the exact requested suite. The `SessionConfig` default requires
+RMCP+ suite 3 and Administrator; `activate(true, ...)` is unchanged.
+
+The password authenticates RAKP messages 2 and 3; Kg (or the password when
+no separate Kg is supplied) derives the session keys used for RAKP4 and
+encrypted/authenticated traffic. Internally copied secrets and handshake
+authentication buffers are cleared, and debug output redacts both keys.
+Callers remain responsible for protecting and clearing their own input buffers.
+
 ### Optional SymCrypt RMCP+ backend
 
 The default build uses RustCrypto and does not need a native library. To

@@ -177,6 +177,9 @@ impl OpenSessionResponse {
             return Err(NotEnoughData);
         }
 
+        if data[2] & 0xf0 != 0 {
+            return Err(InvalidPrivilegeLevel(data[2]));
+        }
         let max_privilege_level =
             PrivilegeLevel::try_from(data[2]).map_err(|_| InvalidPrivilegeLevel(data[2]))?;
 
@@ -303,4 +306,10 @@ fn response_truncation_and_algorithm_lengths() {
             ))
         ));
     }
+    let mut invalid_privilege = valid;
+    invalid_privilege[2] = 0x12;
+    assert_eq!(
+        OpenSessionResponse::from_data(&invalid_privilege),
+        Err(ParseSessionResponseError::InvalidPrivilegeLevel(0x12))
+    );
 }

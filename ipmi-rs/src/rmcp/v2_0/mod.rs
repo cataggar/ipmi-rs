@@ -1,4 +1,5 @@
 use std::num::NonZeroU32;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::auth::PrivilegeLevel;
 
@@ -179,6 +180,12 @@ impl core::fmt::Debug for Message {
     }
 }
 
+impl Zeroize for Message {
+    fn zeroize(&mut self) {
+        self.payload.zeroize();
+    }
+}
+
 impl TryFrom<u8> for PayloadType {
     type Error = ();
 
@@ -227,6 +234,29 @@ pub struct State {
 }
 
 impl State {
+    fn send_handshake(
+        socket: &mut RmcpIpmiSocket,
+        ty: PayloadType,
+        payload: Vec<u8>,
+    ) -> Result<(), WriteError> {
+        let message = Zeroizing::new(Message {
+            ty,
+            session_id: 0,
+            session_sequence_number: 0,
+            payload,
+        });
+        if socket.cancellation_token().is_cancelled() {
+            return Err(WriteError::Cancelled);
+        }
+        let deadline = socket.deadline();
+        if deadline <= std::time::Instant::now() {
+            return Err(WriteError::DeadlineExpired);
+        }
+        socket.send(deadline, |buffer| {
+            CryptoState::write_unencrypted(&message, buffer)
+        })
+    }
+
     fn validate_rakp4_mac_len(
         algorithm: AuthenticationAlgorithm,
         actual_len: usize,
@@ -366,6 +396,7 @@ impl State {
         privilege_level: Option<PrivilegeLevel>,
         username: &Username,
         password: &[u8],
+        kg: Option<&[u8]>,
         suite: CipherSuite,
         provider: CryptoProvider,
     ) -> Result<Self, ActivationError> {
@@ -377,30 +408,6 @@ impl State {
         // makes sure thread_rng is a crypto rng.
         fn assert_crypto_rng<T: CryptoRng>(_: &T) {}
         assert_crypto_rng(&rng);
-
-        fn send(
-            socket: &mut RmcpIpmiSocket,
-            ty: PayloadType,
-            payload: Vec<u8>,
-        ) -> Result<(), WriteError> {
-            if socket.cancellation_token().is_cancelled() {
-                return Err(WriteError::Cancelled);
-            }
-            let deadline = socket.deadline();
-            if deadline <= std::time::Instant::now() {
-                return Err(WriteError::DeadlineExpired);
-            }
-            let message = Message {
-                ty,
-                session_id: 0,
-                session_sequence_number: 0,
-                payload,
-            };
-
-            socket.send(deadline, |buffer| {
-                CryptoState::write_unencrypted(&message, buffer)
-            })
-        }
 
         fn recv(data: &mut [u8]) -> Result<Message, UnwrapSessionError> {
             CryptoState::default()
@@ -419,7 +426,7 @@ impl State {
 
         let mut payload = Vec::new();
         open_session_request.write_data(&mut payload);
-        send(
+        Self::send_handshake(
             &mut socket,
             PayloadType::RmcpPlusOpenSessionRequest,
             payload,
@@ -462,7 +469,7 @@ impl State {
 
         log::debug!("Sending RMCP+ RAKP Message 1");
 
-        send(&mut socket, PayloadType::RakpMessage1, payload)
+        Self::send_handshake(&mut socket, PayloadType::RakpMessage1, payload)
             .map_err(ActivationError::SendRakpMessage1)?;
 
         let data = socket
@@ -494,7 +501,7 @@ impl State {
             ));
         }
 
-        let mut crypto_state = CryptoState::new_with_provider(None, password, provider);
+        let mut crypto_state = CryptoState::new_with_provider(kg, password, provider);
         let message_3_value = crypto_state
             .calculate_rakp3_data(&response, &rm1, &rm2)
             .map_err(ActivationError::CryptoBackend)?
@@ -523,7 +530,7 @@ impl State {
 
         log::debug!("Sending RAKP message 3");
 
-        send(&mut socket, PayloadType::RakpMessage3, payload)
+        Self::send_handshake(&mut socket, PayloadType::RakpMessage3, payload)
             .map_err(ActivationError::RakpMessage3Send)?;
 
         if rm3.is_failure() {

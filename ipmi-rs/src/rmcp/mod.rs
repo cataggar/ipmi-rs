@@ -21,7 +21,11 @@ pub use v2_0::{
 
 pub use ipmi_rs_core::app::auth::{
     AuthenticationAlgorithm, CipherSuite, ConfidentialityAlgorithm, IntegrityAlgorithm,
+    PrivilegeLevel,
 };
+
+mod cipher_policy;
+pub use cipher_policy::CipherSuiteListError;
 
 mod sol;
 pub use sol::{
@@ -191,6 +195,12 @@ pub enum ActivationError {
     RequiredRmcpPlusNotSupported,
     /// Only RMCP+ cipher suites 3 and 17 are implemented.
     UnsupportedCipherSuite(CipherSuite),
+    /// Discovery failed; best-available selection never guesses a suite.
+    GetChannelCipherSuites(CommandError<crate::app::auth::TooMuchData>),
+    /// The advertised cipher-suite records are invalid or incomplete.
+    InvalidCipherSuiteList(CipherSuiteListError),
+    /// Neither supported secure suite was advertised by the channel.
+    NoSupportedCipherSuite,
     RmcpPlusRequired,
     InvalidUsername,
     /// The requested backend cannot be used (e.g. SymCrypt was not compiled in).
@@ -210,6 +220,79 @@ impl From<V1_5ActivationError> for ActivationError {
 impl From<V2_0ActivationError> for ActivationError {
     fn from(value: V2_0ActivationError) -> Self {
         Self::V2_0(value)
+    }
+}
+
+/// RMCP+ cipher selection. Neither policy accepts an algorithm substitution.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CipherSuitePolicy {
+    /// Require exactly this suite (only 3 and 17 are implemented).
+    Exact(CipherSuite),
+    /// Query the channel and prefer 17, then 3. Never assume support on a failed query.
+    BestAvailable,
+}
+
+/// Borrowed credentials and negotiation requirements for an RMCP+ session.
+///
+/// This API always requires RMCP+; the legacy [`Rmcp::activate`] API retains
+/// its existing IPMI 1.5 fallback and suite-3 behavior.
+pub struct SessionConfig<'a> {
+    username: Option<&'a str>,
+    password: Option<&'a [u8]>,
+    kg: Option<&'a [u8]>,
+    privilege: PrivilegeLevel,
+    cipher_suite: CipherSuitePolicy,
+    provider: CryptoProvider,
+}
+
+impl core::fmt::Debug for SessionConfig<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SessionConfig")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("kg", &"<redacted>")
+            .field("privilege", &self.privilege)
+            .field("cipher_suite", &self.cipher_suite)
+            .field("provider", &self.provider)
+            .finish()
+    }
+}
+
+impl<'a> SessionConfig<'a> {
+    /// Create an RMCP+ configuration requiring administrator and suite 3.
+    pub fn new(username: Option<&'a str>, password: Option<&'a [u8]>) -> Self {
+        Self {
+            username,
+            password,
+            kg: None,
+            privilege: PrivilegeLevel::Administrator,
+            cipher_suite: CipherSuitePolicy::Exact(CipherSuite::Id3),
+            provider: CryptoProvider::RustCrypto,
+        }
+    }
+
+    /// Request an exact session privilege (including User or Operator).
+    pub fn with_privilege(mut self, privilege: PrivilegeLevel) -> Self {
+        self.privilege = privilege;
+        self
+    }
+
+    /// Supply a distinct IPMI 2.0 Kg key. By default the password is used as Kg.
+    pub fn with_kg(mut self, kg: &'a [u8]) -> Self {
+        self.kg = Some(kg);
+        self
+    }
+
+    /// Choose an exact suite or opt into discovery of the best supported suite.
+    pub fn with_cipher_suite_policy(mut self, policy: CipherSuitePolicy) -> Self {
+        self.cipher_suite = policy;
+        self
+    }
+
+    /// Select the RMCP+ cryptographic implementation.
+    pub fn with_provider(mut self, provider: CryptoProvider) -> Self {
+        self.provider = provider;
+        self
     }
 }
 
@@ -275,13 +358,7 @@ impl Rmcp {
         username: Option<&str>,
         password: Option<&[u8]>,
     ) -> Result<(), ActivationError> {
-        self.activate_with_selection(
-            rmcp_plus,
-            None,
-            CryptoProvider::RustCrypto,
-            username,
-            password,
-        )
+        self.activate_with_selection(rmcp_plus, None, SessionConfig::new(username, password))
     }
 
     /// Activate RMCP+ using exactly `suite`, without falling back to another
@@ -307,24 +384,38 @@ impl Rmcp {
         username: Option<&str>,
         password: Option<&[u8]>,
     ) -> Result<(), ActivationError> {
-        self.activate_with_selection(true, Some(suite), provider, username, password)
+        self.activate_with_selection(
+            true,
+            Some(CipherSuitePolicy::Exact(suite)),
+            SessionConfig::new(username, password).with_provider(provider),
+        )
+    }
+
+    /// Activate RMCP+ with explicit privilege, optional Kg and cipher policy.
+    ///
+    /// A best-available query must succeed and advertise suite 17 or 3;
+    /// neither query failures nor handshake failures cause a downgrade.
+    pub fn activate_with_session_config(
+        &mut self,
+        config: SessionConfig<'_>,
+    ) -> Result<(), ActivationError> {
+        self.activate_with_selection(true, Some(config.cipher_suite), config)
     }
 
     fn activate_with_selection(
         &mut self,
         rmcp_plus: bool,
-        required_suite: Option<CipherSuite>,
-        provider: CryptoProvider,
-        username: Option<&str>,
-        password: Option<&[u8]>,
+        suite_policy: Option<CipherSuitePolicy>,
+        config: SessionConfig<'_>,
     ) -> Result<(), ActivationError> {
-        if let Some(suite) = required_suite {
+        if let Some(CipherSuitePolicy::Exact(suite)) = suite_policy {
             if !matches!(suite, CipherSuite::Id3 | CipherSuite::Id17) {
                 return Err(ActivationError::UnsupportedCipherSuite(suite));
             }
         }
 
-        provider
+        config
+            .provider
             .ensure_available()
             .map_err(ActivationError::CryptoBackend)?;
 
@@ -338,8 +429,7 @@ impl Rmcp {
             .bind()
             .map_err(ActivationError::BindSocket)?;
 
-        let activated =
-            inactive.activate(rmcp_plus, required_suite, provider, username, password)?;
+        let activated = inactive.activate(rmcp_plus, suite_policy, config)?;
         self.active_state = Some(activated);
         Ok(())
     }
@@ -374,6 +464,8 @@ impl IpmiConnection for Rmcp {
     }
 }
 
+#[cfg(test)]
+mod session_policy_tests;
 #[cfg(test)]
 mod suite17_tests;
 
@@ -524,6 +616,22 @@ mod suite17_activation_tests {
                 assert!(!rmcp.is_active());
             }
         }
+    }
+
+    #[test]
+    fn best_available_does_not_fall_back_to_ipmi_1_5() {
+        let (address, bmc) = mock_bmc(OpenReply::NoRmcpPlus, CipherSuite::Id3);
+        let mut rmcp = Rmcp::new(address, Duration::from_secs(2)).unwrap();
+        let activation = rmcp.activate_with_session_config(
+            SessionConfig::new(None, None)
+                .with_cipher_suite_policy(CipherSuitePolicy::BestAvailable),
+        );
+        bmc.join().unwrap();
+        assert!(matches!(
+            activation,
+            Err(ActivationError::RequiredRmcpPlusNotSupported)
+        ));
+        assert!(!rmcp.is_active());
     }
 
     #[test]

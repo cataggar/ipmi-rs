@@ -165,6 +165,8 @@ fn suite17_rakp_key_and_mac_vectors_for(provider: CryptoProvider) {
         hex::decode("108fab5632fe2d1c9c1fa16f3ccb053ab2236f62e365187f04ab36c5c5178133").unwrap()
     );
     assert_ne!(kg_state.state.keys.k1, state.state.keys.k1);
+    assert!(kg_state.password.iter().all(|byte| *byte == 0));
+    assert!(kg_state.kg.as_ref().unwrap().iter().all(|byte| *byte == 0));
     assert_eq!(CipherSuite::Id17.into_suite(), [3, 4, 1]);
 }
 
@@ -294,4 +296,12 @@ fn suite3_rakp_key_and_mac_vectors() {
     suite3_rakp_key_and_mac_vectors_for(CryptoProvider::RustCrypto);
     #[cfg(feature = "symcrypt-backend")]
     suite3_rakp_key_and_mac_vectors_for(CryptoProvider::SymCrypt);
+}
+
+#[test]
+fn debug_redacts_password_and_distinct_kg() {
+    let state = CryptoState::new(Some(b"distinct-kg-secret"), b"test-password-secret");
+    let debug = format!("{state:?}");
+    assert!(!debug.contains("distinct-kg-secret"));
+    assert!(!debug.contains("test-password-secret"));
 }

@@ -7,6 +7,7 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use zeroize::Zeroizing;
 
 use super::{RmcpHeader, RmcpIpmiReceiveError, RmcpType};
 
@@ -189,7 +190,7 @@ impl RmcpIpmiSocket {
     {
         let header = RmcpHeader::new_ipmi();
 
-        let data = header.write(data)?;
+        let data = Zeroizing::new(header.write(data)?);
         if self.policy.cancellation.is_cancelled() {
             return Err(std::io::Error::new(ErrorKind::Interrupted, "RMCP send cancelled").into());
         }
