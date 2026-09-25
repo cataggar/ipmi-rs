@@ -533,8 +533,10 @@ The VITA counterparts use `vita::{GetVitaCapabilities,GetVitaAddress,
 SetVitaActivation}`. `Ipmi::send_recv` addresses the local BMC by default;
 **reading an IPMB address does not redirect later commands**. Shelf-manager,
 slot, AMC/carrier or VPX FRU commands addressed to a different controller
-require explicit bridged IPMB routing (tracked by #13). Do not attempt a
-remote operation with these local-only defaults. Write commands do not retry
+require explicit bridged IPMB routing, now available for RMCP/RMCP+ through
+`RequestTargetAddress::Bridged` (see [IPMB bridging](#ipmb-bridging-over-rmcp--rmcp)).
+Do not attempt a remote operation with these local-only typed command defaults.
+Write commands do not retry
 themselves, and applications must not resend them on a timeout or other
 ambiguous outcome; observe state separately without assuming a readback
 proves whether an activation/reset/cycle occurred.

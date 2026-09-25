@@ -59,8 +59,13 @@ completion codes retain their original error and response bytes in
 The default `Ipmi::send_recv` target is the BMC. Address-discovery reads
 only report IPMB addresses; they do **not** change the target of later
 requests. Operations on remotely addressed shelf/slot/FRU devices require
-explicit bridged IPMB routing from #13. Until that routing is available
-and selected, these typed commands address only the local controller.
+explicit bridged IPMB routing. RMCP/RMCP+ supports
+`RequestTargetAddress::Bridged` (or `BmcOrIpmb` for a single hop); see the
+[transport routing guide](../README.md#ipmb-bridging-over-rmcp--rmcp).
+The typed commands default to the local controller through `Ipmi::send_recv`.
+To use a remote route, explicitly construct a `Request` from the typed
+`Message` and `Bridged` target, send it via `IpmiConnection`, and check the
+completion code and typed response before interpreting the result.
 All setters are explicit commands and are never retried by the modules.
 If a mutation's acknowledgement is lost or times out, its outcome is
 unknown. Do not automatically resend activation, FRU control, power,
