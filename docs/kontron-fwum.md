@@ -23,13 +23,23 @@ and busy/transport read retries at three total attempts. No firmware mutation
 is triggered. Product 5002 additionally reports SDR revision from Get Device
 ID's first auxiliary revision byte when present; other products do not.
 
-**RMCP/RMCP+ supports read-only inspection but not this update workflow.**
+**Routed firmware updates over RMCP/RMCP+ are not implemented. Issue #36
+remains open; this change does not satisfy its routed-transport requirement.**
+RMCP/RMCP+ supports read-only inspection but not this update workflow.
 Its request correlator permanently retires all 64 six-bit IPMB sequences.
 Even the smallest valid 1460-byte image requires 57 page-bounded Save Image
 packets, each with a Get Device ID check, in addition to baseline reads,
-Start/Finish Image and cleanup. There is no safe session renewal/resumption
-protocol here: `fwum_prepare_update` rejects RMCP (direct or bridged) before
-any packet or 0x3E buffer setup, regardless of the caller's transport label.
+Start/Finish Image and cleanup. Although `Rmcp::activate` can establish a
+fresh session using caller-provided credentials, ipmitool does not show that
+FWUM preserves an in-flight sequence-mode image across sessions. Firmware
+Status exposes bank state/size/revision, **not** the last acknowledged byte
+offset or sequence, and the declared Get Last Answer command is not used as
+a resumption protocol by ipmitool. No live capture establishes that an IPMC
+accepts session renewal during an upload. A reconnect hook would therefore
+claim support not yet demonstrated by the protocol reference. Until a
+confirmed-boundary reconnect/resume path is verified, `fwum_prepare_update`
+rejects RMCP (direct or bridged) before any packet or 0x3E buffer setup,
+regardless of the caller's transport label.
 Do not change RMCP sequence retirement to work around this limit. A custom
 connection wrapping RMCP must forward the
 `IpmiConnection::has_nonrenewable_request_sequences` capability.

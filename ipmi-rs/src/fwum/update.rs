@@ -47,8 +47,8 @@ pub enum PrepareError {
     ExistingUpdate,
     /// Payload limit, transport routing or buffer length cannot be represented.
     InvalidTransport,
-    /// RMCP's 64 retired IPMB sequences cannot finish even the smallest
-    /// image once per-command identity checks and cleanup are included.
+    /// Routed RMCP updates remain unimplemented: 64 retired IPMB sequences
+    /// cannot finish even the smallest image with identity checks and cleanup.
     NonrenewableRequestSequences,
 }
 
@@ -306,6 +306,8 @@ impl<CON: IpmiConnection> Ipmi<CON> {
     /// product IDs, transport sizing, and a reversible two-bank baseline.
     ///
     /// Preparation is read-only. No implicit upgrade, rollback, or reset.
+    /// Built-in RMCP/RMCP+ is rejected before any packet: cross-session FWUM
+    /// upload resumption is not established by the reference or live captures.
     pub fn fwum_prepare_update<'ipmi, 'image>(
         &'ipmi mut self,
         target: FwumTarget,
