@@ -80,6 +80,13 @@ capability probe, and both modes attempt Set Complete. Mutations may
 require Operator or Administrator privilege and a lost reply means the
 outcome is unknown: do not automatically retry.
 
+`sensor_event::PlatformEventMessage` encodes explicit, validated IPMI 2.0
+events with the caller-selected system-interface or LAN/IPMB wire format.
+Existing typed BMC Global Enables commands support opt-in OpenIPMI
+event-buffer setup, preserving other defined bits. Neither a SEL read nor an
+event command automatically injects events or retries a write with an
+uncertain outcome.
+
 SOL commands are in `app::sol` (`ActivateSol`, `DeactivateSol`,
 `SolInstance`) and `transport` (`GetSolConfig`, `SetSolConfig`,
 `SolParameterValue`, `sol_write_guarded`). Configuration writes are always

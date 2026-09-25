@@ -111,6 +111,77 @@ mutation. Never automatically retry add, delete, or time writes in that
 case. A reservation cancellation returned for a delete is a rejection,
 not a reason to silently resend the write.
 
+### Platform events and event consumers
+
+`sensor_event::PlatformEventMessage::new(sensor_type, sensor_number, event_type,
+direction, data, interface)` validates reserved sensor/event codes and sensor
+number `0xff`, uses event revision 0x04, and requires an explicit
+`EventInterface::{System,LanOrIpmb}` choice. The system interface adds the SMS
+generator byte `0x41`; LAN/IPMB must **not** include it. Reading the SEL never
+injects an event. To inject an event, call `Ipmi::inject_platform_event(event)`
+once. `EventInjectionError::Rejected` means the BMC explicitly returned a
+completion-code failure; `OutcomeUnknown` means an event *may* have been
+recorded despite a lost, mismatched, or malformed response. Never automatically
+retry an unknown outcome.
+
+```rust
+use ipmi_rs::{
+    sensor_event::{EventInterface, PlatformEventMessage},
+    storage::{sdr::SensorType, sel::EventDirection},
+};
+// With an authenticated, authorized Ipmi connection:
+let event = PlatformEventMessage::new(
+    SensorType::Temperature, 0x30, 1, EventDirection::Assert,
+    [9, 0xff, 0xff], EventInterface::LanOrIpmb,
+)?;
+ipmi.inject_platform_event(event)?; // only explicit calls can send an event
+```
+
+There are **two distinct receive paths**:
+
+* On a Linux OpenIPMI `File` connection, `file.open_event_receiver()?` explicitly
+  enables the BMC event buffer (read/modify/write, preserving other bits) and
+  subscribes that descriptor via `IPMICTL_SET_GETS_EVENTS_CMD`. Its
+  `receiver.recv_until(deadline, &token)` returns a parsed 16-byte
+  `OpenIpmiEvent`, or a setup/receive, unexpected-message, malformed-record,
+  truncated-event, cancellation, or deadline error. This is **true local
+  asynchronous notification** (not available over RMCP); it exclusively
+  borrows the descriptor. Call `receiver.close()` to surface unsubscribe
+  failures; Drop unsubscribes best-effort, but does not disable the BMC-wide
+  enable bit. Prefer a dedicated OpenIPMI file descriptor: kernel events
+  already queued on a reused descriptor may conflict with subsequent
+  command/response reads.
+  A failed global-enables write may have taken effect; do not blindly repeat it.
+* `ipmi.sel_poller(max_entries, deadline, &token)?` works with any
+  `IpmiConnection` (local or RMCP). It establishes a baseline without replaying
+  old entries, then `poll_once(deadline, &token)` performs one scan or
+  `wait_next(interval, deadline, &token)` waits for an entry or gap. This is
+  **periodic polling**, not an asynchronous interrupt. It reuses the bounded,
+  fallible `sel_entries` traversal; supply `max_entries` in `1..=65534`.
+  `SelPollBatch` has new entries in BMC order, removed/missing IDs,
+  `wrapped` (new ID decrease across scans), `overflow` (current BMC state),
+  and `continuity_lost` for removals, deletion timestamps, or **any currently
+  set overflow bit**, including overflow present at startup. Check
+  `poller.overflow()` immediately after creating a baseline; a quiet scan
+  while still overflowing returns a gap rather than an empty wait. The poller
+  deduplicates by record ID and **raw contents**, not by arithmetic increments,
+  so IDs may skip or wrap. If an
+  identical record ID/content is reused between scans without detectable SEL
+  metadata changes, continuity cannot be proven; poll more often or use the
+  local asynchronous receiver. A failed/unstable scan never advances the
+  baseline or masquerades as an empty batch.
+
+Both receive APIs accept an absolute monotonic `Instant` and the cloneable
+`rmcp::CancellationToken` (cancellation is sticky; reset only after an operation
+has returned). The local receiver checks cancellation every 50 ms. SEL polling
+checks **before and after every transport command**, including Get SEL Info,
+reservations, reads, and internal rescans. Built-in RMCP, OpenIPMI file, serial
+and AMI USB connections clamp each command to the remaining deadline and
+observe the poller's token during I/O (kernel ioctls cannot be preempted
+mid-call). Custom `IpmiConnection` implementations should override
+`send_recv_deadline` for the same guarantee; the default delegates to
+`send_recv`, so configure a bounded per-command timeout on custom transports.
+
 ### `ipmi-channels`
 This example discovers available channels and prints channel information. For LAN channels, it also shows a small set of LAN configuration parameters (addressing and gateways).
 
@@ -211,6 +282,7 @@ The following IPMI commands are currently supported in `ipmi-rs-core`:
 | Delete SEL Entry                        | 31.8                  |
 | Clear SEL                               | 31.9                  |
 | Get / Set SEL Time                      | 31.10 / 31.11         |
+| Platform Event Message                  | 29.3                  |
 | Get Sensor Reading                      | 35.14                 |
 | Get PEF Capabilities                     | Sensor/Event 0x10     |
 | Set / Get PEF Configuration Parameters  | Sensor/Event 0x12/0x13 |

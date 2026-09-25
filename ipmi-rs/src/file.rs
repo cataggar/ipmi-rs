@@ -3,16 +3,21 @@ use std::{
     ffi::c_int,
     io,
     os::fd::{AsFd, AsRawFd},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ipmi_rs_core::connection::NetFn;
+use ipmi_rs_core::{
+    app::{BmcGlobalEnables, GetBmcGlobalEnables, GlobalEnablesError, SetBmcGlobalEnables},
+    storage::sel::{Entry, ParseEntryError},
+};
 use nix::errno::Errno;
 use nix::poll::{PollFd, PollFlags};
 
 use crate::connection::{
     Address, IpmiConnection, Message, Request, RequestTargetAddress, Response,
 };
+use crate::{rmcp::CancellationToken, Ipmi, IpmiError};
 
 const MAX_DEVICE_RESPONSE: usize = 1 + 9 + 1024; // Completion code + Sun file header + data.
 
@@ -190,10 +195,11 @@ mod ioctl {
 
     use nix::{ioctl_read, ioctl_readwrite};
 
-    use super::{IpmiRecv, IpmiRequest};
+    use super::{c_int, IpmiRecv, IpmiRequest};
 
     ioctl_readwrite!(ipmi_recv_msg_trunc, IPMI_IOC_MAGIC, 11, IpmiRecv);
     ioctl_read!(ipmi_send_request, IPMI_IOC_MAGIC, 13, IpmiRequest);
+    ioctl_read!(ipmi_set_gets_events, IPMI_IOC_MAGIC, 16, c_int);
     ioctl_read!(ipmi_get_my_address, IPMI_IOC_MAGIC, 18, u32);
 }
 
@@ -304,6 +310,171 @@ pub struct File {
     my_addr: Address,
 }
 
+/// Opening the local event queue configures the BMC event buffer and kernel
+/// subscription. A failed Set BMC Global Enables may have taken effect.
+#[derive(Debug)]
+pub enum OpenIpmiEventSetupError {
+    /// Get BMC Global Enables failed or returned malformed data.
+    ReadEnables(IpmiError<io::Error, GlobalEnablesError>),
+    /// Set BMC Global Enables failed; do not automatically repeat the write.
+    EnableBuffer(IpmiError<io::Error, GlobalEnablesError>),
+    /// OpenIPMI did not accept the subscription (also covers unsupported ioctl).
+    Subscribe(io::Error),
+}
+
+/// One kernel-delivered OpenIPMI asynchronous event, not a SEL poll.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenIpmiEvent {
+    /// Parsed standard, OEM or unknown SEL record.
+    pub entry: Entry,
+    /// Exact 16 bytes supplied by the kernel.
+    pub raw: [u8; 16],
+}
+
+/// Receive failures, malformed events, cancellation and timeouts are distinct.
+#[derive(Debug)]
+pub enum OpenIpmiEventError {
+    /// Kernel poll or receive failed.
+    Io(io::Error),
+    /// The kernel reported an event exceeding the 16-byte record buffer.
+    Truncated,
+    /// Unexpected message type; no event was consumed.
+    UnexpectedType(i32),
+    /// The event is not exactly 16 bytes.
+    InvalidLength(usize),
+    /// The SEL record bytes could not be parsed.
+    Malformed(ParseEntryError),
+    /// Cancellation was requested.
+    Cancelled,
+    /// The monotonic deadline elapsed.
+    DeadlineExpired,
+}
+
+/// Exclusive, bounded receiver of true local OpenIPMI notifications.
+///
+/// The file is borrowed so command replies cannot be accidentally consumed as
+/// events by a concurrent request on this descriptor.
+pub struct OpenIpmiEventReceiver<'a> {
+    file: &'a mut File,
+    subscribed: bool,
+}
+
+impl OpenIpmiEventReceiver<'_> {
+    fn unsubscribe(&mut self) -> io::Result<()> {
+        self.subscribed = false;
+        let mut disabled: c_int = 0;
+        // SAFETY: the ioctl reads a live, initialized int and borrows no data.
+        unsafe { ioctl::ipmi_set_gets_events(self.file.fd(), &mut disabled) }
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    /// Stop notifications on this descriptor; reports an unsubscribe failure.
+    /// Drop also unsubscribes on a best-effort basis.
+    pub fn close(mut self) -> io::Result<()> {
+        self.unsubscribe()
+    }
+
+    /// Wait for one kernel notification, checking cancellation at most every
+    /// 50 ms. Unexpected messages and malformed events are errors.
+    pub fn recv_until(
+        &mut self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<OpenIpmiEvent, OpenIpmiEventError> {
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(OpenIpmiEventError::Cancelled);
+            }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|duration| !duration.is_zero())
+                .ok_or(OpenIpmiEventError::DeadlineExpired)?;
+            let mut polls = [PollFd::new(self.file.inner.as_fd(), PollFlags::POLLIN)];
+            let timeout = remaining.as_millis().clamp(1, 50) as u16;
+            match nix::poll::poll(&mut polls, timeout) {
+                Ok(0) | Err(Errno::EINTR) => continue,
+                Ok(_) => {}
+                Err(error) => return Err(OpenIpmiEventError::Io(error.into())),
+            }
+            let revents = polls[0].revents().unwrap_or(PollFlags::empty());
+            if !revents.contains(PollFlags::POLLIN) {
+                return Err(OpenIpmiEventError::Io(io::Error::other(format!(
+                    "OpenIPMI poll returned {revents:?}"
+                ))));
+            }
+            if cancellation.is_cancelled() {
+                return Err(OpenIpmiEventError::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(OpenIpmiEventError::DeadlineExpired);
+            }
+            let mut addr = [0u8; 32];
+            let mut data = [0u8; 16];
+            let mut recv = IpmiRecv {
+                recv_type: 0,
+                addr: addr.as_mut_ptr(),
+                addr_len: addr.len() as u32,
+                msg_id: 0,
+                message: IpmiMessage {
+                    netfn: 0,
+                    cmd: 0,
+                    data_len: data.len() as u16,
+                    data: data.as_mut_ptr(),
+                },
+            };
+            // SAFETY: both output pointers remain valid throughout the ioctl.
+            match unsafe { ioctl::ipmi_recv_msg_trunc(self.file.fd(), &mut recv) } {
+                Ok(_) => {}
+                Err(Errno::EMSGSIZE) => return Err(OpenIpmiEventError::Truncated),
+                Err(Errno::EINTR) => continue,
+                Err(error) => return Err(OpenIpmiEventError::Io(error.into())),
+            }
+            let len = usize::from(recv.message.data_len);
+            if len > data.len() {
+                return Err(OpenIpmiEventError::Truncated);
+            }
+            return parse_async_event(recv.recv_type, &data[..len]);
+        }
+    }
+}
+
+impl Drop for OpenIpmiEventReceiver<'_> {
+    fn drop(&mut self) {
+        if self.subscribed {
+            if let Err(error) = self.unsubscribe() {
+                log::warn!("Failed to unsubscribe from OpenIPMI events: {error}");
+            }
+        }
+    }
+}
+
+fn parse_async_event(recv_type: i32, data: &[u8]) -> Result<OpenIpmiEvent, OpenIpmiEventError> {
+    if recv_type != 2 {
+        return Err(OpenIpmiEventError::UnexpectedType(recv_type));
+    }
+    let raw: [u8; 16] = data
+        .try_into()
+        .map_err(|_| OpenIpmiEventError::InvalidLength(data.len()))?;
+    let entry = Entry::parse(&raw).map_err(OpenIpmiEventError::Malformed)?;
+    Ok(OpenIpmiEvent { entry, raw })
+}
+
+fn enable_event_msg_buffer<CON: IpmiConnection<Error = io::Error>>(
+    ipmi: &mut Ipmi<CON>,
+) -> Result<(), OpenIpmiEventSetupError> {
+    let enables = ipmi
+        .send_recv(GetBmcGlobalEnables)
+        .map_err(OpenIpmiEventSetupError::ReadEnables)?;
+    if !enables.contains(BmcGlobalEnables::EVENT_MESSAGE_BUFFER) {
+        ipmi.send_recv(SetBmcGlobalEnables(
+            enables | BmcGlobalEnables::EVENT_MESSAGE_BUFFER,
+        ))
+        .map_err(OpenIpmiEventSetupError::EnableBuffer)?;
+    }
+    Ok(())
+}
+
 impl File {
     fn fd(&mut self) -> c_int {
         self.inner.as_raw_fd()
@@ -325,6 +496,23 @@ impl File {
             recv_timeout,
             seq: -1,
             my_addr,
+        })
+    }
+
+    /// Enable the BMC event buffer (preserving all other enable bits) and
+    /// subscribe this descriptor to OpenIPMI asynchronous events. No setup
+    /// failure is silently treated as an empty event stream.
+    pub fn open_event_receiver(
+        &mut self,
+    ) -> Result<OpenIpmiEventReceiver<'_>, OpenIpmiEventSetupError> {
+        enable_event_msg_buffer(&mut Ipmi::new(&mut *self))?;
+        let mut enabled: c_int = 1;
+        // SAFETY: the ioctl reads a live, initialized int and borrows no data.
+        unsafe { ioctl::ipmi_set_gets_events(self.fd(), &mut enabled) }
+            .map_err(|error| OpenIpmiEventSetupError::Subscribe(error.into()))?;
+        Ok(OpenIpmiEventReceiver {
+            file: self,
+            subscribed: true,
         })
     }
 
@@ -487,6 +675,42 @@ impl IpmiConnection for File {
 
         self.recv()
     }
+
+    fn send_recv_deadline(
+        &mut self,
+        request: &mut Request,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> io::Result<Response> {
+        let original_timeout = self.recv_timeout;
+        let result = (|| {
+            if cancellation.is_cancelled() {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            self.send(request)?;
+            loop {
+                if cancellation.is_cancelled() {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|duration| !duration.is_zero())
+                    .ok_or(io::ErrorKind::TimedOut)?;
+                self.recv_timeout = remaining
+                    .min(original_timeout)
+                    .min(Duration::from_millis(50));
+                match self.recv() {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    response => return response,
+                }
+            }
+        })();
+        self.recv_timeout = original_timeout;
+        result
+    }
 }
 
 #[cfg(test)]
@@ -507,3 +731,7 @@ mod bridge_tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "file/events_tests.rs"]
+mod events_tests;

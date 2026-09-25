@@ -1,12 +1,18 @@
-use std::{collections::HashSet, num::NonZeroU16};
+use std::{collections::HashSet, num::NonZeroU16, time::Instant};
 
 use crate::{
-    connection::{CompletionErrorCode, IpmiConnection, NotEnoughData},
+    connection::{CompletionErrorCode, IpmiCommand, IpmiConnection, NotEnoughData},
+    rmcp::CancellationToken,
     storage::sel::{
         self, GetSelEntry, GetSelInfo, ReserveSel, SelCommand, SelEntryInfo as EntryInfo,
     },
     Ipmi, IpmiError,
 };
+
+type ReadResult<CON, CMD> = Result<
+    <CMD as IpmiCommand>::Output,
+    IpmiError<<CON as IpmiConnection>::Error, <CMD as IpmiCommand>::Error>,
+>;
 
 /// A SEL write failed, with a distinct outcome for an acknowledged BMC error.
 ///
@@ -43,6 +49,10 @@ pub enum SelIterError<CON> {
     },
     /// The BMC returned a cyclic record chain.
     RecordCycle(sel::RecordId),
+    /// A bounded traversal was cancelled between transport operations.
+    Cancelled,
+    /// A bounded traversal reached its absolute deadline.
+    DeadlineExpired,
 }
 
 /// Bounded, fallible SEL traversal. Follows next-record pointers, not ID
@@ -63,6 +73,7 @@ pub struct SelIter<'a, CON> {
     remaining_reads: usize,
     restarts: usize,
     finished: bool,
+    budget: Option<(Instant, CancellationToken)>,
 }
 
 impl<'a, CON: IpmiConnection> SelIter<'a, CON> {
@@ -79,7 +90,47 @@ impl<'a, CON: IpmiConnection> SelIter<'a, CON> {
             remaining_reads: max_entries.saturating_mul(4).saturating_add(4).min(65_536),
             restarts: 0,
             finished: false,
+            budget: None,
         }
+    }
+
+    pub(crate) fn new_bounded(
+        ipmi: &'a mut Ipmi<CON>,
+        max_entries: usize,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Self {
+        let mut iter = Self::new(ipmi, max_entries);
+        iter.budget = Some((deadline, cancellation));
+        iter
+    }
+
+    fn check_budget(&self) -> Result<(), SelIterError<CON::Error>> {
+        if let Some((deadline, cancellation)) = &self.budget {
+            if cancellation.is_cancelled() {
+                return Err(SelIterError::Cancelled);
+            }
+            if Instant::now() >= *deadline {
+                return Err(SelIterError::DeadlineExpired);
+            }
+        }
+        Ok(())
+    }
+
+    fn send<CMD: IpmiCommand>(
+        &mut self,
+        command: CMD,
+    ) -> Result<ReadResult<CON, CMD>, SelIterError<CON::Error>> {
+        self.check_budget()?;
+        let result = match &self.budget {
+            Some((deadline, cancellation)) => {
+                self.ipmi
+                    .send_recv_bounded(command, *deadline, cancellation)
+            }
+            None => self.ipmi.send_recv(command),
+        };
+        self.check_budget()?;
+        Ok(result)
     }
 
     fn fail(
@@ -91,16 +142,12 @@ impl<'a, CON: IpmiConnection> SelIter<'a, CON> {
     }
 
     fn reserve(&mut self) -> Result<(), SelIterError<CON::Error>> {
-        self.reservation = Some(
-            self.ipmi
-                .send_recv(ReserveSel)
-                .map_err(SelIterError::Reservation)?,
-        );
+        self.reservation = Some(self.send(ReserveSel)?.map_err(SelIterError::Reservation)?);
         Ok(())
     }
 
     fn info(&mut self) -> Result<sel::SelInfo, SelIterError<CON::Error>> {
-        self.ipmi.send_recv(GetSelInfo).map_err(SelIterError::Info)
+        self.send(GetSelInfo)?.map_err(SelIterError::Info)
     }
 
     fn read(&mut self, id: sel::RecordId) -> Result<EntryInfo, SelIterError<CON::Error>> {
@@ -111,7 +158,7 @@ impl<'a, CON: IpmiConnection> SelIter<'a, CON> {
                 return Err(SelIterError::ReadLimit);
             }
             self.remaining_reads -= 1;
-            match self.ipmi.send_recv(GetSelEntry::new(self.reservation, id)) {
+            match self.send(GetSelEntry::new(self.reservation, id))? {
                 Err(IpmiError::Failed {
                     completion_code: CompletionErrorCode::ReservationCancelledOrInvalidId,
                     ..

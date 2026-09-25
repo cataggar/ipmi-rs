@@ -130,6 +130,10 @@ impl State {
             })
     }
 
+    pub(crate) fn socket_mut(&mut self) -> &mut RmcpIpmiSocket {
+        &mut self.socket
+    }
+
     pub fn new(
         socket: UdpSocket,
         policy: TransportPolicy,
