@@ -19,6 +19,10 @@ ipmi-rs-core = { path = "../ipmi-rs-core", version = "0.6.0" }
 
 # For unix-file IPMI
 nix = { version = "0.30", default-features = false, features = [ "ioctl", "poll" ], optional = true }
+serialport = { version = "4.7", default-features = false, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { version = "0.2", optional = true }
 
 # For RMCP+
 hmac = "0.12.1"
@@ -37,6 +41,8 @@ default = [ "unix-file", "md5" ]
 
 # Connection features
 unix-file = [ "nix" ]
+serial = [ "dep:serialport" ]
+ami-usb = [ "dep:libc" ]
 symcrypt-backend = [ "dep:symcrypt" ]
 
 [dev-dependencies]

@@ -270,6 +270,81 @@ Access to this file generally requires root privileges.
 
 [lipmid]: https://docs.kernel.org/driver-api/ipmi.html
 
+## Serial basic and terminal modes (opt-in)
+
+Enable `ipmi-rs/serial` to use `ipmi_rs::serial::{SerialConnection, SerialMode}`
+with an explicitly selected port, baud rate, mode, and nonzero operation timeout:
+
+```rust,no_run
+use ipmi_rs::{chassis::GetChassisStatus, serial::{SerialConnection, SerialMode}, Ipmi};
+use std::time::Duration;
+
+let serial = SerialConnection::open(
+    "/dev/ttyS0", 115200, SerialMode::Basic, Duration::from_secs(5),
+).expect("open serial port");
+let status = Ipmi::new(serial).send_recv(GetChassisStatus).expect("read chassis");
+```
+
+Use `SerialMode::Terminal` for a terminal-mode BMC instead. Supported rates are
+2400, 9600, 19200, 38400, 57600, 115200, 230400 and (if supported by the
+driver) 460800, with 8N1 and no flow control. Serial-port support depends on
+the `serialport` crate and the OS driver (Linux, other Unix systems and Windows);
+it is **not** required in default builds. Basic mode uses IPMB checksums and
+escaped `A0`/`A5` frames; terminal mode uses `[hex]\r\n` frames. Direct BMC
+requests and single-hop IPMB Send Message requests on primary/numbered channels
+are supported; system-channel, double-bridge and larger-than-40-byte
+transactions are rejected. Responses are correlated by sequence, netfn,
+command, and (in basic mode) address and checksum. Both modes bound input size
+and enforce a single deadline; neither automatically retries a request.
+
+`cancellation_token().cancel()` interrupts I/O (checked at most every 50 ms
+between serial-port reads/writes); call `reset()` **only after** the operation
+has returned. If a send starts but a response is lost, timed out, or cancelled,
+`send_recv` returns `SerialError::OutcomeUnknown` (or
+`SerialError::Send(SerialSendError::OutcomeUnknown(_))` for an interrupted
+write); standalone `recv` reports `SerialRecvError`. In all cases the command
+**may have executed**. Never automatically retry a mutation; observe subsequent
+status separately. Serial responses retain the IPMI completion code for typed
+`Ipmi::send_recv` commands. After any ambiguous send/receive failure the
+connection refuses further requests with
+`SerialSendError::ConnectionUncertain`; resetting the cancellation token does
+**not** make it safe to reuse the 6-bit sequence number. Reopen the serial
+connection before any later operation.
+
+## AMI USB virtual-CD via Linux SCSI generic (opt-in)
+
+Enable `ipmi-rs/ami-usb` to use `ipmi_rs::ami_usb::AmiUsb`. On **Linux only**,
+explicitly choose a SCSI generic device (such as `/dev/sg2`) and timeout:
+
+```rust,no_run
+use ipmi_rs::{ami_usb::AmiUsb, chassis::GetChassisStatus, Ipmi};
+use std::time::Duration;
+
+let usb = AmiUsb::open("/dev/sg2", Duration::from_secs(5)).expect("open AMI device");
+let status = Ipmi::new(usb).send_recv(GetChassisStatus).expect("read chassis");
+```
+
+This backend follows the AMI virtual-CD `SG_IO` interface in ipmitool, **not**
+generic USB HID/libusb; no libusb dependency, discovery, or USB hardware is
+needed for default builds. There is no known universal USB vendor/product ID
+pair: the selected device must respond to the AMI identify SCSI command `EEh`
+with `$$$AMI$$$` and support `E2h`/`E3h` command/data sectors. Other devices
+return `AmiUsbError::UnsupportedDevice` (or an I/O error if inaccessible).
+On non-Linux targets the feature compiles but `AmiUsb::open` returns
+`UnsupportedPlatform`. AMI USB only supports direct BMC commands; IPMB
+bridging is rejected. Responses include the IPMI completion byte and use the
+existing typed commands. The selected device is held with a nonblocking
+advisory exclusive lock for the connection's lifetime; non-cooperating clients
+must also avoid sending commands to the same device.
+
+The SCSI transaction has a fixed response cap and deadline and never retries
+requests. Cancellation is checked between SG_IO calls (a call can block for up
+to 200 ms). After any post-dispatch failure, including timeout/cancellation,
+`AmiUsbError::OutcomeUnknown` is returned and the connection refuses more
+requests until it is reopened: AMI replies have no sequence field to safely
+match a late response. Do not automatically resend a mutation. SCSI transport
+status (`DeviceStatus`) is separate from an IPMI completion code.
+
 ## RMCP
 
 RMCP with the following authentication types is supported:

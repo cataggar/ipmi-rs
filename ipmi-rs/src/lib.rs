@@ -13,6 +13,12 @@ pub use file::File;
 
 pub mod rmcp;
 
+#[cfg(feature = "serial")]
+pub mod serial;
+
+#[cfg(feature = "ami-usb")]
+pub mod ami_usb;
+
 mod error;
 pub use error::IpmiError;
 
