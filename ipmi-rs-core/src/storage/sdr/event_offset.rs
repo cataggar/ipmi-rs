@@ -8,7 +8,7 @@
 
 use core::fmt;
 
-use super::SensorType;
+use super::{event_reading_type_code::EventReadingTypeCodes, SensorType};
 
 fn sensor_event_offset_desc(sensor_type: SensorType, offset: u8) -> Option<&'static str> {
     let offset = offset & 0x0F; // Only lower 4 bits are used
@@ -491,6 +491,23 @@ fn generic_event_offset_desc(event_type: u8, offset: u8) -> Option<&'static str>
             _ => None,
         },
 
+        _ => None,
+    }
+}
+
+/// Describe a discrete reading offset using its SDR sensor and event/reading types.
+/// Unknown, OEM and unassigned offsets have no standard description.
+pub fn discrete_state_description(
+    event_type: EventReadingTypeCodes,
+    sensor_type: SensorType,
+    offset: u8,
+) -> Option<&'static str> {
+    if offset > 14 {
+        return None;
+    }
+    match event_type {
+        EventReadingTypeCodes::DiscreteGeneric(code) => generic_event_offset_desc(code, offset),
+        EventReadingTypeCodes::SensorSpecific => sensor_event_offset_desc(sensor_type, offset),
         _ => None,
     }
 }

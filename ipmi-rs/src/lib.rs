@@ -17,7 +17,7 @@ mod error;
 pub use error::IpmiError;
 
 use ipmi_rs_core::{
-    connection::{CompletionErrorCode, IpmiCommand, LogicalUnit, Request, RequestTargetAddress},
+    connection::{CompletionErrorCode, IpmiCommand, Request, RequestTargetAddress},
     storage::sdr::{self, Record as SdrRecord},
 };
 
@@ -66,9 +66,10 @@ where
     where
         CMD: IpmiCommand,
     {
+        let target_lun = request.target_lun();
         let target_address = match request.target() {
-            Some((a, c)) => RequestTargetAddress::BmcOrIpmb(a, c, LogicalUnit::Zero),
-            None => RequestTargetAddress::Bmc(LogicalUnit::Zero),
+            Some((a, c)) => RequestTargetAddress::BmcOrIpmb(a, c, target_lun),
+            None => RequestTargetAddress::Bmc(target_lun),
         };
 
         let message = request.into();
@@ -173,3 +174,6 @@ where
         None
     }
 }
+
+#[cfg(test)]
+mod sensor_threshold_tests;

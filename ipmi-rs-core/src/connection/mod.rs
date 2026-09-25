@@ -286,4 +286,9 @@ pub trait IpmiCommand: Into<Message> {
     fn target(&self) -> Option<(Address, Channel)> {
         None
     }
+
+    /// Target logical unit; defaults to LUN 0 for existing commands.
+    fn target_lun(&self) -> LogicalUnit {
+        LogicalUnit::Zero
+    }
 }

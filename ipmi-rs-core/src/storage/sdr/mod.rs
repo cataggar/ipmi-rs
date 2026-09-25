@@ -22,7 +22,7 @@ mod sensor_type;
 pub use sensor_type::SensorType;
 
 mod event_offset;
-pub use event_offset::decode_event;
+pub use event_offset::{decode_event, discrete_state_description};
 
 mod event_data;
 pub use event_data::{EventData, EventData2Type, EventData3Type};
