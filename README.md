@@ -96,6 +96,9 @@ The following IPMI commands are currently supported in `ipmi-rs-core`:
 | Get SEL Entry                           | 31.5                  |
 | Clear SEL                               | 31.9                  |
 | Get Sensor Reading                      | 35.14                 |
+| Get PEF Capabilities                     | Sensor/Event 0x10     |
+| Set / Get PEF Configuration Parameters  | Sensor/Event 0x12/0x13 |
+| Get Last Processed Event ID (PEF status) | Sensor/Event 0x15     |
 | Get Device SDR Info                     | 35.2                  |
 | Get Device SDR                          | 35.3                  |
 | Get SDR Repository Info                 | 33.9                  |
