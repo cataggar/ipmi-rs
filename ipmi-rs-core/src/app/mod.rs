@@ -28,3 +28,17 @@ pub mod sol;
 
 mod reset;
 pub use reset::{ColdReset, UnexpectedResetResponseLength, WarmReset};
+
+mod management;
+pub use management::{
+    DeviceGuid, GetDeviceGuid, GetSelfTestResults, ManagementResponseError, SelfTestResult,
+    SelfTestStatus,
+};
+
+mod global_enables;
+pub use global_enables::{
+    BmcGlobalEnables, GetBmcGlobalEnables, GlobalEnablesError, SetBmcGlobalEnables,
+};
+
+pub mod system_info;
+pub mod watchdog;

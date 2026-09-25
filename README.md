@@ -118,6 +118,10 @@ The following IPMI commands are currently supported in `ipmi-rs-core`:
 | Get Chassis Status                      | 28.2                  |
 | Chassis Control (host power)            | 28.3                  |
 | Get Device ID                           | 20.1                  |
+| Get Device GUID / Self Test Results      | App commands 0x37/0x04 |
+| Get / Set BMC Global Enables             | App commands 0x2f/0x2e |
+| Get / Set / Reset Watchdog Timer         | App commands 0x25/0x24/0x22 |
+| Get / Set System Info Parameters         | App commands 0x59/0x58 |
 | Cold Reset / Warm Reset (BMC)            | App commands 0x02/0x03 |
 | Get Channel Authentication Capabilities | 22.13                 |
 | Get Channel Cipher Suites               | 22.15                 |
@@ -259,6 +263,54 @@ controller echoes the secret. The library never retries these writes. On
 timeout, disconnection, or any ambiguous send result, the outcome is
 **unknown**: check status through an independent read or recovery access, but
 never blindly repeat a mutation (even after `NodeBusy`).
+
+## Management-controller status and configuration
+
+`ipmi_rs::app::{GetDeviceGuid, GetSelfTestResults}` return a typed GUID and
+two-byte self-test result. GUID `raw()` preserves the controller's exact 16
+bytes; `ipmi_uuid()` interprets them in **IPMI order** (node, clock sequence,
+time-high, time-mid, time-low, all least-significant-byte first). Some BMCs
+incorrectly send SMBIOS or RFC 4122 order; there is deliberately no
+guess-based conversion. Self-test unknown codes and their diagnostic byte are
+preserved.
+
+`GetBmcGlobalEnables` reads the seven defined enable bits;
+`SetBmcGlobalEnables(flags)` **replaces the entire byte**, never silently
+read-modify-writes it. Changing flags can suppress event logging, alerts or
+interrupts. Reserved bit 4 is rejected. Inspect existing enables and obtain
+adequate BMC privileges (typically **Administrator** for writes) before
+changing them. Reads typically require User privilege; device policy varies.
+
+`app::watchdog::{GetWatchdogTimer, SetWatchdogTimer, ResetWatchdogTimer}` expose
+the 8-byte readback and explicit six-byte configuration. Construct a validated
+write using `SetWatchdogTimer::new(WatchdogConfiguration { ... })`; countdowns
+are in **100 ms units**, pre-timeout in **seconds**. Setting can stop an
+existing timer unless `do_not_stop` is true; resetting reloads **and starts**
+the timer. An expiry action can hard-reset, power down or cycle the **host**.
+Changing or remotely "petting" a watchdog over an unreliable network can
+cause unexpected host downtime. Obtain Operator/Administrator privileges as
+required by your BMC and use an appropriate local service for periodic resets.
+No watchdog write is implicit in a read.
+
+`app::system_info::{GetSystemInfoParameter, SetSystemInfoParameter}` cover
+standard parameters 0–7. Get returns a revision-checked response; use
+`request.decode(&response)` to validate the echoed set and interpret its value.
+`SystemInfoString::new` validates the encoding and 255-byte limit;
+`to_writes()` splits into a 14-byte first set and subsequent 16-byte sets.
+To update multiple sets, explicitly send parameter-0
+`SetSystemInfoParameter::set_in_progress` values (`InProgress`,
+`CommitWrite`, `Complete`), or explicitly invoke `system_info_write_guarded`
+with an `Ipmi::send_recv` closure and the validated `SystemInfoString`. The
+guard attempts set-complete cleanup after an acknowledged begin and reports
+begin, block, commit and cleanup failures separately. If begin fails, it does
+not release a lock that may belong to another writer; inspect an ambiguous
+outcome and decide how to recover. Unsupported/read-only/already-in-progress
+completion codes are preserved; other completion codes remain in `IpmiError`.
+String and watchdog writes, including transaction-state writes, are sent
+**once**, not retried after a possibly-applied request. A timeout or lost
+acknowledgement leaves the outcome **unknown**; readback can show current
+state but cannot prove a transient watchdog action did not occur. System-info
+write privilege and multi-block support vary by BMC.
 
 # Supported interfaces
 
