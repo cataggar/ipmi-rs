@@ -23,6 +23,17 @@ and busy/transport read retries at three total attempts. No firmware mutation
 is triggered. Product 5002 additionally reports SDR revision from Get Device
 ID's first auxiliary revision byte when present; other products do not.
 
+**RMCP/RMCP+ supports read-only inspection but not this update workflow.**
+Its request correlator permanently retires all 64 six-bit IPMB sequences.
+Even the smallest valid 1460-byte image requires 57 page-bounded Save Image
+packets, each with a Get Device ID check, in addition to baseline reads,
+Start/Finish Image and cleanup. There is no safe session renewal/resumption
+protocol here: `fwum_prepare_update` rejects RMCP (direct or bridged) before
+any packet or 0x3E buffer setup, regardless of the caller's transport label.
+Do not change RMCP sequence retirement to work around this limit. A custom
+connection wrapping RMCP must forward the
+`IpmiConnection::has_nonrenewable_request_sequences` capability.
+
 ## On-device write prerequisites
 
 Enable `kontron-fwum-update` explicitly when building both crates; read-only
@@ -36,10 +47,12 @@ features remain the default. **Before invoking** `fwum_prepare_update`:
    Provide nonempty maintenance-window, interruption and rollback procedures
    via `UpdateAuthorization::new`. This is an operator acknowledgement, not
    automatic recovery or hardware qualification.
-3. Establish the transport's real request-data limit. Use
+3. Use a transport without a nonrenewable request sequence limit, and
+   establish its real request-data limit. Use
    `TransportLimits::standard(Local | Network | Bridged)` for 32-byte
    packets without changing controller buffers, or explicitly request
    `TransportLimits::negotiated(kind, max_request_bytes, buffer_bytes)`.
+   A `Network` or `Bridged` label cannot override the RMCP preflight gate.
    Negotiation requires Kontron identification at the gateway too. For a
    bridged target, the 0x3E/0x82 setup order is local 0x0E, local IPMB 0x00,
    remote 0x0E; successful/uncertain settings are cleared once in reverse
@@ -62,13 +75,16 @@ features remain the default. **Before invoking** `fwum_prepare_update`:
 mode for protocol ≤5 or short Info replies; sequence mode otherwise), then
 finishes 0x0C. The callback receives **acknowledged** bytes and may stop
 cleanly by returning `false`. The staged bank must report matching size and
-revision as `NewFirmware` before 0x09 may be sent. Call `activate` explicitly;
-an ACK only requests activation after shutdown, and `verify_activation`
-needs a fresh status showing the new bank as Last Known Good and the old
-bank no longer current. Pending verification can be retried **read-only**.
+revision as `NewFirmware` **and** the original Last Known Good bank must
+retain its baseline length/revision before 0x09 may be sent. Call `activate`
+explicitly; an ACK only requests activation after shutdown, and `verify_activation`
+needs a fresh status showing the new bank as Last Known Good and the unchanged
+old bank as Previous Good. Pending verification can be retried **read-only**.
 Manual 0x0E `rollback` is separately explicit, available only after verified
-activation; `verify_rollback` must observe the original good bank, version
-and length. It never assumes that a rollback ACK completed the reboot.
+activation and a fresh check that the original Previous Good bank still has
+its baseline length/revision. `verify_rollback` must observe the original
+good bank, version and length. It never assumes that a rollback ACK completed
+the reboot.
 
 ## Interruption and recovery
 

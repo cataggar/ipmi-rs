@@ -169,6 +169,16 @@ pub trait IpmiConnection {
     /// The type of error the can occur when sending a [`Request`] or receiving a [`Response`].
     type Error: core::fmt::Debug + From<Self::SendError> + From<Self::RecvError>;
 
+    /// Whether a session permanently consumes a finite request sequence space.
+    ///
+    /// Long, non-resumable mutation workflows must refuse this transport
+    /// before writing if they cannot guarantee enough sequences for the whole
+    /// workflow, including identity checks and cleanup. Wrappers must forward
+    /// this capability instead of silently using the default.
+    fn has_nonrenewable_request_sequences(&self) -> bool {
+        false
+    }
+
     /// Send `request` to the remote end of this connection.
     fn send(&mut self, request: &mut Request) -> Result<(), Self::SendError>;
 
@@ -183,6 +193,10 @@ impl<T: IpmiConnection + ?Sized> IpmiConnection for &mut T {
     type SendError = T::SendError;
     type RecvError = T::RecvError;
     type Error = T::Error;
+
+    fn has_nonrenewable_request_sequences(&self) -> bool {
+        (**self).has_nonrenewable_request_sequences()
+    }
 
     fn send(&mut self, request: &mut Request) -> Result<(), Self::SendError> {
         (**self).send(request)

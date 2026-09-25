@@ -47,6 +47,9 @@ pub enum PrepareError {
     ExistingUpdate,
     /// Payload limit, transport routing or buffer length cannot be represented.
     InvalidTransport,
+    /// RMCP's 64 retired IPMB sequences cannot finish even the smallest
+    /// image once per-command identity checks and cleanup are included.
+    NonrenewableRequestSequences,
 }
 
 impl<'a> UpdateAuthorization<'a> {
@@ -337,6 +340,9 @@ impl<CON: IpmiConnection> Ipmi<CON> {
             return Err(preflight(PrepareError::ImageTargetMismatch));
         }
         limits.check(target).map_err(preflight)?;
+        if self.inner.has_nonrenewable_request_sequences() {
+            return Err(preflight(PrepareError::NonrenewableRequestSequences));
+        }
         let baseline = self.fwum_banks(target).map_err(|error| UpdateError {
             phase: UpdatePhase::Prepared,
             confirmed_bytes: 0,
@@ -506,9 +512,21 @@ impl<'ipmi, 'image, CON: IpmiConnection> UpdateSession<'ipmi, 'image, CON> {
         errors
     }
 
+    fn old_bank_matches(&self, status: &BankInventory, expected: BankState) -> bool {
+        status.inventory.firmware.bank_count == self.baseline_count
+            && status
+                .banks
+                .get(usize::from(self.old_good_bank))
+                .is_some_and(|value| {
+                    value.state == expected
+                        && value.length == self.old_good.length
+                        && value.revision == self.old_good.revision
+                })
+    }
+
     fn verify_staged(&mut self, bank: u8) -> Result<bool, FwumReadError<CON::Error>> {
         let status = self.ipmi.fwum_banks(self.target)?;
-        Ok(status.inventory.firmware.bank_count == self.baseline_count
+        Ok(self.old_bank_matches(&status, BankState::LastKnownGood)
             && status.banks.get(usize::from(bank)).is_some_and(|status| {
                 status.state == BankState::NewFirmware
                     && status.length as usize == self.image.len()
@@ -651,17 +669,16 @@ impl<'ipmi, 'image, CON: IpmiConnection> UpdateSession<'ipmi, 'image, CON> {
             .ipmi
             .fwum_banks(self.target)
             .map_err(|err| self.error(UpdateCause::Read(err), Vec::new()))?;
-        if status.banks.get(usize::from(bank)).is_some_and(|value| {
+        let new_bank_is_good = status.banks.get(usize::from(bank)).is_some_and(|value| {
             value.state == BankState::LastKnownGood
                 && value.length as usize == self.image.len()
                 && value.revision == self.image.revision
-        }) && status
-            .banks
-            .get(usize::from(self.old_good_bank))
-            .is_some_and(|value| value.state != BankState::LastKnownGood)
-        {
+        });
+        if new_bank_is_good && self.old_bank_matches(&status, BankState::PreviousGood) {
             self.phase = UpdatePhase::Activated { bank };
             Ok(())
+        } else if new_bank_is_good {
+            Err(self.stop(UpdateCause::Verification))
         } else {
             Err(self.error(UpdateCause::Pending, Vec::new()))
         }
@@ -676,11 +693,13 @@ impl<'ipmi, 'image, CON: IpmiConnection> UpdateSession<'ipmi, 'image, CON> {
             .ipmi
             .fwum_banks(self.target)
             .map_err(|err| self.error(UpdateCause::Read(err), Vec::new()))?;
-        if !status.banks.get(usize::from(bank)).is_some_and(|value| {
-            value.state == BankState::LastKnownGood
-                && value.length as usize == self.image.len()
-                && value.revision == self.image.revision
-        }) {
+        if !self.old_bank_matches(&status, BankState::PreviousGood)
+            || !status.banks.get(usize::from(bank)).is_some_and(|value| {
+                value.state == BankState::LastKnownGood
+                    && value.length as usize == self.image.len()
+                    && value.revision == self.image.revision
+            })
+        {
             return Err(self.stop(UpdateCause::Verification));
         }
         if let Err(err) = self.write(ManualRollback(self.target), UpdateAction::Rollback) {

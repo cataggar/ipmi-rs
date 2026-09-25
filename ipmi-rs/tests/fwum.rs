@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{cell::Cell, collections::VecDeque, rc::Rc};
 
 use ipmi_rs::{
     connection::{
@@ -66,6 +66,9 @@ struct Mock {
     rollback_pending: bool,
     pending_activation_snapshot: bool,
     pending_rollback_snapshot: bool,
+    finite_sequences: bool,
+    old_status_override: Rc<Cell<Option<[u8; 7]>>>,
+    old_status_after_finish: Option<[u8; 7]>,
     scripted: VecDeque<Result<Vec<u8>, Fault>>,
 }
 
@@ -90,6 +93,11 @@ impl Mock {
         }
         let pending_activate = self.pending_activation_snapshot;
         let pending_rollback = self.pending_rollback_snapshot;
+        if bank == 0 {
+            if let Some(status) = self.old_status_override.get() {
+                return status.to_vec();
+            }
+        }
         if bank == 1 {
             if self.activated {
                 self.activation_pending = false;
@@ -121,6 +129,10 @@ impl IpmiConnection for Mock {
     type SendError = Fault;
     type RecvError = Fault;
     type Error = Fault;
+
+    fn has_nonrenewable_request_sequences(&self) -> bool {
+        self.finite_sequences
+    }
 
     fn send(&mut self, _: &mut Request) -> Result<(), Self::SendError> {
         unreachable!()
@@ -182,6 +194,7 @@ impl IpmiConnection for Mock {
                 }
                 (8, 0x0c) => {
                     self.staged = true;
+                    self.old_status_override.set(self.old_status_after_finish);
                     vec![]
                 }
                 (8, 0x09) => {
@@ -392,6 +405,67 @@ fn bad_image_or_recovery_fails_before_any_mutation() {
 
 #[cfg(feature = "kontron-fwum-update")]
 #[test]
+fn minimum_image_is_rejected_before_any_rmcp_packet_or_mutation() {
+    let bytes = image(BOARD, 15000, 1);
+    let recovery = image(BOARD, 15000, 2);
+    assert_eq!(bytes.len(), 0x5b4);
+    let mut offset = 0;
+    let mut saves = 0;
+    while offset < bytes.len() {
+        offset += (bytes.len() - offset).min(28).min(256 - offset % 256);
+        saves += 1;
+    }
+    assert_eq!(saves, 57);
+    assert!(saves * 2 + 16 > 64);
+
+    let rmcp =
+        ipmi_rs::rmcp::Rmcp::new("127.0.0.1:623", std::time::Duration::from_secs(1)).unwrap();
+    assert!(rmcp.has_nonrenewable_request_sequences());
+    let mut ipmi = Ipmi::new(rmcp);
+    assert!(matches!(
+        ipmi.fwum_prepare_update(
+            bridged(),
+            &bytes,
+            &authorization(&recovery),
+            TransportLimits::standard(TransportKind::Bridged)
+        ),
+        Err(err) if matches!(err.cause, UpdateCause::Preflight(PrepareError::NonrenewableRequestSequences))
+    ));
+    let mut rmcp = ipmi.release();
+    let wrapped = &mut rmcp;
+    assert!(IpmiConnection::has_nonrenewable_request_sequences(&wrapped));
+    let direct_bytes = image(77, 15000, 1);
+    let direct_recovery = image(77, 15000, 2);
+    let mut borrowed = Ipmi::new(wrapped);
+    assert!(matches!(
+        borrowed.fwum_prepare_update(
+            direct(),
+            &direct_bytes,
+            &authorization(&direct_recovery),
+            TransportLimits::standard(TransportKind::Local)
+        ),
+        Err(err) if matches!(err.cause, UpdateCause::Preflight(PrepareError::NonrenewableRequestSequences))
+    ));
+
+    let mut mock = Mock::kontron();
+    mock.finite_sequences = true;
+    let mut ipmi = Ipmi::new(mock);
+    assert!(matches!(
+        ipmi.fwum_prepare_update(
+            bridged(),
+            &bytes,
+            &authorization(&recovery),
+            TransportLimits::negotiated(TransportKind::Bridged, 32, 32).unwrap()
+        ),
+        Err(err) if matches!(err.cause, UpdateCause::Preflight(PrepareError::NonrenewableRequestSequences))
+    ));
+    assert!(ipmi.inner_mut().sent.is_empty());
+    assert_eq!(count(ipmi.inner_mut(), 8, 0x0a), 0);
+    assert_eq!(count(ipmi.inner_mut(), 0x3e, 0x82), 0);
+}
+
+#[cfg(feature = "kontron-fwum-update")]
+#[test]
 fn bridged_setup_upload_finish_activate_and_rollback_with_verified_progress() {
     let bytes = image(BOARD, 15000, 1);
     let recovery = image(BOARD, 15000, 2);
@@ -490,6 +564,128 @@ fn bridged_setup_upload_finish_activate_and_rollback_with_verified_progress() {
         bytes
     );
     assert_eq!(saves.first().unwrap().2[0], 0);
+}
+
+#[cfg(feature = "kontron-fwum-update")]
+#[test]
+fn missing_or_changed_fallback_before_finish_or_activation_blocks_mutation() {
+    let bytes = image(BOARD, 15000, 1);
+    let recovery = image(BOARD, 15000, 2);
+    let missing = [0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+    let changed = [3, 100, 0, 0, 9, 0x12, 3];
+
+    let mut mock = Mock::kontron();
+    mock.old_status_after_finish = Some(missing);
+    let mut ipmi = Ipmi::new(mock);
+    let mut session = ipmi
+        .fwum_prepare_update(
+            bridged(),
+            &bytes,
+            &authorization(&recovery),
+            TransportLimits::standard(TransportKind::Bridged),
+        )
+        .unwrap();
+    assert!(matches!(
+        session.stage(|_| true),
+        Err(err) if matches!(err.cause, UpdateCause::Verification)
+    ));
+    assert_eq!(session.phase(), UpdatePhase::Interrupted);
+    drop(session);
+    let mock = ipmi.release();
+    assert_eq!(count(&mock, 8, 0x0c), 1);
+    assert_eq!(count(&mock, 8, 0x09), 0);
+
+    for altered in [missing, [4, 100, 0, 0, 1, 0x12, 3], changed] {
+        let mock = Mock::kontron();
+        let status = Rc::clone(&mock.old_status_override);
+        let mut ipmi = Ipmi::new(mock);
+        let mut session = ipmi
+            .fwum_prepare_update(
+                bridged(),
+                &bytes,
+                &authorization(&recovery),
+                TransportLimits::standard(TransportKind::Bridged),
+            )
+            .unwrap();
+        session.stage(|_| true).unwrap();
+        status.set(Some(altered));
+        assert!(matches!(
+            session.activate(),
+            Err(err) if matches!(err.cause, UpdateCause::Verification)
+        ));
+        assert_eq!(session.phase(), UpdatePhase::Interrupted);
+        drop(session);
+        let mock = ipmi.release();
+        assert_eq!(count(&mock, 8, 0x09), 0);
+        assert_eq!(count(&mock, 8, 0x0e), 0);
+    }
+}
+
+#[cfg(feature = "kontron-fwum-update")]
+#[test]
+fn rollback_requires_original_previous_good_bank_unchanged() {
+    let bytes = image(BOARD, 15000, 1);
+    let recovery = image(BOARD, 15000, 2);
+    for altered in [
+        [0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+        [3, 100, 0, 0, 1, 0x12, 3],
+        [4, 100, 0, 0, 1, 0x13, 3],
+    ] {
+        let mock = Mock::kontron();
+        let status = Rc::clone(&mock.old_status_override);
+        let mut ipmi = Ipmi::new(mock);
+        let mut session = ipmi
+            .fwum_prepare_update(
+                bridged(),
+                &bytes,
+                &authorization(&recovery),
+                TransportLimits::standard(TransportKind::Bridged),
+            )
+            .unwrap();
+        session.stage(|_| true).unwrap();
+        session.activate().unwrap();
+        session.verify_activation().unwrap();
+        status.set(Some(altered));
+        assert!(matches!(
+            session.rollback(),
+            Err(err) if matches!(err.cause, UpdateCause::Verification)
+        ));
+        assert_eq!(session.phase(), UpdatePhase::Interrupted);
+        drop(session);
+        assert_eq!(count(&ipmi.release(), 8, 0x0e), 0);
+    }
+}
+
+#[cfg(feature = "kontron-fwum-update")]
+#[test]
+fn activation_verification_does_not_mark_missing_fallback_rollback_safe() {
+    let bytes = image(BOARD, 15000, 1);
+    let recovery = image(BOARD, 15000, 2);
+    let mock = Mock::kontron();
+    let status = Rc::clone(&mock.old_status_override);
+    let mut ipmi = Ipmi::new(mock);
+    let mut session = ipmi
+        .fwum_prepare_update(
+            bridged(),
+            &bytes,
+            &authorization(&recovery),
+            TransportLimits::standard(TransportKind::Bridged),
+        )
+        .unwrap();
+    session.stage(|_| true).unwrap();
+    session.activate().unwrap();
+    status.set(Some([0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]));
+    assert!(matches!(
+        session.verify_activation(),
+        Err(err) if matches!(err.cause, UpdateCause::Verification)
+    ));
+    assert_eq!(session.phase(), UpdatePhase::Interrupted);
+    assert!(matches!(
+        session.rollback(),
+        Err(err) if matches!(err.cause, UpdateCause::InvalidPhase)
+    ));
+    drop(session);
+    assert_eq!(count(&ipmi.release(), 8, 0x0e), 0);
 }
 
 #[cfg(feature = "kontron-fwum-update")]

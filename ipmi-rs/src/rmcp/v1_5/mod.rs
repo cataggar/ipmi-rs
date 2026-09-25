@@ -233,6 +233,10 @@ impl IpmiConnection for State {
 
     type Error = RmcpIpmiError;
 
+    fn has_nonrenewable_request_sequences(&self) -> bool {
+        true
+    }
+
     fn send(&mut self, request: &mut Request) -> Result<(), RmcpIpmiSendError> {
         log::trace!("Sending message with auth type {:?}", self.auth_type);
         if self.socket.cancellation_token().is_cancelled() {
