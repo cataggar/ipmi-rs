@@ -72,8 +72,8 @@ fn wire_fixtures_cover_selectors_blocks_revisions_and_completion_codes() {
             67 => LanConfigParameter::Ipv6StaticRouter1PrefixLength,
             74 => LanConfigParameter::Ipv6DynamicRouterAddress,
             76 => LanConfigParameter::Ipv6DynamicRouterPrefixLength,
-            79 => LanConfigParameter::Ipv6NdSlaacTimingSupport,
-            80 => LanConfigParameter::Ipv6NdSlaacTiming,
+            79 => LanConfigParameter::Ipv6NeighborDiscoverySlaacTimingSupport,
+            80 => LanConfigParameter::Ipv6NeighborDiscoverySlaacTiming,
             _ => parameter,
         };
         let response = GetLanConfigParameters::parse_success_response(&hex(fields[3])).unwrap();

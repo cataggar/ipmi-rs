@@ -122,7 +122,7 @@ pub enum LanConfigParameterRequest {
     Ipv6StaticRouter2Mac(MacAddress),
     Ipv6StaticRouter2PrefixLength(u8),
     Ipv6StaticRouter2Prefix(Ipv6Address),
-    Ipv6NdSlaacTiming(Ipv6LanBlock),
+    Ipv6NeighborDiscoverySlaacTiming(Ipv6LanBlock),
     /// Raw escape hatch, used with an explicit selector through `from_request`.
     Raw(Vec<u8>),
 }
@@ -171,7 +171,7 @@ impl LanConfigParameterRequest {
             Self::Ipv6StaticRouter2Mac(_) => P::Ipv6StaticRouter2Mac,
             Self::Ipv6StaticRouter2PrefixLength(_) => P::Ipv6StaticRouter2PrefixLength,
             Self::Ipv6StaticRouter2Prefix(_) => P::Ipv6StaticRouter2Prefix,
-            Self::Ipv6NdSlaacTiming(_) => P::Ipv6NdSlaacTiming,
+            Self::Ipv6NeighborDiscoverySlaacTiming(_) => P::Ipv6NeighborDiscoverySlaacTiming,
             Self::Raw(_) => return None,
         })
     }
@@ -279,7 +279,7 @@ impl LanConfigParameterRequest {
             R::Ipv6StaticDuid(value)
             | R::Ipv6DynamicDuid(value)
             | R::Ipv6DhcpTiming(value)
-            | R::Ipv6NdSlaacTiming(value) => {
+            | R::Ipv6NeighborDiscoverySlaacTiming(value) => {
                 Ipv6LanBlock::new(
                     value.set_selector,
                     value.block_selector,
@@ -297,7 +297,7 @@ impl LanConfigParameterRequest {
                 {
                     return Err(LanConfigError::InvalidBlockSequence);
                 }
-                if matches!(self, R::Ipv6NdSlaacTiming(_))
+                if matches!(self, R::Ipv6NeighborDiscoverySlaacTiming(_))
                     && (value.block_selector != 0 || value.bytes.len() != 16)
                 {
                     return Err(LanConfigError::InvalidBlockSequence);
@@ -360,7 +360,7 @@ impl LanConfigParameterRequest {
             Self::Ipv6StaticDuid(v)
             | Self::Ipv6DynamicDuid(v)
             | Self::Ipv6DhcpTiming(v)
-            | Self::Ipv6NdSlaacTiming(v) => v.wire(),
+            | Self::Ipv6NeighborDiscoverySlaacTiming(v) => v.wire(),
             _ => unreachable!("all remaining variants are always valid"),
         })
     }

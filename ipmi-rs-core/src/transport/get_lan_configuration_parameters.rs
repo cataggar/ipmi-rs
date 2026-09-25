@@ -147,8 +147,8 @@ pub enum LanConfigParameter {
     Ipv6DynamicRouterPrefixLength,
     Ipv6DynamicRouterPrefix,
     Ipv6DynamicHopLimit,
-    Ipv6NdSlaacTimingSupport,
-    Ipv6NdSlaacTiming,
+    Ipv6NeighborDiscoverySlaacTimingSupport,
+    Ipv6NeighborDiscoverySlaacTiming,
     /// Unrecognized/OEM parameter, returned as raw bytes.
     Other(u8),
 }
@@ -212,8 +212,8 @@ impl LanConfigParameter {
             LanConfigParameter::Ipv6DynamicRouterPrefixLength => 76,
             LanConfigParameter::Ipv6DynamicRouterPrefix => 77,
             LanConfigParameter::Ipv6DynamicHopLimit => 78,
-            LanConfigParameter::Ipv6NdSlaacTimingSupport => 79,
-            LanConfigParameter::Ipv6NdSlaacTiming => 80,
+            LanConfigParameter::Ipv6NeighborDiscoverySlaacTimingSupport => 79,
+            LanConfigParameter::Ipv6NeighborDiscoverySlaacTiming => 80,
             LanConfigParameter::Other(value) => *value,
         }
     }
@@ -255,7 +255,7 @@ impl LanConfigParameter {
             Self::Ipv6StaticDuid
             | Self::Ipv6DynamicDuid
             | Self::Ipv6DhcpTiming
-            | Self::Ipv6NdSlaacTiming => 0,
+            | Self::Ipv6NeighborDiscoverySlaacTiming => 0,
             _ => 1,
         };
         if expected != 0 {
@@ -347,11 +347,15 @@ impl LanConfigParameter {
             Self::Ipv6StaticDuidStorageLength => Ipv6StaticDuidStorageLength(data[0]),
             Self::Ipv6DynamicDuidStorageLength => Ipv6DynamicDuidStorageLength(data[0]),
             Self::Ipv6DhcpTimingSupport => Ipv6DhcpTimingSupport(data[0].try_into()?),
-            Self::Ipv6NdSlaacTimingSupport => Ipv6NdSlaacTimingSupport(data[0].try_into()?),
+            Self::Ipv6NeighborDiscoverySlaacTimingSupport => {
+                Ipv6NeighborDiscoverySlaacTimingSupport(data[0].try_into()?)
+            }
             Self::Ipv6StaticDuid => Ipv6StaticDuid(Ipv6LanBlock::parse(data)?),
             Self::Ipv6DynamicDuid => Ipv6DynamicDuid(Ipv6LanBlock::parse(data)?),
             Self::Ipv6DhcpTiming => Ipv6DhcpTiming(Ipv6LanBlock::parse(data)?),
-            Self::Ipv6NdSlaacTiming => Ipv6NdSlaacTiming(Ipv6LanBlock::parse(data)?),
+            Self::Ipv6NeighborDiscoverySlaacTiming => {
+                Ipv6NeighborDiscoverySlaacTiming(Ipv6LanBlock::parse(data)?)
+            }
             Self::Ipv6RouterControl => {
                 if data[0] & !3 != 0 {
                     return Err(LanConfigError::InvalidValue(data[0]));
@@ -451,7 +455,9 @@ impl LanConfigParameterResponse {
             D::Ipv6StaticDuid(v)
             | D::Ipv6DynamicDuid(v)
             | D::Ipv6DhcpTiming(v)
-            | D::Ipv6NdSlaacTiming(v) => Some((v.set_selector, Some(v.block_selector))),
+            | D::Ipv6NeighborDiscoverySlaacTiming(v) => {
+                Some((v.set_selector, Some(v.block_selector)))
+            }
             D::Ipv6DynamicRouterAddress(v) | D::Ipv6DynamicRouterPrefix(v) => {
                 Some((v.set_selector, None))
             }
@@ -527,8 +533,8 @@ pub enum LanConfigParameterData {
     Ipv6DynamicRouterPrefixLength(Ipv6DynamicRouter<u8>),
     Ipv6DynamicRouterPrefix(Ipv6DynamicRouter<Ipv6Address>),
     Ipv6DynamicHopLimit(u8),
-    Ipv6NdSlaacTimingSupport(Ipv6TimingSupport),
-    Ipv6NdSlaacTiming(Ipv6LanBlock),
+    Ipv6NeighborDiscoverySlaacTimingSupport(Ipv6TimingSupport),
+    Ipv6NeighborDiscoverySlaacTiming(Ipv6LanBlock),
     Raw(Vec<u8>),
 }
 
