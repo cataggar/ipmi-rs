@@ -156,6 +156,45 @@ The following IPMI commands are currently supported in `ipmi-rs-core`:
 | Get SDR Repository Info                 | 33.9                  |
 | Get SDR Repository Allocation Info      | 33.10                 |
 | Get SDR                                 | 33.12                 |
+| Get FRU Inventory Area Info             | Storage command 0x10  |
+| Read FRU Data                           | Storage command 0x11  |
+| Write FRU Data                          | Storage command 0x12  |
+
+## FRU inventory
+
+`ipmi_rs::storage::fru` provides sans-IO FRU info, read and **explicit**
+write commands and `FruInventory::parse` for a complete image. The parser
+validates the common header, area layout, terminators and checksums, and
+multirecord boundaries/checksums. Unknown/OEM fields retain their original
+bytes. English 8-bit fields decode as ASCII/Latin-1; non-English 8-bit
+fields retain raw bytes rather than guessing text.
+
+With an existing `Ipmi` connection:
+
+```rust,ignore
+use ipmi_rs::storage::fru::FruDevice;
+
+let candidates = ipmi.fru_devices(); // built-in ID 0 plus logical SDR locators
+let inventory = ipmi.read_fru_inventory(FruDevice::BUILTIN)?;
+let raw = ipmi.read_fru_image(FruDevice::BUILTIN)?;
+// Writing is never implicit in a read. To replace a complete valid image:
+let info = ipmi.fru_info(FruDevice::BUILTIN)?;
+ipmi.write_fru_image(FruDevice::BUILTIN, info, &raw)?;
+```
+
+SDR FRU-device and FRU-capable management-controller locators identify
+candidate devices and their address/channel/LUN routing, not inventory contents.
+Remote targets need a transport supporting that address; the RMCP transport
+currently only sends requests to its local controller (the device-file
+transport supports routed IPMB requests).
+The built-in candidate may not exist on all systems; query it before reading.
+Reads use at most 16 bytes per command, shrinking on size-related completion
+codes. Writes validate the entire image **before** the first command, then
+send at most 16 bytes per command without automatic retry. On any write error,
+including a timeout, completion code, or short acknowledgement, some bytes
+may have been changed. The reported offset and confirmed prefix are *not* a
+guarantee that the affected chunk was not written. Investigate the device
+state before attempting another mutation.
 
 ## Opt-in OEM commands
 

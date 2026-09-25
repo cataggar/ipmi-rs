@@ -4,6 +4,7 @@ pub use full_sensor_record::{FullSensorRecord, ThresholdValueError};
 mod compact_sensor_record;
 mod event_only_sensor_record;
 mod fru_device_locator;
+pub use fru_device_locator::{FruDevice, FruDeviceLocator};
 mod generic_device_locator;
 mod mc_device_locator;
 
@@ -17,7 +18,6 @@ use nonmax::NonMaxU8;
 
 use crate::connection::{Channel, LogicalUnit};
 use crate::storage::sdr::record::event_only_sensor_record::EventOnlySensorRecord;
-use crate::storage::sdr::record::fru_device_locator::FruDeviceLocator;
 use crate::storage::sdr::record::mc_device_locator::McDeviceLocatorRecord;
 
 use super::{event_reading_type_code::EventReadingTypeCodes, RecordId, SensorType, Unit};
