@@ -24,6 +24,8 @@ enum Action {
     On,
     Cycle,
     Reset,
+    Diag,
+    Soft,
 }
 
 impl From<Action> for PowerAction {
@@ -33,6 +35,8 @@ impl From<Action> for PowerAction {
             Action::On => Self::On,
             Action::Cycle => Self::Cycle,
             Action::Reset => Self::HardReset,
+            Action::Diag => Self::DiagnosticInterrupt,
+            Action::Soft => Self::AcpiSoftShutdown,
         }
     }
 }
@@ -46,7 +50,7 @@ struct Cli {
     /// Milliseconds to wait for a response
     #[arg(long, default_value_t = 2000)]
     timeout_ms: u64,
-    /// Explicit host action: off, on, cycle, or reset (not a BMC reset)
+    /// Explicit host action: off, on, cycle, reset, diag, or soft (not a BMC reset)
     #[arg(long, value_enum)]
     action: Option<Action>,
 }

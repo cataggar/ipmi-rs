@@ -1,5 +1,3 @@
-use std::convert::Infallible;
-
 use crate::connection::{IpmiCommand, Message, NetFn};
 
 /// An explicit action affecting the host's power, not the BMC's own state.
@@ -13,6 +11,10 @@ pub enum PowerAction {
     Cycle,
     /// Hard-reset the host (`0x03`); does not reset the BMC.
     HardReset,
+    /// Pulse the host's diagnostic interrupt (`0x04`).
+    DiagnosticInterrupt,
+    /// Request an ACPI soft shutdown of the host (`0x05`).
+    AcpiSoftShutdown,
 }
 
 impl PowerAction {
@@ -23,6 +25,8 @@ impl PowerAction {
             Self::On => 0x01,
             Self::Cycle => 0x02,
             Self::HardReset => 0x03,
+            Self::DiagnosticInterrupt => 0x04,
+            Self::AcpiSoftShutdown => 0x05,
         }
     }
 }
@@ -59,12 +63,20 @@ impl From<ChassisControl> for Message {
 
 impl IpmiCommand for ChassisControl {
     type Output = ();
-    type Error = Infallible;
+    type Error = UnexpectedControlResponseLength;
 
-    fn parse_success_response(_: &[u8]) -> Result<Self::Output, Self::Error> {
-        Ok(())
+    fn parse_success_response(data: &[u8]) -> Result<Self::Output, Self::Error> {
+        if data.is_empty() {
+            Ok(())
+        } else {
+            Err(UnexpectedControlResponseLength(data.len()))
+        }
     }
 }
+
+/// A successful Chassis Control response unexpectedly contained data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnexpectedControlResponseLength(pub usize);
 
 #[cfg(test)]
 mod tests {
@@ -77,6 +89,8 @@ mod tests {
             (PowerAction::On, 0x01),
             (PowerAction::Cycle, 0x02),
             (PowerAction::HardReset, 0x03),
+            (PowerAction::DiagnosticInterrupt, 0x04),
+            (PowerAction::AcpiSoftShutdown, 0x05),
         ];
         for (action, expected) in fixtures {
             let command = ChassisControl::new(action);
@@ -87,5 +101,9 @@ mod tests {
             assert_eq!(request.data(), [expected]);
             assert_eq!(ChassisControl::parse_success_response(&[]), Ok(()));
         }
+        assert_eq!(
+            ChassisControl::parse_success_response(&[0]),
+            Err(UnexpectedControlResponseLength(1))
+        );
     }
 }

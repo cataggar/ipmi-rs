@@ -5,7 +5,14 @@
 //! automatically.
 
 mod chassis_control;
-pub use chassis_control::{ChassisControl, PowerAction};
+pub use chassis_control::{ChassisControl, PowerAction, UnexpectedControlResponseLength};
+
+mod chassis_operations;
+pub use chassis_operations::{
+    ChassisIdentify, ChassisResponseLength, GetPowerOnHours, GetPowerRestorePolicySupport,
+    GetSystemRestartCause, IdentifyMode, PowerOnHours, PowerRestorePolicySetting, RestartCause,
+    RestartReason, SetPowerRestorePolicy, SupportedPowerRestorePolicies,
+};
 
 mod get_chassis_status;
 pub use get_chassis_status::{
@@ -15,7 +22,10 @@ pub use get_chassis_status::{
 
 mod boot_options;
 pub use boot_options::{
-    BootDevice, BootFlags, BootInfoAcknowledge, BootInfoActors, BootOptionError,
-    BootOptionRejection, BootOptionSelector, BootOptionWrite, BootOverride, BootOverrideDuration,
-    BootParameter, BootValidBitClearing, GetSystemBootOptions, SetInProgress, SetSystemBootOptions,
+    BootDevice, BootFlags, BootInfoAcknowledge, BootInfoActors, BootInitiatorInfo,
+    BootInitiatorInfoWrite, BootMailboxBlock, BootOptionError, BootOptionRejection,
+    BootOptionSelector, BootOptionWrite, BootOverride, BootOverrideDuration, BootParameter,
+    BootValidBitClearing, GetBootMailboxBlock, GetRawBootOption, GetSystemBootOptions,
+    RawBootOption, ServicePartitionScan, ServicePartitionSelector, SetBootMailboxBlock,
+    SetInProgress, SetSystemBootOptions,
 };
