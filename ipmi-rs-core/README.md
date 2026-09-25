@@ -70,4 +70,45 @@ SOL commands are in `app::sol` (`ActivateSol`, `DeactivateSol`,
 explicit and distinct from activation; a guarded write attempts a bounded
 set-complete cleanup and returns cleanup errors instead of hiding them.
 
+PEF commands are in `sensor_event::pef`. Read-only discovery uses
+`GetPefCapabilities` (`0x10`), `GetPefLastProcessedEventId` (`0x15`) and
+`GetPefConfig` (`0x13`) for control, actions, filter/policy table sizes and
+entries, and the optional PET system GUID. `PefInfo` and `PefStatus` group
+these typed readbacks. Decode a configuration result with
+`raw.parse(request.parameter)` (or `request.parse_response(bytes)`) and check
+the returned `PefConfigValue` variant. Parameter revision, exact lengths,
+reserved bits and echoed table IDs are checked. A table size of zero means
+unsupported; `PefFilterId::new(index, size)` and `PefPolicyId::new(index, size)`
+reject ID zero and IDs above the discovered size. Read the size again before
+mutating a table that may have changed.
+
+Writes are separate and **never** performed by reads or discovery.
+`SetPefConfig` (`0x12`) explicitly changes a filter's enabled bit or writes a
+complete alert policy entry. To toggle a policy, read its entry, change only
+`entry.policy.enabled`, then write it using `PefChange::PolicyEntry(entry)`;
+this preserves its policy set, rule, channel, destination and alert string key.
+`pef_write_guarded(|request| ipmi.send_recv(request), change)` attempts
+set-in-progress, the write, commit and set-complete. A confirmed nonzero
+completion code for Begin (including `0x81`, already in progress) skips
+set-complete so another writer's transaction is not released. A timeout, lost
+response, or malformed success is ambiguous: set-complete is still attempted
+and both errors are retained. Once Begin succeeds, cleanup is attempted after
+write/commit failures as well. Other error types supplied to the helper must
+implement `PefBeginError`, returning `true` only for a confirmed rejection.
+A failed response does not prove a write did not take effect; do not blindly
+retry. If the BMC rejects set-in-progress as unsupported (`0x80`), an
+unguarded `SetPefConfig` requires an explicit caller decision. Completion
+codes are retained by the connection's `IpmiError`.
+
+An alert policy selects a **channel** and four-bit **destination ID**; it does
+not configure the destination's address, type, community or delivery behavior.
+LAN alert destination parameters 16–19 belong to LAN configuration on that
+channel (tracked separately in issue #23). Do not mistake a policy write for a
+LAN destination write. The reference ipmitool PEF CLI implements info, status,
+filter/policy listing and enable/disable, including LAN/serial destination
+*display*. Its `capabilities`, `event`, `pet`, `timer` and filter/policy
+`create`/`delete` CLI branches are explicitly **not implemented**. This module
+does not claim those CLI workflows, destination setup, or full filter-entry
+writes.
+
 [`ipmi-rs`]: https://crates.io/crates/ipmi-rs
