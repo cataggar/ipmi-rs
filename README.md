@@ -29,7 +29,48 @@ This example will:
 
 ### `sel`
 
-This example will read out and print the SEL (System Event Log) of your target. It can also be cleared by passing the `--clear` flag.
+This example will read out and print the SEL (System Event Log) of your target. It can also be cleared by passing the `--clear` flag. Listing uses bounded, fallible SEL traversal; errors are reported rather than treated as end-of-log.
+
+### SEL traversal and writes
+
+`Ipmi::sel_entries(max_entries)` returns an iterator over `Result<SelEntryInfo, SelIterError<_>>`.
+It reads Get SEL Info to recognize an empty log, reserves the SEL if supported, follows
+the BMC's next-record pointers (IDs need not be consecutive), renews cancelled
+reservations on *reads*, and rescans from FIRST up to twice if a next ID was
+deleted. Previously emitted records are not emitted again. `None` means the
+log ended; an `Err` means a read failed or a bounded traversal could not
+complete (including the caller's `max_entries` limit). The iterator is fused
+after an error. This is **not a snapshot**: a changing log can omit records;
+restart a new scan if a stable view is needed. The read budget is at most
+`min(max_entries * 4 + 4, 65536)` Get SEL Entry requests.
+
+```rust
+// ipmi: &mut Ipmi<impl IpmiConnection>
+for result in ipmi.sel_entries(4096) {
+    let record = result?; // handle error; do not treat it as end-of-log
+    println!("SEL ID {:04X}: {:?}", record.entry.record_id().value(), record.entry);
+    // record.raw contains the exact 16 bytes for every record, including OEM/unknown.
+}
+```
+
+`GetSelTime` returns a `Timestamp`; `.seconds()` exposes the raw 32-bit
+seconds value (0 means unspecified). The clock value is not adjusted for
+timezone by the library. `SetSelTime(Timestamp::from(seconds))` sends an
+explicit clock write. `AddSelEntry::new(&raw_record)` accepts exactly 16
+bytes with a zero record ID (the BMC assigns the ID) and validates the
+record; it returns the assigned `RecordId`. `DeleteSelEntry::new(reservation,
+record_id)` accepts only actual record IDs and returns the deleted ID.
+Use `ReserveSel` first when the BMC advertises reservation support; otherwise
+pass `None`. OEM and unrecognized record types retain their uninterpreted
+payload; `SelEntryInfo::raw` preserves all 16 bytes losslessly.
+
+Send SEL mutations using `ipmi.sel_mutation(command)`, **not** a retry loop:
+`SelMutationError::Rejected` contains a BMC completion-code failure;
+`SelMutationError::OutcomeUnknown` means a transport failure, mismatched
+response, or malformed successful response could follow an executed
+mutation. Never automatically retry add, delete, or time writes in that
+case. A reservation cancellation returned for a delete is a rejection,
+not a reason to silently resend the write.
 
 ### `ipmi-channels`
 This example discovers available channels and prints channel information. For LAN channels, it also shows a small set of LAN configuration parameters (addressing and gateways).
@@ -94,7 +135,10 @@ The following IPMI commands are currently supported in `ipmi-rs-core`:
 | Get SEL Allocation Info                 | 31.3                  |
 | Reserve SEL                             | 31.4                  |
 | Get SEL Entry                           | 31.5                  |
+| Add SEL Entry                           | 31.6                  |
+| Delete SEL Entry                        | 31.8                  |
 | Clear SEL                               | 31.9                  |
+| Get / Set SEL Time                      | 31.10 / 31.11         |
 | Get Sensor Reading                      | 35.14                 |
 | Get Device SDR Info                     | 35.2                  |
 | Get Device SDR                          | 35.3                  |

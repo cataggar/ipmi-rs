@@ -134,6 +134,18 @@ impl Loggable for Entry {
                     (1, "Data", format!("{data:02X?}"))
                 ]
             }
+            Entry::Unknown {
+                record_id,
+                ty,
+                data,
+            } => {
+                log_vec![
+                    (0, "SEL entry"),
+                    (1, "Record type", format!("Unknown (0x{ty:02X})")),
+                    (1, "Record ID", format!("0x{:04X}", record_id.value())),
+                    (1, "Data", format!("{data:02X?}")),
+                ]
+            }
         }
     }
 }

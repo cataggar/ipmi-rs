@@ -30,6 +30,8 @@ impl GetEntry {
 pub struct EntryInfo {
     pub next_entry: RecordId,
     pub entry: Entry,
+    /// The entire wire record, including uninterpreted/OEM bytes.
+    pub raw: [u8; 16],
 }
 
 impl IpmiCommand for GetEntry {
@@ -44,7 +46,14 @@ impl IpmiCommand for GetEntry {
 
         let next_entry = RecordId::new_raw(u16::from_le_bytes([data[0], data[1]]));
         let entry = Entry::parse(&data[2..])?;
-        Ok(EntryInfo { next_entry, entry })
+        let raw = data[2..]
+            .try_into()
+            .map_err(|_| ParseEntryError::NotEnoughData)?;
+        Ok(EntryInfo {
+            next_entry,
+            entry,
+            raw,
+        })
     }
 }
 

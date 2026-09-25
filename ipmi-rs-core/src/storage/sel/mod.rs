@@ -8,6 +8,12 @@ use crate::storage::sdr::{decode_event, EventData, SensorType};
 mod clear;
 pub use clear::{ClearSel, ClearSelAction, ErasureProgress};
 
+mod add_entry;
+pub use add_entry::{AddSelEntry, AddSelEntryError};
+
+mod delete_entry;
+pub use delete_entry::{DeleteSelEntry, DeleteSelEntryError};
+
 mod get_alloc_info;
 pub use get_alloc_info::{AllocInfo as SelAllocInfo, GetAllocInfo as SelGetAllocInfo};
 
@@ -20,7 +26,10 @@ pub use get_info::{Command as SelCommand, GetInfo as GetSelInfo, Info as SelInfo
 mod reserve;
 pub use reserve::ReserveSel;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+mod time;
+pub use time::{GetSelTime, SelTimeResponseError, SetSelTime};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RecordId(u16);
 
 impl RecordId {
@@ -51,6 +60,10 @@ impl RecordId {
         self == &Self::LAST
     }
 }
+
+/// A command that changes the SEL. Send through `Ipmi::sel_mutation` to
+/// distinguish a BMC rejection from an uncertain outcome.
+pub trait SelMutation: crate::connection::IpmiCommand {}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SelRecordType {
@@ -160,16 +173,31 @@ pub enum Entry {
         ty: u8,
         data: [u8; 13],
     },
+    /// Unrecognized record types retain all 13 uninterpreted bytes.
+    Unknown {
+        record_id: RecordId,
+        ty: u8,
+        data: [u8; 13],
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ParseEntryError {
     NotEnoughData,
-    UnknownRecordType(u8),
+    InvalidLength(usize),
     InvalidChannel(u8),
 }
 
 impl Entry {
+    pub fn record_id(&self) -> RecordId {
+        match self {
+            Self::System { record_id, .. }
+            | Self::OemTimestamped { record_id, .. }
+            | Self::OemNotTimestamped { record_id, .. }
+            | Self::Unknown { record_id, .. } => *record_id,
+        }
+    }
+
     pub fn event_description(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Entry::System {
@@ -191,13 +219,16 @@ impl Entry {
         if data.len() < 16 {
             return Err(ParseEntryError::NotEnoughData);
         }
+        if data.len() != 16 {
+            return Err(ParseEntryError::InvalidLength(data.len()));
+        }
 
         let record_id = RecordId(u16::from_le_bytes([data[0], data[1]]));
         let record_type = SelRecordType::from(data[2]);
-        let timestamp = u32::from_le_bytes([data[3], data[4], data[5], data[6]]);
 
         match record_type {
             SelRecordType::System => {
+                let timestamp = u32::from_le_bytes([data[3], data[4], data[5], data[6]]);
                 let generator_id = EventGenerator::try_from((data[7], data[8]))?;
                 let event_message_format = EventMessageRevision::from(data[9]);
                 let sensor_type = data[10];
@@ -224,7 +255,9 @@ impl Entry {
             SelRecordType::TimestampedOem(v) => Ok(Self::OemTimestamped {
                 record_id,
                 ty: v,
-                timestamp: Timestamp::from(timestamp),
+                timestamp: Timestamp::from(u32::from_le_bytes([
+                    data[3], data[4], data[5], data[6],
+                ])),
                 manufacturer_id: u32::from_le_bytes([data[7], data[8], data[9], 0]),
                 data: [data[10], data[11], data[12], data[13], data[14], data[15]],
             }),
@@ -236,7 +269,11 @@ impl Entry {
                     data[11], data[12], data[13], data[14], data[15],
                 ],
             }),
-            SelRecordType::Unknown(v) => Err(ParseEntryError::UnknownRecordType(v)),
+            SelRecordType::Unknown(v) => Ok(Self::Unknown {
+                record_id,
+                ty: v,
+                data: data[3..16].try_into().expect("checked SEL record length"),
+            }),
         }
     }
 }

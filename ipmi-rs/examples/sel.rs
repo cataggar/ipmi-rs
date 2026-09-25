@@ -19,21 +19,15 @@ use std::fmt;
 
 use clap::Parser;
 use common::IpmiConnectionEnum;
-use ipmi_rs::{
-    storage::{
-        sdr::{
-            record::{
-                FullSensorRecord, InstancedSensor, RecordContents, SensorKey as SdrSensorKey,
-                SensorOwner, WithSensorRecordCommon,
-            },
-            EventData, SensorType, Unit,
+use ipmi_rs::storage::{
+    sdr::{
+        record::{
+            FullSensorRecord, InstancedSensor, RecordContents, SensorKey as SdrSensorKey,
+            SensorOwner, WithSensorRecordCommon,
         },
-        sel::{
-            ClearSel, Entry, ErasureProgress, EventGenerator, GetSelEntry, GetSelInfo,
-            RecordId as SelRecordId, ReserveSel, SelCommand,
-        },
+        EventData, SensorType, Unit,
     },
-    IpmiError,
+    sel::{ClearSel, Entry, ErasureProgress, EventGenerator, GetSelInfo, ReserveSel, SelCommand},
 };
 
 /// Sensor lookup key: (owner_id, channel, owner_lun, sensor_number)
@@ -437,44 +431,23 @@ fn main() -> std::io::Result<()> {
 
         log::info!("Reading {} SEL entries...", info.entries);
 
-        let mut record_id = SelRecordId::FIRST;
         let mut count = 0u32;
         let mut oem_text_buffer = String::new();
         let mut oem_nts_buffer = String::new(); // OEM non-timestamped text buffer
         let mut oem_nts_last_seq: Option<u8> = None;
 
-        loop {
-            match ipmi.send_recv(GetSelEntry::new(None, record_id)) {
-                Ok(entry_info) => {
-                    count += 1;
-                    print_entry(
-                        count,
-                        &entry_info.entry,
-                        &mut oem_text_buffer,
-                        &mut oem_nts_buffer,
-                        &mut oem_nts_last_seq,
-                        &sensor_lookup,
-                    );
-
-                    if entry_info.next_entry.is_last() {
-                        break;
-                    }
-                    record_id = entry_info.next_entry;
-                }
-                Err(IpmiError::Failed {
-                    completion_code, ..
-                }) => {
-                    log::error!(
-                        "Failed to get SEL entry: completion code {:?}",
-                        completion_code
-                    );
-                    break;
-                }
-                Err(e) => {
-                    log::error!("Failed to get SEL entry: {:?}", e);
-                    break;
-                }
-            }
+        for entry_info in ipmi.sel_entries(65_534) {
+            let entry_info = entry_info
+                .map_err(|e| std::io::Error::other(format!("SEL traversal failed: {e:?}")))?;
+            count += 1;
+            print_entry(
+                count,
+                &entry_info.entry,
+                &mut oem_text_buffer,
+                &mut oem_nts_buffer,
+                &mut oem_nts_last_seq,
+                &sensor_lookup,
+            );
         }
 
         // Flush any remaining OEM text
@@ -722,6 +695,22 @@ fn print_entry(
                     );
                 }
             }
+        }
+        Entry::Unknown {
+            record_id,
+            ty,
+            data,
+        } => {
+            flush_oem_buffer(oem_text_buffer);
+            flush_oem_nts_buffer(oem_nts_buffer);
+            *oem_nts_last_seq = None;
+            log::info!(
+                "#{:4} | ID: 0x{:04X} | Unknown SEL type 0x{:02X} | Data: {:02X?}",
+                num,
+                record_id.value(),
+                ty,
+                data
+            );
         }
     }
 }

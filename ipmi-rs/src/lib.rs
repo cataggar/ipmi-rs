@@ -16,6 +16,9 @@ pub mod rmcp;
 mod error;
 pub use error::IpmiError;
 
+mod sel;
+pub use sel::{SelIter, SelIterError, SelMutationError};
+
 use ipmi_rs_core::{
     connection::{CompletionErrorCode, IpmiCommand, LogicalUnit, Request, RequestTargetAddress},
     storage::sdr::{self, Record as SdrRecord},
@@ -57,6 +60,31 @@ where
             ipmi: self,
             next_id: Some(sdr::RecordId::FIRST),
         }
+    }
+
+    /// Traverse at most `max_entries` SEL records. The iterator is fallible and
+    /// reports changes or truncated traversal rather than silently ending.
+    pub fn sel_entries(&mut self, max_entries: usize) -> SelIter<'_, CON> {
+        SelIter::new(self, max_entries)
+    }
+
+    /// Send an explicitly chosen SEL write exactly once. Only a completion-code
+    /// rejection is known to have failed; all other errors have unknown outcome.
+    pub fn sel_mutation<CMD>(
+        &mut self,
+        request: CMD,
+    ) -> Result<CMD::Output, SelMutationError<CON::Error, CMD::Error>>
+    where
+        CMD: storage::sel::SelMutation,
+    {
+        self.send_recv(request).map_err(|error| match error {
+            IpmiError::Failed { .. }
+            | IpmiError::Command {
+                completion_code: Some(_),
+                ..
+            } => SelMutationError::Rejected(error),
+            _ => SelMutationError::OutcomeUnknown(error),
+        })
     }
 
     pub fn send_recv<CMD>(

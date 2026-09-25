@@ -9,7 +9,7 @@ use ipmi_rs::{
         Rmcp, RmcpIpmiError, RmcpIpmiReceiveError, RmcpIpmiSendError, V1_5WriteError,
         V2_0WriteError,
     },
-    storage::sdr,
+    storage::{sdr, sel::SelEntryInfo},
     File, Ipmi, IpmiError, SdrIter,
 };
 
@@ -72,6 +72,22 @@ impl IpmiConnectionEnum {
         match self {
             IpmiConnectionEnum::Rmcp(rmcp) => SdrIterInner::Rmcp(rmcp.sdrs()),
             IpmiConnectionEnum::File(file) => SdrIterInner::File(file.sdrs()),
+        }
+    }
+
+    pub fn sel_entries(
+        &mut self,
+        max_entries: usize,
+    ) -> Box<dyn Iterator<Item = std::io::Result<SelEntryInfo>> + '_> {
+        match self {
+            IpmiConnectionEnum::Rmcp(rmcp) => Box::new(
+                rmcp.sel_entries(max_entries)
+                    .map(|result| result.map_err(|e| error(format!("{e:?}")))),
+            ),
+            IpmiConnectionEnum::File(file) => Box::new(
+                file.sel_entries(max_entries)
+                    .map(|result| result.map_err(|e| error(format!("{e:?}")))),
+            ),
         }
     }
 }
