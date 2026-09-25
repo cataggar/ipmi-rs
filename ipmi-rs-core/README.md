@@ -64,6 +64,22 @@ The sensor-key constructors carry the SDR owner address, channel and LUN.
 support** in the transport; using a sensor key does not provide that missing
 bridging by itself.
 
+`app::{GetDeviceGuid, GetSelfTestResults}` return the exact GUID bytes (with
+explicit IPMI-order formatting) and typed self-test codes including unknown
+values. `app::{GetBmcGlobalEnables, SetBmcGlobalEnables}` validate defined
+bits; setting enables replaces the full byte and can disable event logging
+or interrupts. `app::watchdog` models get/set/reset separately, with countdowns
+in 100 ms units and host-power consequences on expiry. `app::system_info`
+provides versioned Get, per-set Set, typed set-in-progress, bounded strings
+and a guarded multi-set write with visible cleanup errors after a confirmed
+begin. A failed begin is not cleaned up automatically, since the lock may
+belong to another writer. Select `SystemInfoCommitMode::CompleteOnly` for
+controllers that do not support optional Commit Write (`2`), or
+`CommitThenComplete` when they do; unsupported commit is not used as a
+capability probe, and both modes attempt Set Complete. Mutations may
+require Operator or Administrator privilege and a lost reply means the
+outcome is unknown: do not automatically retry.
+
 SOL commands are in `app::sol` (`ActivateSol`, `DeactivateSol`,
 `SolInstance`) and `transport` (`GetSolConfig`, `SetSolConfig`,
 `SolParameterValue`, `sol_write_guarded`). Configuration writes are always
