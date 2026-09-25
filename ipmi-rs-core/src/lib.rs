@@ -24,5 +24,14 @@ pub mod transport;
 
 pub mod hpm;
 
+#[cfg(feature = "group-extensions")]
+mod group_extension;
+
+#[cfg(feature = "group-extensions")]
+pub mod picmg;
+
+#[cfg(feature = "group-extensions")]
+pub mod vita;
+
 #[cfg(test)]
 mod tests;

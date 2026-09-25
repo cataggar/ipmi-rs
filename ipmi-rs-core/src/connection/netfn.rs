@@ -56,8 +56,17 @@ netfn!(
     App => [0x06 | 0x07],
     Firmware => [0x08 | 0x09],
     Storage => [0x0A | 0x0B],
-    Transport => [0x0C | 0x0D]
+    Transport => [0x0C | 0x0D],
+    GroupExtension => [0x2C | 0x2D]
 );
+
+#[test]
+fn group_extension_request_and_reply_have_one_identity() {
+    assert_eq!(NetFn::from(0x2c), NetFn::GroupExtension);
+    assert_eq!(NetFn::from(0x2d), NetFn::GroupExtension);
+    assert_eq!(NetFn::GroupExtension.request_value(), 0x2c);
+    assert_eq!(NetFn::GroupExtension.response_value(), 0x2d);
+}
 
 impl NetFn {
     /// Check whether `v` is a response value.

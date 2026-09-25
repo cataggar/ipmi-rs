@@ -495,6 +495,52 @@ status, at least 100 ms for self-test/rollback) with a caller-imposed deadline;
 the library performs one read per call and never automatically reconnects or
 polls indefinitely. An acknowledged command can still be processing.
 
+## PICMG/ATCA and VITA 46.11 group extensions
+
+Enable `ipmi-rs` with `--features group-extensions` to use the typed
+`ipmi_rs::{picmg,vita}` command modules (or enable the feature on
+`ipmi-rs-core` for sans-IO use). These commands are **not** auto-discovered
+or issued during ordinary IPMI operations. Query `GetPicmgProperties` or
+`GetVitaCapabilities` first, then call `require_supported()` on the result
+before issuing other extension commands. Commands validate the returned
+extension ID (`0x00` for PICMG, `0x03` for VITA), lengths, and unsupported
+completion codes; raw site types, flags, and OEM descriptor values are
+preserved.
+
+For example, with an already established `Ipmi` connection addressed to
+the correct management controller:
+
+```rust
+use ipmi_rs::{picmg, vita};
+
+let properties = ipmi.send_recv(picmg::GetPicmgProperties)?;
+properties.require_supported().expect("supported PICMG extension version");
+let location = ipmi.send_recv(picmg::GetPicmgAddress { fru_id: 0 })?;
+let power = ipmi.send_recv(picmg::GetPicmgPower {
+    fru_id: location.fru_id,
+    power_type: picmg::PowerType::SteadyState,
+})?;
+// Read-only above. To request a mutation, explicitly construct the command:
+let activation = picmg::SetPicmgActivation {
+    fru_id: location.fru_id,
+    action: picmg::Activation::Activate,
+};
+// ipmi.send_recv(activation)?; // Only after independently authorizing the target.
+```
+
+The VITA counterparts use `vita::{GetVitaCapabilities,GetVitaAddress,
+SetVitaActivation}`. `Ipmi::send_recv` addresses the local BMC by default;
+**reading an IPMB address does not redirect later commands**. Shelf-manager,
+slot, AMC/carrier or VPX FRU commands addressed to a different controller
+require explicit bridged IPMB routing (tracked by #13). Do not attempt a
+remote operation with these local-only defaults. Write commands do not retry
+themselves, and applications must not resend them on a timeout or other
+ambiguous outcome; observe state separately without assuming a readback
+proves whether an activation/reset/cycle occurred.
+
+See the [ipmitool entry-point coverage matrix](docs/group-extensions.md)
+for every supported family, unsupported operations, and fixture coverage.
+
 ## BMC reset and boot overrides
 
 `ipmi_rs::app::{WarmReset, ColdReset}` reset the **management controller**, not the host.

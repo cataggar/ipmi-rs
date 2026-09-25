@@ -1,0 +1,11 @@
+# name | command | request data | success response data | malformed success response data
+properties|00|03|03211000210f02|0321100021
+addrinfo|40|0302|032082000201c00f86|032082
+frucontrol|04|030203|03|
+activate|0c|030201|03|
+policy_get|0b|0302|0383|03
+policy_set|0a|03020f05|03|
+led_prop|05|0302|030004|0300
+led_cap|06|030201|033e010203|033e01
+led_get|08|030201|030700ff0101ff027f|030700ff01
+led_set|07|0302010a0703|03|
