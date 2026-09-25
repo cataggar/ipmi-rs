@@ -74,6 +74,9 @@ pub struct RepositoryInfo {
 
 impl RepositoryInfo {
     pub fn parse(v: &[u8]) -> Option<Self> {
+        if v.len() < 14 {
+            return None;
+        }
         let version_minor = (v[0] & 0xF0) >> 4;
         let version_major = v[0] & 0x0F;
         let record_count = u16::from_le_bytes([v[1], v[2]]);
@@ -82,7 +85,7 @@ impl RepositoryInfo {
         let most_recent_erase = Timestamp::from(u32::from_le_bytes([v[9], v[10], v[11], v[12]]));
         let overflow = (v[13] & 0x80) == 0x80;
 
-        let modality = v[13] & 0x60 >> 5;
+        let modality = (v[13] & 0x60) >> 5;
         let modality = match modality {
             0b00 => Operation::ModalityUnspecified,
             0b01 => Operation::NonModalUpdate,

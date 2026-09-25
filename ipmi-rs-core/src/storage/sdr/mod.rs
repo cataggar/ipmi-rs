@@ -2,7 +2,10 @@ mod get_dev_sdr_info;
 pub use get_dev_sdr_info::*;
 
 mod get_sdr;
-pub use get_sdr::{GetDeviceSdr, RecordInfo as SdrRecordInfo, *};
+pub use get_sdr::{RecordInfo as SdrRecordInfo, *};
+
+mod reserve_sdr;
+pub use reserve_sdr::*;
 
 pub mod record;
 pub use record::{ParseError as RecordParseError, Record};

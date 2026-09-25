@@ -135,4 +135,13 @@ trying a vendor packet on a different BMC. The [OEM coverage matrix](../docs/oem
 tracks unimplemented families, supported hardware, required routes and
 verification limits. Ordinary raw `Message`/`Request` use remains possible.
 
+SDR retrieval uses separate `storage::sdr::GetSdr` (Storage `0x23`) and
+`GetDeviceSdr` (Sensor/Event `0x21`) commands. The latter previously sent the
+repository command; its existing constructor and full-record result are
+retained, but callers relying on its old wire encoding should switch to
+`GetSdr`. `ReserveSdrRepository` and `ReserveDeviceSdr` reserve the respective
+sources. `ReadSdr` and `ReadDeviceSdr` return raw `SdrChunk`s for partial
+requests (the caller must verify the byte count); use `ipmi-rs`'s
+`Ipmi::sdrs_fallible()` for bounded, reservation-aware traversal and errors.
+
 [`ipmi-rs`]: https://crates.io/crates/ipmi-rs
