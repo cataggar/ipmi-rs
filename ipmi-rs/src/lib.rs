@@ -142,11 +142,11 @@ where
             });
         }
 
-        // A malformed or hostile password response might echo the secret.
-        // Keep its completion code, but never attach response bytes to a
-        // Debug-printable error for this command.
+        // Password and Sun replies may echo secrets; omit their bytes from errors.
         let error_data = || {
-            if response.netfn() == connection::NetFn::App && response.cmd() == 0x47 {
+            if (response.netfn() == connection::NetFn::App && response.cmd() == 0x47)
+                || response.netfn().request_value() == 0x2E
+            {
                 Vec::new()
             } else {
                 response.data().to_vec()

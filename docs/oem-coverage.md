@@ -12,7 +12,7 @@ at LUN 0. Routing over RMCP is separately tracked in [#13](https://github.com/ca
 | Family; source | Hardware/firmware indicated by source | Required routing, operations actually implemented in ipmitool | Typed here; remaining work |
 | --- | --- | --- | --- |
 | [Dell `delloem`](https://github.com/cataggar/ipmitool/blob/33f3a0a1b895e3effabb0ec8d180a0a2f1536128/lib/ipmi_delloem.c#L266-L310) | IANA **674**; iDRAC 10G–13G capabilities vary; some 12G/13G features need a license. | Direct BMC LUN 0, OEM 0x30 plus App system-info, Transport, Sensor and Storage commands: `lcd` get/configure/text/KVM/lock, `mac` DRAC/LOM, `lan` NIC get/set/active, `setled` drive mapping, `powermonitor` status/consumption/history/headroom/cap/clear, `vFlash` card status. | `dell::GetPowerCapStatus` (0x30/0xBA read `[01 FF]`) only; remaining groups and capability gates: **[#33](https://github.com/cataggar/ipmi-rs/issues/33)**. |
-| [Sun/Oracle `sunoem`](https://github.com/cataggar/ipmitool/blob/33f3a0a1b895e3effabb0ec8d180a0a2f1536128/lib/ipmi_sunoem.c#L2319-L2429) | Sun IANA **42**; ILOM `getfile` and `getbehavior` require **3.2.0.0+** (source checks version). No product-specific list in the command source. | OEM 0x2E: `version` (0x24), `nacname` (0x29), `ping` (0x23), `led get/set` (0x21/0x22, using SDR generic-device locators and LUN), `sshkey set/del` (0x01/0x02), `cli` (0x19), `getval` (0x2A), `setval` (0x2C, **local host only**), `getfile/getbehavior` via core tunnel (0x44). | `sun::GetVersion` only; remaining reads, bounded multipacket handling, scoped writes and firmware gates: **[#35](https://github.com/cataggar/ipmi-rs/issues/35)**. |
+| [Sun/Oracle `sunoem`](https://github.com/cataggar/ipmitool/blob/33f3a0a1b895e3effabb0ec8d180a0a2f1536128/lib/ipmi_sunoem.c#L2319-L2429) | Sun IANA **42**; ILOM `getfile` and `getbehavior` require **3.2.0.0+** (source checks version). No product-specific list in the command source. | OEM 0x2E: `version` (0x24), `nacname` (0x29), `ping` (0x23), `led get/set` (0x21/0x22, using SDR generic-device locators and LUN), `sshkey set/del` (0x01/0x02), `cli` (0x19), `getval` (0x2A), `setval` (0x2C, **local host only**), `getfile/getbehavior` via core tunnel (0x44). | `sun::GetVersion` plus checked `Ipmi::sun_*` typed and bounded read/write workflows, including firmware checks and local-only `sun_set_value`; see [Sun ILOM operational guide](sun-ilom.md). |
 | [Kontron `kontronoem`](https://github.com/cataggar/ipmitool/blob/33f3a0a1b895e3effabb0ec8d180a0a2f1536128/lib/ipmi_kontronoem.c#L70-L179) | IANA **15000**. Source explicitly describes `nextboot` for **CP6012** (product **6012**). Other FRU operations require board-specific verification. | OEM 0x3E LUN **3** `setsn` (0x0C read + Storage FRU writes), `setmfgdate` (0x0E read + Storage FRU writes), `nextboot` (0x02 write). `set_large_buffer` (0x3E/0x82) negotiates local and remote/IPMB channel lengths with rollback on failure. | `kontron::GetManufacturingDate` (read **only**) and product-gated `SetNextBoot` (CP6012); full FRU writes, channel buffer sequencing: **[#32](https://github.com/cataggar/ipmi-rs/issues/32)**. |
 | [Quanta QCT](https://github.com/cataggar/ipmitool/blob/33f3a0a1b895e3effabb0ec8d180a0a2f1536128/lib/ipmi_quantaoem.c#L79-L174) | IANA **7244**; Get Platform ID enumerates **Grantley** (1) and **Purley** (2), with Purley-specific memory SEL location mapping. | Direct BMC LUN 0 OEM 0x36/0x65 `Get Platform ID` `[4C 1C 00 02]`, invoked from the SEL decoder. No Quanta CLI command or mutation is present. | `quanta::GetPlatformId`, rejecting unknown IDs; confirm real hardware and assess typed SEL location (not CLI text): **[#38](https://github.com/cataggar/ipmi-rs/issues/38)**. |
 | [Kontron FWUM](https://github.com/cataggar/ipmitool/blob/33f3a0a1b895e3effabb0ec8d180a0a2f1536128/lib/ipmi_fwum.c#L145-L218) | Kontron firmware-update manager; compatibility compares firmware **IANA and board product** with target. Board **5002** has special SDR reporting. Do not assume every device exposing Firmware NetFn supports it. | Firmware 0x08: `info` (0x00, plus App Get Device ID), `status` (0x07), `tracelog` (0x0F), `download` (0x0A/0x0B/0x0C), `upgrade` (0x09), `rollback` (0x0E); IPMB/local buffer negotiation via Kontron 0x3E/0x82. | No typed FWUM commands yet; update state machine and device/image safety are separate **[#36](https://github.com/cataggar/ipmi-rs/issues/36)**. |
@@ -46,14 +46,18 @@ at LUN 0. Routing over RMCP is separately tracked in [#13](https://github.com/ca
   [#30](https://github.com/cataggar/ipmi-rs/issues/30). CLI-only file
   handling, terminal formatting, SEL prose and declared but uncalled
   Sun health/fan header constants are excluded, not counted as coverage.
+  Sun version/LED/CLI/core-tunnel fixtures are source-derived; no matched
+  live hardware capture or real-device mutation verification is available.
 
 `Ipmi::send_oem` checks manufacturer and, where specified, product immediately
 before each command. Identity failures and mismatches send no OEM packet;
 command completion codes and timeouts are distinct errors. Raw `Message` /
 `Request` and custom `IpmiCommand` paths remain available without this
 automatic check for applications intentionally implementing other commands.
-The initial typed writes are restricted to Kontron CP6012 nextboot; they do not
-perform automatic retry or reset. A timeout **after** dispatch leaves the
-outcome unknown; confirm on-device state before considering another write.
+Typed writes include Kontron CP6012 nextboot and the explicitly approved Sun
+LED/key/CLI operations. Sun setval additionally requires the host-local
+device-file transport. None perform automatic retry or reset. A timeout
+**after** dispatch leaves the outcome unknown; confirm on-device state before
+considering another write.
 Do not mark #29 complete until each linked family is implemented or explicitly
 excluded with a recorded rationale and verification limits.

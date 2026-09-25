@@ -14,6 +14,8 @@ use crate::connection::{
     Address, IpmiConnection, Message, Request, RequestTargetAddress, Response,
 };
 
+const MAX_DEVICE_RESPONSE: usize = 1 + 9 + 1024; // Completion code + Sun file header + data.
+
 #[repr(C)]
 #[derive(Debug)]
 pub struct IpmiMessage {
@@ -29,7 +31,8 @@ impl IpmiMessage {
     }
 
     fn is_password_command(&self) -> bool {
-        NetFn::from(self.netfn) == NetFn::App && self.cmd == 0x47
+        (NetFn::from(self.netfn) == NetFn::App && self.cmd == 0x47)
+            || NetFn::from(self.netfn).request_value() == 0x2E
     }
 
     fn trace_data(&self) -> String {
@@ -77,6 +80,48 @@ mod password_log_tests {
         };
         assert!(!msg.is_password_command());
         assert_ne!(msg.trace_data(), "[REDACTED]");
+        for netfn in [0x2e, 0x2f] {
+            let msg = IpmiMessage {
+                netfn,
+                cmd: 0x01,
+                data_len: secret.len() as u16,
+                data: secret.as_mut_ptr(),
+            };
+            assert_eq!(msg.trace_data(), "[REDACTED]");
+        }
+    }
+}
+
+#[cfg(test)]
+mod full_block_tests {
+    use super::*;
+
+    #[test]
+    fn local_receive_buffer_holds_complete_sun_file_block() {
+        let mut wire = [0u8; MAX_DEVICE_RESPONSE];
+        wire[5..9].copy_from_slice(&1024u32.to_be_bytes());
+        wire[9] = 1;
+        wire[10..].fill(0xa5);
+        let mut address = IpmiSysIfaceAddr::bmc(0);
+        let received = IpmiRecv {
+            recv_type: 0,
+            addr: std::ptr::addr_of_mut!(address).cast(),
+            addr_len: core::mem::size_of::<IpmiSysIfaceAddr>() as u32,
+            msg_id: 7,
+            message: IpmiMessage {
+                netfn: 0x2f,
+                cmd: 0x44,
+                data_len: wire.len() as u16,
+                data: wire.as_mut_ptr(),
+            },
+        };
+        let response = Response::try_from(received).unwrap();
+        assert_eq!(response.seq(), 7);
+        assert_eq!(response.cc(), 0);
+        assert_eq!(response.data().len(), 9 + 1024);
+        assert_eq!(&response.data()[4..8], &1024u32.to_be_bytes());
+        assert_eq!(response.data()[8], 1);
+        assert_eq!(&response.data()[9..], &[0xa5; 1024]);
     }
 }
 
@@ -356,7 +401,7 @@ impl IpmiConnection for File {
 
         let mut bmc_addr = IpmiSysIfaceAddr::bmc(0);
 
-        let mut response_data = [0u8; 1024];
+        let mut response_data = [0u8; MAX_DEVICE_RESPONSE];
 
         let response_data_len = response_data.len() as u16;
         let response_data_ptr = response_data.as_mut_ptr();
