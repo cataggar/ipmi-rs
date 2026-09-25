@@ -288,10 +288,12 @@ fn fill_ipv6_static_addresses(
             None => break,
         };
 
-        let entry = match response.parse(LanConfigParameter::Ipv6StaticAddresses) {
-            Ok(LanConfigParameterData::Ipv6StaticAddresses(value)) => value,
-            _ => break,
-        };
+        let entry =
+            match response.parse_selected(LanConfigParameter::Ipv6StaticAddresses, set_selector, 0)
+            {
+                Ok(LanConfigParameterData::Ipv6StaticAddresses(value)) => value,
+                _ => break,
+            };
 
         if entry.set_selector != set_selector {
             break;
@@ -328,7 +330,11 @@ fn fill_ipv6_dynamic_addresses(
             None => break,
         };
 
-        let entry = match response.parse(LanConfigParameter::Ipv6DynamicAddress) {
+        let entry = match response.parse_selected(
+            LanConfigParameter::Ipv6DynamicAddress,
+            set_selector,
+            0,
+        ) {
             Ok(LanConfigParameterData::Ipv6DynamicAddress(value)) => value,
             _ => break,
         };
