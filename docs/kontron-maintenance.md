@@ -72,7 +72,7 @@ No other FRU IDs or LUNs are supported by this workflow.
    cannot prove an earlier or in-flight chunk's resulting FRU state. There
    is **no automatic retry or rollback**. A mismatch/readback error also
    requires investigation. Keep the persisted backup, examine a fresh FRU
-   dump and compare both complete areas; a partial area may be unparseable.
+   dump and compare both complete areas; a partial area may be unparsable.
    Only after deliberate operator approval, call
    `restore_kontron_fru_backup(&change, KontronWriteApproval::acknowledge_risk())`.
    Recovery checks the original identity/size and **all other bytes**
