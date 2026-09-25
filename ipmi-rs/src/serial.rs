@@ -34,6 +34,8 @@ pub enum SerialMode {
 pub enum SerialSendError {
     /// The previous request still awaits a response.
     RequestPending,
+    /// A previous request's outcome is unknown; reopen before sending again.
+    ConnectionUncertain,
     /// The target or channel cannot be addressed by this interface.
     UnsupportedTarget,
     /// The request netfn must be a request value.
@@ -129,6 +131,7 @@ pub struct SerialConnection {
     cancellation: CancellationToken,
     sequence: u8,
     pending: Option<Pending>,
+    uncertain: bool,
 }
 
 impl SerialConnection {
@@ -176,12 +179,19 @@ impl SerialConnection {
             cancellation: CancellationToken::default(),
             sequence: 0,
             pending: None,
+            uncertain: false,
         }
     }
 
     /// A sticky cancellation signal. Reset it only after an operation returns.
     pub fn cancellation_token(&self) -> CancellationToken {
         self.cancellation.clone()
+    }
+
+    fn poison_send(&mut self, error: io::Error) -> SerialSendError {
+        self.pending = None;
+        self.uncertain = true;
+        SerialSendError::OutcomeUnknown(error)
     }
 
     fn check(&self, deadline: Instant) -> Result<(), SerialRecvError> {
@@ -392,6 +402,9 @@ impl IpmiConnection for SerialConnection {
     type Error = SerialError;
 
     fn send(&mut self, request: &mut Request) -> Result<(), Self::SendError> {
+        if self.uncertain {
+            return Err(SerialSendError::ConnectionUncertain);
+        }
         if self.pending.is_some() {
             return Err(SerialSendError::RequestPending);
         }
@@ -477,11 +490,12 @@ impl IpmiConnection for SerialConnection {
         let mut offset = 0;
         while offset < wire.len() {
             if self.cancellation.is_cancelled() || Instant::now() >= deadline {
-                self.pending = None;
-                return Err(SerialSendError::OutcomeUnknown(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "serial send timed out or was cancelled; outcome unknown",
-                )));
+                let kind = if self.cancellation.is_cancelled() {
+                    io::ErrorKind::Interrupted
+                } else {
+                    io::ErrorKind::TimedOut
+                };
+                return Err(self.poison_send(io::Error::new(kind, "serial send outcome unknown")));
             }
             match self.port.write(&wire[offset..]) {
                 Ok(0) => break,
@@ -494,16 +508,12 @@ impl IpmiConnection for SerialConnection {
                             | io::ErrorKind::Interrupted
                     ) => {}
                 Err(err) => {
-                    self.pending = None;
-                    return Err(SerialSendError::OutcomeUnknown(err));
+                    return Err(self.poison_send(err));
                 }
             }
         }
         if offset != wire.len() {
-            self.pending = None;
-            return Err(SerialSendError::OutcomeUnknown(io::Error::from(
-                io::ErrorKind::WriteZero,
-            )));
+            return Err(self.poison_send(io::ErrorKind::WriteZero.into()));
         }
         Ok(())
     }
@@ -513,29 +523,35 @@ impl IpmiConnection for SerialConnection {
             .pending
             .take()
             .ok_or(SerialRecvError::NoPendingRequest)?;
-        let mut body = self.receive_matching(pending.outer, pending.deadline)?;
-        let expected = if let Some(inner) = pending.inner {
-            if body[0] != 0 {
-                // The Send Message completion code itself is meaningful.
-                inner
-            } else if body.len() == 1 {
-                body = self.receive_matching(inner, pending.deadline)?;
-                inner
-            } else if body.len() >= 10 {
-                body = parse_ipmb(&body[2..], inner).ok_or(SerialRecvError::InvalidFrame)?;
-                inner
+        let response = (|| {
+            let mut body = self.receive_matching(pending.outer, pending.deadline)?;
+            let expected = if let Some(inner) = pending.inner {
+                if body[0] != 0 {
+                    // The Send Message completion code itself is meaningful.
+                    inner
+                } else if body.len() == 1 {
+                    body = self.receive_matching(inner, pending.deadline)?;
+                    inner
+                } else if body.len() >= 10 {
+                    body = parse_ipmb(&body[2..], inner).ok_or(SerialRecvError::InvalidFrame)?;
+                    inner
+                } else {
+                    return Err(SerialRecvError::InvalidFrame);
+                }
             } else {
-                return Err(SerialRecvError::InvalidFrame);
-            }
-        } else {
-            pending.outer
-        };
-        let netfn = (expected.netfn >> 2) | 1;
-        Response::new(
-            Message::new_raw(netfn, expected.cmd, body),
-            expected.seq as i64,
-        )
-        .ok_or(SerialRecvError::InvalidFrame)
+                pending.outer
+            };
+            let netfn = (expected.netfn >> 2) | 1;
+            Response::new(
+                Message::new_raw(netfn, expected.cmd, body),
+                expected.seq as i64,
+            )
+            .ok_or(SerialRecvError::InvalidFrame)
+        })();
+        if response.is_err() {
+            self.uncertain = true;
+        }
+        response
     }
 
     fn send_recv(&mut self, request: &mut Request) -> Result<Response, Self::Error> {

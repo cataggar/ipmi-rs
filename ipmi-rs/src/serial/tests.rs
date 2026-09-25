@@ -136,7 +136,12 @@ fn basic_bad_checksum_escape_and_unbounded_frames_are_rejected() {
     serial.send(&mut request()).unwrap();
     incoming(&state, &[0xA0, 0xAA, 0xFF, 0xA5]);
     assert!(matches!(serial.recv(), Err(SerialRecvError::InvalidFrame)));
+    assert!(matches!(
+        serial.send(&mut request()),
+        Err(SerialSendError::ConnectionUncertain)
+    ));
 
+    let (mut serial, state) = mock(SerialMode::Basic);
     serial.send(&mut request()).unwrap();
     incoming(&state, &encode(SerialMode::Basic, &[0; MAX_FRAME + 1]));
     assert!(matches!(serial.recv(), Err(SerialRecvError::InvalidFrame)));
@@ -148,27 +153,32 @@ fn terminal_whitespace_validation_and_timeouts() {
     serial.send(&mut request()).unwrap();
     incoming(&state, b"[ 04 04 01 00 ]\r\n");
     assert_eq!(serial.recv().unwrap().cc(), 0);
-    serial.send(&mut request()).unwrap();
-    incoming(&state, b"[GG]\r\n");
-    assert!(matches!(serial.recv(), Err(SerialRecvError::InvalidFrame)));
-
-    let mut req = request();
-    assert!(matches!(
-        serial.send_recv(&mut req),
-        Err(SerialError::OutcomeUnknown(SerialRecvError::Timeout))
-    ));
-    serial.cancellation_token().cancel();
-    assert!(matches!(
-        serial.send(&mut req),
-        Err(SerialSendError::Cancelled)
-    ));
-    serial.cancellation_token().reset();
     assert!(matches!(
         serial.send(&mut Request::new(
             Message::new_request(NetFn::Chassis, 1, vec![0; 38]),
             RequestTargetAddress::Bmc(LogicalUnit::Zero)
         )),
         Err(SerialSendError::RequestTooLong)
+    ));
+    serial.cancellation_token().cancel();
+    assert!(matches!(
+        serial.send(&mut request()),
+        Err(SerialSendError::Cancelled)
+    ));
+    serial.cancellation_token().reset();
+    serial.send(&mut request()).unwrap();
+    incoming(&state, b"[GG]\r\n");
+    assert!(matches!(serial.recv(), Err(SerialRecvError::InvalidFrame)));
+
+    let (mut serial, _) = mock(SerialMode::Terminal);
+    let mut req = request();
+    assert!(matches!(
+        serial.send_recv(&mut req),
+        Err(SerialError::OutcomeUnknown(SerialRecvError::Timeout))
+    ));
+    assert!(matches!(
+        serial.send(&mut req),
+        Err(SerialSendError::ConnectionUncertain)
     ));
 }
 
@@ -261,14 +271,69 @@ fn terminal_bridging_and_embedded_basic_response() {
 }
 
 #[test]
-fn cancellation_after_send_is_uncertain_and_late_response_is_ignored() {
-    let (mut serial, state) = mock(SerialMode::Basic);
-    serial.send(&mut request()).unwrap();
-    serial.cancellation_token().cancel();
-    assert!(matches!(serial.recv(), Err(SerialRecvError::Cancelled)));
-    serial.cancellation_token().reset();
-    serial.send(&mut request()).unwrap();
-    incoming(&state, &response(SerialMode::Basic, 1, 0, &[9]));
-    incoming(&state, &response(SerialMode::Basic, 2, 0, &[7]));
-    assert_eq!(serial.recv().unwrap().data(), &[7]);
+fn ambiguous_exchange_never_wraps_into_stale_reply() {
+    for mode in [SerialMode::Basic, SerialMode::Terminal] {
+        for cancel in [false, true] {
+            let (mut serial, state) = mock(mode);
+            for seq in 1..=63 {
+                incoming(&state, &response(mode, seq, 0, &[seq]));
+                assert_eq!(serial.send_recv(&mut request()).unwrap().data(), &[seq]);
+            }
+
+            // Send #64 uses sequence zero. The next send would wrap to the
+            // first request's sequence, which a late reply can still carry.
+            serial.send(&mut request()).unwrap();
+            if cancel {
+                serial.cancellation_token().cancel();
+                assert!(matches!(serial.recv(), Err(SerialRecvError::Cancelled)));
+                serial.cancellation_token().reset();
+            } else {
+                assert!(matches!(serial.recv(), Err(SerialRecvError::Timeout)));
+            }
+            let bytes_sent = state.lock().unwrap().written.len();
+            incoming(&state, &response(mode, 1, 0, &[0xEE]));
+            assert!(matches!(
+                serial.send_recv(&mut request()),
+                Err(SerialError::Send(SerialSendError::ConnectionUncertain))
+            ));
+            let state = state.lock().unwrap();
+            assert_eq!(state.written.len(), bytes_sent);
+            assert!(!state.incoming.is_empty());
+        }
+    }
+}
+
+#[test]
+fn interrupted_write_also_retires_connection() {
+    struct FailingPort(bool);
+    impl Read for FailingPort {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::TimedOut.into())
+        }
+    }
+    impl Write for FailingPort {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            if !self.0 {
+                self.0 = true;
+                Ok(1)
+            } else {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    for mode in [SerialMode::Basic, SerialMode::Terminal] {
+        let mut serial =
+            SerialConnection::with_port(Box::new(FailingPort(false)), mode, Duration::from_secs(1));
+        assert!(matches!(
+            serial.send(&mut request()),
+            Err(SerialSendError::OutcomeUnknown(_))
+        ));
+        assert!(matches!(
+            serial.send(&mut request()),
+            Err(SerialSendError::ConnectionUncertain)
+        ));
+    }
 }

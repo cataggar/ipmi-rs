@@ -182,11 +182,16 @@ and enforce a single deadline; neither automatically retries a request.
 `cancellation_token().cancel()` interrupts I/O (checked at most every 50 ms
 between serial-port reads/writes); call `reset()` **only after** the operation
 has returned. If a send starts but a response is lost, timed out, or cancelled,
-`SerialError::OutcomeUnknown` (or
+`send_recv` returns `SerialError::OutcomeUnknown` (or
 `SerialError::Send(SerialSendError::OutcomeUnknown(_))` for an interrupted
-write) means the command **may have executed**. Never automatically retry a
-mutation; observe subsequent status separately. Serial responses retain the
-IPMI completion code for typed `Ipmi::send_recv` commands.
+write); standalone `recv` reports `SerialRecvError`. In all cases the command
+**may have executed**. Never automatically retry a mutation; observe subsequent
+status separately. Serial responses retain the IPMI completion code for typed
+`Ipmi::send_recv` commands. After any ambiguous send/receive failure the
+connection refuses further requests with
+`SerialSendError::ConnectionUncertain`; resetting the cancellation token does
+**not** make it safe to reuse the 6-bit sequence number. Reopen the serial
+connection before any later operation.
 
 ## AMI USB virtual-CD via Linux SCSI generic (opt-in)
 
