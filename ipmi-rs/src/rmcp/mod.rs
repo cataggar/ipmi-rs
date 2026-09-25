@@ -442,10 +442,6 @@ impl IpmiConnection for Rmcp {
 
     type Error = RmcpIpmiError;
 
-    fn has_nonrenewable_request_sequences(&self) -> bool {
-        true
-    }
-
     fn send(&mut self, request: &mut crate::connection::Request) -> Result<(), Self::SendError> {
         let active = self.active_state.as_mut().ok_or(RmcpIpmiError::NotActive)?;
         active.send(request)

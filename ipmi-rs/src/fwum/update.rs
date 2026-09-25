@@ -47,9 +47,9 @@ pub enum PrepareError {
     ExistingUpdate,
     /// Payload limit, transport routing or buffer length cannot be represented.
     InvalidTransport,
-    /// Routed RMCP updates remain unimplemented: 64 retired IPMB sequences
-    /// cannot finish even the smallest image with identity checks and cleanup.
-    NonrenewableRequestSequences,
+    /// Transport did not explicitly opt in to long, non-resumable mutations.
+    /// This includes RMCP's 64 retired IPMB sequences and unknown wrappers.
+    UnsupportedLongTransferTransport,
 }
 
 impl<'a> UpdateAuthorization<'a> {
@@ -342,8 +342,8 @@ impl<CON: IpmiConnection> Ipmi<CON> {
             return Err(preflight(PrepareError::ImageTargetMismatch));
         }
         limits.check(target).map_err(preflight)?;
-        if self.inner.has_nonrenewable_request_sequences() {
-            return Err(preflight(PrepareError::NonrenewableRequestSequences));
+        if !self.inner.supports_long_mutation_workflows() {
+            return Err(preflight(PrepareError::UnsupportedLongTransferTransport));
         }
         let baseline = self.fwum_banks(target).map_err(|error| UpdateError {
             phase: UpdatePhase::Prepared,

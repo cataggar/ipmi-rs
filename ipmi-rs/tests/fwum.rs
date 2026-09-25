@@ -130,8 +130,8 @@ impl IpmiConnection for Mock {
     type RecvError = Fault;
     type Error = Fault;
 
-    fn has_nonrenewable_request_sequences(&self) -> bool {
-        self.finite_sequences
+    fn supports_long_mutation_workflows(&self) -> bool {
+        !self.finite_sequences
     }
 
     fn send(&mut self, _: &mut Request) -> Result<(), Self::SendError> {
@@ -217,6 +217,34 @@ impl IpmiConnection for Mock {
         let mut bytes = vec![0];
         bytes.extend(payload);
         Ok(Self::response(netfn, cmd, bytes))
+    }
+}
+
+#[cfg(feature = "kontron-fwum-update")]
+struct Delegating<C> {
+    inner: C,
+    calls: Rc<Cell<usize>>,
+}
+
+#[cfg(feature = "kontron-fwum-update")]
+impl<C: IpmiConnection> IpmiConnection for Delegating<C> {
+    type SendError = C::SendError;
+    type RecvError = C::RecvError;
+    type Error = C::Error;
+
+    fn send(&mut self, request: &mut Request) -> Result<(), Self::SendError> {
+        self.calls.set(self.calls.get() + 1);
+        self.inner.send(request)
+    }
+
+    fn recv(&mut self) -> Result<Response, Self::RecvError> {
+        self.calls.set(self.calls.get() + 1);
+        self.inner.recv()
+    }
+
+    fn send_recv(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
+        self.calls.set(self.calls.get() + 1);
+        self.inner.send_recv(request)
     }
 }
 
@@ -420,7 +448,7 @@ fn minimum_image_is_rejected_before_any_rmcp_packet_or_mutation() {
 
     let rmcp =
         ipmi_rs::rmcp::Rmcp::new("127.0.0.1:623", std::time::Duration::from_secs(1)).unwrap();
-    assert!(rmcp.has_nonrenewable_request_sequences());
+    assert!(!rmcp.supports_long_mutation_workflows());
     let mut ipmi = Ipmi::new(rmcp);
     assert!(matches!(
         ipmi.fwum_prepare_update(
@@ -429,11 +457,11 @@ fn minimum_image_is_rejected_before_any_rmcp_packet_or_mutation() {
             &authorization(&recovery),
             TransportLimits::standard(TransportKind::Bridged)
         ),
-        Err(err) if matches!(err.cause, UpdateCause::Preflight(PrepareError::NonrenewableRequestSequences))
+        Err(err) if matches!(err.cause, UpdateCause::Preflight(PrepareError::UnsupportedLongTransferTransport))
     ));
     let mut rmcp = ipmi.release();
     let wrapped = &mut rmcp;
-    assert!(IpmiConnection::has_nonrenewable_request_sequences(&wrapped));
+    assert!(!IpmiConnection::supports_long_mutation_workflows(&wrapped));
     let direct_bytes = image(77, 15000, 1);
     let direct_recovery = image(77, 15000, 2);
     let mut borrowed = Ipmi::new(wrapped);
@@ -444,7 +472,7 @@ fn minimum_image_is_rejected_before_any_rmcp_packet_or_mutation() {
             &authorization(&direct_recovery),
             TransportLimits::standard(TransportKind::Local)
         ),
-        Err(err) if matches!(err.cause, UpdateCause::Preflight(PrepareError::NonrenewableRequestSequences))
+        Err(err) if matches!(err.cause, UpdateCause::Preflight(PrepareError::UnsupportedLongTransferTransport))
     ));
 
     let mut mock = Mock::kontron();
@@ -457,11 +485,62 @@ fn minimum_image_is_rejected_before_any_rmcp_packet_or_mutation() {
             &authorization(&recovery),
             TransportLimits::negotiated(TransportKind::Bridged, 32, 32).unwrap()
         ),
-        Err(err) if matches!(err.cause, UpdateCause::Preflight(PrepareError::NonrenewableRequestSequences))
+        Err(err) if matches!(err.cause, UpdateCause::Preflight(PrepareError::UnsupportedLongTransferTransport))
     ));
     assert!(ipmi.inner_mut().sent.is_empty());
     assert_eq!(count(ipmi.inner_mut(), 8, 0x0a), 0);
     assert_eq!(count(ipmi.inner_mut(), 0x3e, 0x82), 0);
+}
+
+#[cfg(feature = "kontron-fwum-update")]
+#[test]
+fn unknown_delegating_rmcp_wrapper_fails_closed_without_any_io() {
+    let bytes = image(BOARD, 15000, 1);
+    let recovery = image(BOARD, 15000, 2);
+    let calls = Rc::new(Cell::new(0));
+    let rmcp =
+        ipmi_rs::rmcp::Rmcp::new("127.0.0.1:623", std::time::Duration::from_secs(1)).unwrap();
+    let connection = Delegating {
+        inner: rmcp,
+        calls: Rc::clone(&calls),
+    };
+    assert!(!connection.supports_long_mutation_workflows());
+    let mut ipmi = Ipmi::new(connection);
+    assert!(matches!(
+        ipmi.fwum_prepare_update(
+            bridged(),
+            &bytes,
+            &authorization(&recovery),
+            TransportLimits::negotiated(TransportKind::Bridged, 32, 32).unwrap()
+        ),
+        Err(err) if matches!(err.cause, UpdateCause::Preflight(PrepareError::UnsupportedLongTransferTransport))
+    ));
+    assert_eq!(calls.get(), 0);
+}
+
+#[cfg(feature = "kontron-fwum-update")]
+#[test]
+fn explicitly_safe_direct_transport_still_stages_full_image() {
+    let bytes = image(77, 15000, 1);
+    let recovery = image(77, 15000, 2);
+    let mut connection = Mock::kontron();
+    assert!(connection.supports_long_mutation_workflows());
+    let borrowed = &mut connection;
+    assert!(IpmiConnection::supports_long_mutation_workflows(&borrowed));
+    let mut ipmi = Ipmi::new(borrowed);
+    let mut session = ipmi
+        .fwum_prepare_update(
+            direct(),
+            &bytes,
+            &authorization(&recovery),
+            TransportLimits::standard(TransportKind::Local),
+        )
+        .unwrap();
+    assert_eq!(session.stage(|_| true).unwrap(), 1);
+    drop(session);
+    let _ = ipmi.release();
+    assert_eq!(count(&connection, 8, 0x0a), 1);
+    assert_eq!(count(&connection, 8, 0x0c), 1);
 }
 
 #[cfg(feature = "kontron-fwum-update")]

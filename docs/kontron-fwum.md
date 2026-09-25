@@ -40,9 +40,13 @@ claim support not yet demonstrated by the protocol reference. Until a
 confirmed-boundary reconnect/resume path is verified, `fwum_prepare_update`
 rejects RMCP (direct or bridged) before any packet or 0x3E buffer setup,
 regardless of the caller's transport label.
-Do not change RMCP sequence retirement to work around this limit. A custom
-connection wrapping RMCP must forward the
-`IpmiConnection::has_nonrenewable_request_sequences` capability.
+Do not change RMCP sequence retirement to work around this limit.
+`IpmiConnection::supports_long_mutation_workflows` defaults to **false**:
+unknown transports and delegating wrappers around RMCP cannot accidentally
+bypass this preflight. Only explicitly audited local transports (Linux IPMI
+device files and Linux AMI USB) opt in; `&mut T` forwards the inner transport's
+choice. A custom wrapper must not opt in unless its *entire* transport chain
+can safely complete long uploads. Serial transport is not opted in.
 
 ## On-device write prerequisites
 
