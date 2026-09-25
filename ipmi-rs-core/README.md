@@ -127,4 +127,12 @@ filter/policy listing and enable/disable, including LAN/serial destination
 does not claim those CLI workflows, destination setup, or full filter-entry
 writes.
 
+OEM typed commands live in the opt-in `oem::{dell,sun,kontron,quanta}`
+namespace, executed with `ipmi_rs::Ipmi::send_oem`. This checks Get Device ID
+at the command's destination before sending (manufacturer and, for Kontron
+CP6012 nextboot, product). It returns an unsupported-device error rather than
+trying a vendor packet on a different BMC. The [OEM coverage matrix](../docs/oem-coverage.md)
+tracks unimplemented families, supported hardware, required routes and
+verification limits. Ordinary raw `Message`/`Request` use remains possible.
+
 [`ipmi-rs`]: https://crates.io/crates/ipmi-rs

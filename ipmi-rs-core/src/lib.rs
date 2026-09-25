@@ -9,6 +9,9 @@ pub mod chassis;
 
 pub mod connection;
 
+/// Opt-in, identity-checked vendor-specific IPMI commands.
+pub mod oem;
+
 pub mod storage;
 
 pub mod sensor_event;
