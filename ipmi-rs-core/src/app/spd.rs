@@ -145,7 +145,7 @@ impl Spd {
                     u32::from(ranks) + 1
                 };
                 details.capacity_mib =
-                    module_capacity_with_ranks(raw[4] & 0x0f, raw[13] & 7, raw[12] & 7, ranks, 7);
+                    module_capacity_with_ranks(raw[4] & 0x0f, raw[13] & 7, raw[12] & 7, ranks, 9);
                 details.ecc_width_bits = ecc_width((raw[13] >> 3) & 3);
                 if raw.len() == PAGE_SIZE * 2 {
                     details.manufacturer_jedec_id = Some([raw[320], raw[321]]);
@@ -197,7 +197,11 @@ fn module_capacity_with_ranks(
     if density > max_density || bus > 3 || device > 3 {
         return None;
     }
-    let density_mbit = 256_u32.checked_shl(u32::from(density))?;
+    let density_mbit = match density {
+        8 if max_density == 9 => 12 * 1024,
+        9 if max_density == 9 => 24 * 1024,
+        _ => 256_u32.checked_shl(u32::from(density))?,
+    };
     let bus_width = 8_u32.checked_shl(u32::from(bus))?;
     let device_width = 4_u32.checked_shl(u32::from(device))?;
     if device_width > bus_width {
@@ -285,5 +289,18 @@ mod tests {
         let spd = Spd::decode(bytes.clone()).unwrap();
         assert_eq!(spd.details.capacity_mib, None);
         assert_eq!(spd.raw, bytes);
+    }
+
+    #[test]
+    fn ddr4_non_power_of_two_densities() {
+        let mut bytes = fixture(include_str!("../../tests/fixtures/spd/ddr4.hex"), 512);
+        for (density_code, capacity_mib) in [(8, 24_576), (9, 49_152)] {
+            bytes[4] = density_code;
+            let spd = Spd::decode(bytes.clone()).unwrap();
+            assert_eq!(spd.details.capacity_mib, Some(capacity_mib));
+            assert_eq!(spd.raw, bytes);
+        }
+        bytes[4] = 0x0a;
+        assert_eq!(Spd::decode(bytes).unwrap().details.capacity_mib, None);
     }
 }

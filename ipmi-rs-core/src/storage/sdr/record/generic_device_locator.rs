@@ -16,7 +16,8 @@ use std::num::NonZeroU8;
 /// (record data offsets 0-2).
 #[derive(Debug, Clone)]
 pub struct GenericDeviceRecordKey {
-    /// 7-bit I2C Slave Address of device on the channel.
+    /// 7-bit address of the management controller providing access to the
+    /// device, or zero when the device is directly on IPMB.
     pub device_access_address: u8,
     /// 7-bit I2C Slave Address on the device's bus.
     pub device_slave_address: u8,
@@ -171,7 +172,6 @@ impl GenericDeviceLocator {
             .checked_add(address_index)
             .ok_or(I2cValidationError::InvalidAddress(key.device_slave_address))?;
         let address = I2cAddress::from_7bit(address)?;
-        let controller = I2cAddress::from_7bit(key.device_access_address)?;
         let channel = Channel::new(key.channel_number)
             .ok_or(I2cValidationError::InvalidChannel(key.channel_number))?;
         let bus = I2cBus::new(
@@ -180,10 +180,14 @@ impl GenericDeviceLocator {
                 .map_or(I2cBusKind::Public, |id| I2cBusKind::Private(id.get())),
         )?;
         let command = MasterWriteRead::new(bus, address, write.to_vec(), read)?;
-        if controller.wire_value() == 0x20 && key.channel_number == 0 {
-            // This is the local BMC; its LUN can still be nonzero.
+        if key.device_access_address == 0
+            || (key.device_access_address == 0x10 && key.channel_number == 0)
+        {
+            // Zero denotes a device directly on IPMB, not an I2C address.
+            // The local BMC (20h) also needs no bridged target.
             Ok(command.with_local_lun(key.access_lun))
         } else {
+            let controller = I2cAddress::from_7bit(key.device_access_address)?;
             Ok(command.with_controller(Address(controller.wire_value()), channel, key.access_lun))
         }
     }
@@ -195,7 +199,7 @@ impl GenericDeviceLocator {
     ///
     /// | Offset | Field                              |
     /// |--------|-----------------------------------|
-    /// | 0      | Device Access Address \[7:1\], \[0\] reserved |
+    /// | 0      | Device Access Address \[7:1\] (0 if directly on IPMB), \[0\] reserved |
     /// | 1      | Device Slave Address, channel ms-bit in \[0\] |
     /// | 2      | \[7:5\] Channel Number (ls-3 bits), \[4:3\] Access LUN, \[2:0\] Private Bus ID |
     /// | 3      | \[7:3\] reserved, \[2:0\] Address Span |
@@ -213,7 +217,8 @@ impl GenericDeviceLocator {
         }
 
         // Byte 0: Device Access Address
-        // [7:1] = 7-bit I2C slave address of device on channel
+        // [7:1] = 7-bit address of controller providing access (0 if
+        //         device directly on IPMB)
         // [0] = reserved
         //
         // Reference: IPMI 2.0 Spec, Table 43-6
@@ -397,13 +402,28 @@ mod tests {
     }
 
     #[test]
+    fn direct_on_ipmb_has_no_controller_target() {
+        let direct = fixture(include_str!(
+            "../../../../tests/fixtures/locators/direct-ipmb.hex"
+        ));
+        assert_eq!(direct.record_key.device_access_address, 0);
+        assert_eq!(direct.record_key.private_bus_id, None);
+        let read = direct.read(0x20, 2).unwrap();
+        assert_eq!(read.target(), None);
+        assert_eq!(read.target_lun(), LogicalUnit::Two);
+        let message: Message = read.into();
+        assert_eq!(message.data(), &[0x20, 0xb0, 2, 0x20]);
+        let write = direct.write(0x20, &[0x55]).unwrap();
+        assert_eq!(write.target(), None);
+        assert_eq!(write.target_lun(), LogicalUnit::Two);
+        let message: Message = write.into();
+        assert_eq!(message.data(), &[0x20, 0xb0, 0, 0x20, 0x55]);
+    }
+
+    #[test]
     fn reject_bad_locator_addresses_and_channel() {
         assert_eq!(
             locator(0x20, 0, 0).read(0, 1).unwrap_err(),
-            I2cValidationError::InvalidAddress(0)
-        );
-        assert_eq!(
-            locator(0, 0xa0, 0).read(0, 1).unwrap_err(),
             I2cValidationError::InvalidAddress(0)
         );
         // Channel 12 is reserved in the connection API; its high bit is in

@@ -221,12 +221,15 @@ build validated I2C commands; merely discovering/parsing
 the locator **never sends a command or mutates a device**. Writes must be
 explicitly sent, and their outcomes can be unknown after a timeout. Never
 automatically retry uncertain writes. Controller addresses and LUNs in SDRs
-are honored; remote satellite controllers require bridged RMCP routing
+are honored; device-access address zero denotes a device directly on IPMB
+and uses the local BMC for the Master Write-Read command. Remote satellite
+controllers require bridged RMCP routing
 (tracked in issue #13), not provided by this API alone.
 
 `app::spd::{Spd, SpdPage}` decodes a complete 256-byte SPD image (or two
 pages for DDR4), preserving every unknown byte and memory type. DDR3/DDR4
-capacity, ECC width, raw manufacturer ID, serial and part-number bytes are
+capacity (including DDR4 12Gb/24Gb densities), ECC width, raw manufacturer
+ID, serial and part-number bytes are
 decoded where available. A DDR4 header declaring 512 bytes needs both pages.
 Decoder output never attempts EEPROM writes.
 

@@ -313,11 +313,6 @@ pub trait IpmiCommand: Into<Message> {
         Self::parse_success_response(data)
     }
 
-    /// The target LUN, including when the target is the local BMC.
-    fn target_lun(&self) -> LogicalUnit {
-        LogicalUnit::Zero
-    }
-
     /// Get the intended target [`Address`] and [`Channel`] for this command.
     fn target(&self) -> Option<(Address, Channel)> {
         None
