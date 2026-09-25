@@ -8,6 +8,12 @@ successful response byte. `picmg` uses `0x00`; `vita` uses `0x03`.
 `ipmi-rs-core/tests/fixtures/{picmg,vita}.txt` contains exact request,
 success, rejection (incorrect identifier / unsupported completion), and
 malformed-length fixtures for **every implemented command**.
+PICMG Get Address Info recognizes the four-byte legacy, seven-byte ATCA,
+and eight-byte MTCA carrier response forms; FRU/site fields absent from
+legacy replies are `None`, while the carrier extension byte remains raw.
+PICMG FRU Control acknowledges the group identifier and retains up to
+254 additional opaque bytes in `FruControlAcknowledgement`, without
+retrying the action.
 
 | ipmitool `picmg` entry point | Command | Rust (`picmg` module) | Coverage |
 | --- | --- | --- | --- |

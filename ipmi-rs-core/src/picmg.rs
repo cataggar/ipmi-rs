@@ -42,6 +42,8 @@ group_command!(GetPicmgProperties => PicmgProperties, PICMG_ID, 0x00,
 });
 
 /// Read physical FRU location and IPMB-0 address (`0x01`).
+/// The legacy four-byte reply has no FRU/site fields; MTCA carriers may
+/// return an eighth, opaque byte in [`AddressInfo::optional_bytes`].
 #[derive(Clone, Copy, Debug)]
 pub struct GetPicmgAddress {
     pub fru_id: u8,
@@ -92,13 +94,24 @@ group_command!(SetPicmgPolicy => (), PICMG_ID, 0x0a,
     |v| vec![PICMG_ID, v.fru_id, v.mask, v.value], |data| ack(data, PICMG_ID));
 
 /// Explicit FRU control/reset (`0x04`); quiesce is only valid for an AMC.
+/// A successful response may carry bounded, uninterpreted trailing bytes.
+/// Validate the group ID but do not treat these bytes as a failed reset.
 #[derive(Clone, Copy, Debug)]
 pub struct PicmgFruControl {
     pub fru_id: u8,
     pub action: FruControl,
 }
-group_command!(PicmgFruControl => (), PICMG_ID, 0x04,
-    |v| vec![PICMG_ID, v.fru_id, v.action.value()], |data| ack(data, PICMG_ID));
+/// Successful FRU control acknowledgement, including any vendor-specific bytes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FruControlAcknowledgement {
+    pub optional_bytes: Vec<u8>,
+}
+group_command!(PicmgFruControl => FruControlAcknowledgement, PICMG_ID, 0x04,
+|v| vec![PICMG_ID, v.fru_id, v.action.value()],
+|data| {
+    let b = check(data, PICMG_ID, 1, 255)?;
+    Ok(FruControlAcknowledgement { optional_bytes: b[1..].to_vec() })
+});
 
 /// Read FRU LED inventory (`0x05`).
 #[derive(Clone, Copy, Debug)]

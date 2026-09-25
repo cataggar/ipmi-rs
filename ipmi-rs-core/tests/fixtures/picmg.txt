@@ -1,7 +1,9 @@
 # name | command | request data | success response data | malformed success response data
 properties|00|00|00220f02|0022
-addrinfo|01|0002|002082000201c0|002082
-frucontrol|04|000201|00|
+addrinfo|01|0000|004182ff000100|004182
+addrinfo_legacy|01|0000|004182ff|004182
+addrinfo_carrier|01|0000|004182ff000100a5|004182ff0001
+frucontrol|04|000201|000144|
 activate|0c|000201|00|
 policy_get|0b|0002|0082|00
 policy_set|0a|00020301|00|

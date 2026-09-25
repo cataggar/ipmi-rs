@@ -110,24 +110,32 @@ pub struct AddressInfo {
     pub hardware_address: u8,
     pub ipmb_0_address: u8,
     pub reserved: u8,
-    pub fru_id: u8,
-    pub site_id: u8,
-    pub site_type: u8,
+    pub fru_id: Option<u8>,
+    pub site_id: Option<u8>,
+    pub site_type: Option<u8>,
     pub channel_7_address: Option<u8>,
+    /// Uninterpreted optional response bytes (PICMG carrier extension or VITA fields).
     pub optional_bytes: Vec<u8>,
 }
 
 pub(crate) fn address(data: &[u8], id: u8, vita: bool) -> Result<AddressInfo, GroupError> {
-    let b = check(data, id, 7, if vita { 9 } else { 7 })?;
+    let b = check(data, id, if vita { 7 } else { 4 }, if vita { 9 } else { 8 })?;
+    if !vita && !matches!(b.len(), 4 | 7 | 8) {
+        return Err(GroupError::InvalidLength {
+            min: 4,
+            max: 8,
+            actual: b.len(),
+        });
+    }
     Ok(AddressInfo {
         hardware_address: b[1],
         ipmb_0_address: b[2],
         reserved: b[3],
-        fru_id: b[4],
-        site_id: b[5],
-        site_type: b[6],
+        fru_id: b.get(4).copied(),
+        site_id: b.get(5).copied(),
+        site_type: b.get(6).copied(),
         channel_7_address: b.get(8).copied(),
-        optional_bytes: b[7..].to_vec(),
+        optional_bytes: b.get(7..).unwrap_or(&[]).to_vec(),
     })
 }
 

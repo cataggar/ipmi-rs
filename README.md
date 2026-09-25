@@ -516,13 +516,14 @@ use ipmi_rs::{picmg, vita};
 let properties = ipmi.send_recv(picmg::GetPicmgProperties)?;
 properties.require_supported().expect("supported PICMG extension version");
 let location = ipmi.send_recv(picmg::GetPicmgAddress { fru_id: 0 })?;
+let fru_id = location.fru_id.expect("legacy address reply has no FRU ID");
 let power = ipmi.send_recv(picmg::GetPicmgPower {
-    fru_id: location.fru_id,
+    fru_id,
     power_type: picmg::PowerType::SteadyState,
 })?;
 // Read-only above. To request a mutation, explicitly construct the command:
 let activation = picmg::SetPicmgActivation {
-    fru_id: location.fru_id,
+    fru_id,
     action: picmg::Activation::Activate,
 };
 // ipmi.send_recv(activation)?; // Only after independently authorizing the target.

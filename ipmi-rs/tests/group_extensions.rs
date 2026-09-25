@@ -7,7 +7,7 @@ use ipmi_rs::{
     picmg, vita, Ipmi, IpmiError,
 };
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct TransportError;
 
 struct Mock {
@@ -99,4 +99,35 @@ fn an_ambiguous_activation_result_is_not_retried() {
         Err(IpmiError::Connection(TransportError))
     ));
     assert_eq!(ipmi.inner_mut().sends, 1);
+}
+
+#[test]
+fn fru_control_with_trailing_ack_data_is_not_reported_as_failed_or_retried() {
+    let mut ipmi = Ipmi::new(Mock {
+        reply: Some(vec![0, 0, 0x01, 0x44]),
+        sends: 0,
+    });
+    assert_eq!(
+        ipmi.send_recv(picmg::PicmgFruControl {
+            fru_id: 2,
+            action: picmg::FruControl::WarmReset,
+        }),
+        Ok(picmg::FruControlAcknowledgement {
+            optional_bytes: vec![0x01, 0x44]
+        })
+    );
+    assert_eq!(ipmi.inner_mut().sends, 1);
+
+    ipmi.inner_mut().reply = Some(vec![0, 3, 0x01]);
+    assert!(matches!(
+        ipmi.send_recv(picmg::PicmgFruControl {
+            fru_id: 2,
+            action: picmg::FruControl::WarmReset,
+        }),
+        Err(IpmiError::Command {
+            error: picmg::GroupError::WrongExtension { .. },
+            ..
+        })
+    ));
+    assert_eq!(ipmi.inner_mut().sends, 2);
 }

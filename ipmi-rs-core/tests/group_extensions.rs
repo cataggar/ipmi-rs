@@ -85,7 +85,7 @@ fn picmg_fixtures_cover_each_command_family() {
             .lines()
             .filter(|line| !line.starts_with('#') && !line.is_empty())
             .count(),
-        19
+        21
     );
     fixture_lines(
         include_str!("fixtures/picmg.txt"),
@@ -99,7 +99,9 @@ fn picmg_fixtures_cover_each_command_family() {
             let selector = p::PortSelector::new(2, 17).unwrap();
             match name {
                 "properties" => case!(p::GetPicmgProperties),
-                "addrinfo" => case!(p::GetPicmgAddress { fru_id: 2 }),
+                "addrinfo" | "addrinfo_legacy" | "addrinfo_carrier" => {
+                    case!(p::GetPicmgAddress { fru_id: 0 })
+                }
                 "frucontrol" => case!(p::PicmgFruControl {
                     fru_id: 2,
                     action: p::FruControl::WarmReset
@@ -262,7 +264,7 @@ fn parsed_fields_preserve_unknown_values_and_optional_data() {
             address.site_type,
             address.channel_7_address
         ),
-        (0x82, 0xc0, Some(0x86))
+        (0x82, Some(0xc0), Some(0x86))
     );
     assert_eq!(address.optional_bytes, [0x0f, 0x86]);
     let power = p::GetPicmgPower::parse_success_response(&hex("0082070a141e")).unwrap();
@@ -295,6 +297,110 @@ fn parsed_fields_preserve_unknown_values_and_optional_data() {
         v::GetVitaPolicy::parse_success_response(&hex("0383")),
         Ok(0x83)
     );
+}
+
+#[test]
+fn picmg_address_forms_from_ipmitool_and_carrier_variants() {
+    // The seven-byte response matches ipmitool's tests/transcripts/picmg.tr.
+    let atca = p::GetPicmgAddress::parse_success_response(&hex("004182ff000100")).unwrap();
+    assert_eq!(
+        (atca.hardware_address, atca.ipmb_0_address, atca.reserved),
+        (0x41, 0x82, 0xff)
+    );
+    assert_eq!(
+        (atca.fru_id, atca.site_id, atca.site_type),
+        (Some(0), Some(1), Some(0))
+    );
+    assert!(atca.optional_bytes.is_empty());
+
+    let legacy = p::GetPicmgAddress::parse_success_response(&hex("004182ff")).unwrap();
+    assert_eq!(
+        (
+            legacy.hardware_address,
+            legacy.ipmb_0_address,
+            legacy.reserved
+        ),
+        (0x41, 0x82, 0xff)
+    );
+    assert_eq!(
+        (legacy.fru_id, legacy.site_id, legacy.site_type),
+        (None, None, None)
+    );
+    assert!(legacy.optional_bytes.is_empty());
+
+    let carrier = p::GetPicmgAddress::parse_success_response(&hex("004182ff000100a5")).unwrap();
+    assert_eq!(
+        (carrier.fru_id, carrier.site_id, carrier.site_type),
+        (Some(0), Some(1), Some(0))
+    );
+    assert_eq!(carrier.optional_bytes, [0xa5]);
+    for packet in [
+        "",
+        "00",
+        "004182",
+        "004182ff00",
+        "004182ff0001",
+        "004182ff000100a501",
+    ] {
+        assert!(
+            matches!(
+                p::GetPicmgAddress::parse_success_response(&hex(packet)),
+                Err(p::GroupError::InvalidLength { .. })
+            ),
+            "invalid response {packet}"
+        );
+    }
+    for packet in ["034182ff", "034182ff000100", "034182ff000100a5"] {
+        assert_eq!(
+            p::GetPicmgAddress::parse_success_response(&hex(packet)),
+            Err(p::GroupError::WrongExtension {
+                expected: 0,
+                actual: 3
+            })
+        );
+    }
+    assert!(matches!(
+        v::GetVitaAddress::parse_success_response(&hex("034182ff")),
+        Err(v::GroupError::InvalidLength { .. })
+    ));
+}
+
+#[test]
+fn picmg_fru_control_validates_group_and_bounds_without_rejecting_trailing_data() {
+    for (packet, trailing) in [("00", ""), ("000144", "0144"), ("00aabbcc", "aabbcc")] {
+        assert_eq!(
+            p::PicmgFruControl::parse_success_response(&hex(packet)),
+            Ok(p::FruControlAcknowledgement {
+                optional_bytes: hex(trailing)
+            })
+        );
+    }
+    assert_eq!(
+        p::PicmgFruControl::parse_success_response(&vec![0; 255]),
+        Ok(p::FruControlAcknowledgement {
+            optional_bytes: vec![0; 254]
+        })
+    );
+    assert!(matches!(
+        p::PicmgFruControl::parse_success_response(&[]),
+        Err(p::GroupError::InvalidLength { .. })
+    ));
+    assert!(matches!(
+        p::PicmgFruControl::parse_success_response(&vec![0; 256]),
+        Err(p::GroupError::InvalidLength { .. })
+    ));
+    assert_eq!(
+        p::PicmgFruControl::parse_success_response(&hex("030144")),
+        Err(p::GroupError::WrongExtension {
+            expected: 0,
+            actual: 3
+        })
+    );
+    // Other PICMG setters retain strict acknowledgement parsing.
+    assert!(matches!(
+        p::SetPicmgActivation::parse_success_response(&hex("0001")),
+        Err(p::GroupError::InvalidLength { .. })
+    ));
 }
 
 #[test]
