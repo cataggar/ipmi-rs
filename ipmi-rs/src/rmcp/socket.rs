@@ -1,6 +1,6 @@
 use std::{
     io::ErrorKind,
-    net::UdpSocket,
+    net::{SocketAddr, UdpSocket},
     time::{Duration, Instant},
 };
 use zeroize::Zeroizing;
@@ -115,6 +115,14 @@ impl RmcpIpmiSocket {
         self.policy.operation_cancellation = previous.1;
     }
 
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        self.socket.peer_addr()
+    }
+
     pub fn new(
         socket: UdpSocket,
         policy: TransportPolicy,
@@ -139,6 +147,16 @@ impl RmcpIpmiSocket {
     pub fn deadline(&self) -> Instant {
         self.activation_deadline
             .unwrap_or_else(|| self.policy.deadline())
+    }
+
+    /// Bound an IPMI transaction by its caller's absolute operation deadline.
+    pub(crate) fn limit_deadline(&mut self, deadline: Instant) -> Option<Instant> {
+        self.activation_deadline
+            .replace(self.deadline().min(deadline))
+    }
+
+    pub(crate) fn restore_deadline(&mut self, previous: Option<Instant>) {
+        self.activation_deadline = previous;
     }
 
     pub fn cancellation_token(&self) -> CancellationToken {

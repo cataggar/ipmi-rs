@@ -27,6 +27,7 @@ pub mod auth;
 pub mod i2c;
 pub mod sol;
 pub mod spd;
+pub mod tyan_tsol;
 
 mod reset;
 pub use reset::{ColdReset, UnexpectedResetResponseLength, WarmReset};
