@@ -19,6 +19,9 @@ pub mod serial;
 #[cfg(feature = "ami-usb")]
 pub mod ami_usb;
 
+/// Opt-in, identity-checked OEM command execution.
+pub mod oem;
+
 mod error;
 pub use error::IpmiError;
 
@@ -112,7 +115,9 @@ where
 
         let response = self.inner.send_recv(&mut request)?;
 
-        if response.netfn() != message_netfn || response.cmd() != message_cmd {
+        if response.netfn().request_value() != message_netfn.request_value()
+            || response.cmd() != message_cmd
+        {
             return Err(IpmiError::UnexpectedResponse {
                 netfn_sent: message_netfn,
                 netfn_recvd: response.netfn(),

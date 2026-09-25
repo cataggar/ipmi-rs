@@ -153,6 +153,33 @@ The following IPMI commands are currently supported in `ipmi-rs-core`:
 | Get SDR Repository Allocation Info      | 33.10                 |
 | Get SDR                                 | 33.12                 |
 
+## Opt-in OEM commands
+
+The `ipmi_rs::oem::{dell,sun,kontron,quanta}` modules provide a few typed
+vendor operations. Use `Ipmi::send_oem`, **not** `Ipmi::send_recv`, for these
+commands. It first reads the selected device's ID (at the same BMC/bridged
+IPMB destination on LUN 0), checks vendor and any required product ID, then
+sends the command; an identity or unsupported-device error sends **no** OEM
+command. For example:
+
+```rust
+use ipmi_rs::oem::{dell::GetPowerCapStatus, kontron::{BootDevice, SetNextBoot}};
+
+let status = ipmi.send_oem(GetPowerCapStatus)?;
+// Only when explicitly requested on a verified Kontron CP6012:
+ipmi.send_oem(SetNextBoot(BootDevice::Network))?;
+```
+
+The Kontron boot setter uses OEM LUN 3 and is **not** the generic chassis
+boot-flags command. The sender never automatically repeats an OEM write;
+after a lost response its outcome is unknown. Manufacturer/product matching
+does not establish that a particular firmware supports a command. Raw
+`Message`/`Request` and custom `IpmiCommand` use are still available for other
+hardware, but have no automatic identity guard. The [source-based OEM coverage
+matrix](docs/oem-coverage.md) lists all families, limitations and linked
+implementation issues; compilation and synthetic fixtures do not establish
+full OEM or hardware parity.
+
 ## BMC reset and boot overrides
 
 `ipmi_rs::app::{WarmReset, ColdReset}` reset the **management controller**, not the host.
