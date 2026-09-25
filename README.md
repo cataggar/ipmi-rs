@@ -415,7 +415,12 @@ behind satellite controllers additionally require bridged RMCP routing
 `ipmi_rs::hpm::read_inventory(&mut ipmi)` reads Device ID, HPM.1 capabilities,
 and the general properties, description and current version of every present
 component. It reads rollback and deferred versions only when a component
-advertises those capabilities. Inventory and the typed status commands in
+advertises those capabilities. A supported component can still have no image
+in an optional slot: HPM.1 `0x81` (not supported), `0x83` (invalid property
+selector) and IPMI `0xcb` (requested data absent) on only these two queries
+yield `None` for that version. Other completion codes, lost responses and
+malformed data fail inventory; required properties always remain mandatory.
+Inventory and the typed status commands in
 `ipmi_rs::hpm` / `ipmi_rs_core::hpm` do not require an update feature and never
 write firmware. HPM.1 is **not** vendor-specific FWUM or IME.
 

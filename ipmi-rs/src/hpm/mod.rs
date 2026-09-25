@@ -5,7 +5,7 @@
 
 use ipmi_rs_core::{
     app::{DeviceId, GetDeviceId},
-    connection::{IpmiConnection, NotEnoughData},
+    connection::{CompletionErrorCode, IpmiConnection, NetFn, NotEnoughData},
     hpm::{
         ComponentId, ComponentProperty, FirmwareVersion, GeneralProperties, GetComponentProperty,
         GetTargetCapabilities, HpmResponseError, TargetCapabilities,
@@ -35,9 +35,11 @@ pub struct ComponentInventory {
     pub description: [u8; 12],
     /// Currently running firmware version.
     pub current: FirmwareVersion,
-    /// Reported rollback firmware (only queried when rollback/backup is supported).
+    /// Reported rollback firmware, or `None` if unsupported or no rollback
+    /// image is present (queried only when rollback/backup is advertised).
     pub rollback: Option<FirmwareVersion>,
-    /// Reported deferred firmware (only queried when deferred activation is supported).
+    /// Reported deferred firmware, or `None` if unsupported or no deferred
+    /// image is present (queried only when deferred activation is advertised).
     pub deferred: Option<FirmwareVersion>,
 }
 
@@ -69,8 +71,30 @@ fn property<CON: IpmiConnection, const S: u8>(
         .map_err(InventoryError::Hpm)
 }
 
+fn optional_version<CON: IpmiConnection, const S: u8>(
+    ipmi: &mut Ipmi<CON>,
+    component: ComponentId,
+) -> Result<Option<ComponentProperty>, InventoryError<CON::Error>> {
+    match property::<CON, S>(ipmi, component) {
+        Ok(version) => Ok(Some(version)),
+        Err(InventoryError::Hpm(IpmiError::Failed {
+            netfn: NetFn::Picmg,
+            cmd: 0x2f,
+            completion_code:
+                CompletionErrorCode::CommandSpecific(0x81 | 0x83)
+                | CompletionErrorCode::RequestedDatapointNotPresent,
+            ..
+        })) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Fetch a complete typed inventory, including optional rollback/deferred
-/// versions when the component advertises support. Sends only read commands.
+/// versions when the component advertises support. An optional image slot
+/// returning HPM.1 Not Supported (`0x81`), Invalid Component Property (`0x83`)
+/// or IPMI Requested Data Not Present (`0xcb`) is represented as `None`; all
+/// other errors, including transport and malformed replies, are propagated.
+/// Sends only read commands.
 pub fn read_inventory<CON: IpmiConnection>(
     ipmi: &mut Ipmi<CON>,
 ) -> Result<Inventory, InventoryError<CON::Error>> {
@@ -96,18 +120,22 @@ pub fn read_inventory<CON: IpmiConnection>(
             unreachable!("selector one");
         };
         let rollback = if general.rollback_backup != 0 {
-            let ComponentProperty::Rollback(version) = property::<_, 3>(ipmi, id)? else {
-                unreachable!("selector three");
-            };
-            Some(version)
+            optional_version::<_, 3>(ipmi, id)?.map(|property| {
+                let ComponentProperty::Rollback(version) = property else {
+                    unreachable!("selector three");
+                };
+                version
+            })
         } else {
             None
         };
         let deferred = if general.deferred_activation {
-            let ComponentProperty::Deferred(version) = property::<_, 4>(ipmi, id)? else {
-                unreachable!("selector four");
-            };
-            Some(version)
+            optional_version::<_, 4>(ipmi, id)?.map(|property| {
+                let ComponentProperty::Deferred(version) = property else {
+                    unreachable!("selector four");
+                };
+                version
+            })
         } else {
             None
         };

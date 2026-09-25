@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use ipmi_rs_core::{
-    connection::{IpmiConnection, Message, NetFn, Request, Response},
+    connection::{CompletionErrorCode, IpmiConnection, Message, NetFn, Request, Response},
     hpm::HpmResponseError,
 };
 
@@ -23,6 +23,7 @@ struct Exchange {
     cmd: u8,
     request: Vec<u8>,
     reply: Result<(u8, Vec<u8>), &'static str>,
+    response_cmd: Option<u8>,
 }
 
 #[derive(Debug)]
@@ -62,7 +63,11 @@ impl IpmiConnection for MockController {
         let mut packet = vec![code];
         packet.extend(data);
         Response::new(
-            Message::new_response(request.netfn(), request.cmd(), packet),
+            Message::new_response(
+                request.netfn(),
+                expected.response_cmd.unwrap_or(request.cmd()),
+                packet,
+            ),
             0,
         )
         .ok_or("invalid scripted response")
@@ -74,24 +79,25 @@ fn good(cmd: u8, request: &[u8], response: &[u8]) -> Exchange {
         cmd,
         request: request.to_vec(),
         reply: Ok((0, response.to_vec())),
+        response_cmd: None,
     }
 }
 
-#[cfg(feature = "hpm-update")]
 fn fail(cmd: u8, request: &[u8], code: u8, response: &[u8]) -> Exchange {
     Exchange {
         cmd,
         request: request.to_vec(),
         reply: Ok((code, response.to_vec())),
+        response_cmd: None,
     }
 }
 
-#[cfg(feature = "hpm-update")]
 fn lost(cmd: u8, request: &[u8]) -> Exchange {
     Exchange {
         cmd,
         request: request.to_vec(),
         reply: Err("lost response"),
+        response_cmd: None,
     }
 }
 
@@ -171,6 +177,132 @@ fn inventory_adapts_to_capabilities_and_checks_reply_shapes() {
     assert_eq!(NetFn::Picmg.request_value(), 0x2c);
 }
 
+fn advertised_optional_versions() -> Vec<Exchange> {
+    vec![
+        good(0x01, &[], &[2, 1, 1, 0x02, 0x51, 0, 1, 2, 3, 2, 1]),
+        good(0x2e, &[0], &[0, 0x10, 0x04, 1, 2, 3, 4, 1]),
+        good(0x2f, &[0, 0, 0], &[0, 0x13]),
+        good(0x2f, &[0, 0, 2], &[0; 13]),
+        good(0x2f, &[0, 0, 1], &[0, 1, 2, 3, 4, 5, 6]),
+    ]
+}
+
+#[test]
+fn missing_advertised_optional_version_slots_are_not_inventory_failures() {
+    for (rollback_code, deferred_code) in [(0x81, 0xcb), (0x83, 0x81), (0xcb, 0x83)] {
+        let mut script = advertised_optional_versions();
+        script.push(fail(0x2f, &[0, 0, 3], rollback_code, &[]));
+        script.push(fail(0x2f, &[0, 0, 4], deferred_code, &[]));
+        let mut ipmi = Ipmi::new(MockController::new(script));
+        let found = read_inventory(&mut ipmi).unwrap();
+        assert_eq!(found.components[0].general.rollback_backup, 3);
+        assert!(found.components[0].general.deferred_activation);
+        assert_eq!(found.components[0].rollback, None);
+        assert_eq!(found.components[0].deferred, None);
+        assert_eq!(found.components[0].current.0, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(ipmi.inner_mut().sent.len(), 7);
+        assert!(ipmi.inner_mut().script.is_empty());
+    }
+
+    let mut script = advertised_optional_versions();
+    script.push(fail(0x2f, &[0, 0, 3], 0x81, &[]));
+    script.push(good(0x2f, &[0, 0, 4], &[0, 7, 8, 9, 10, 11, 12]));
+    let mut ipmi = Ipmi::new(MockController::new(script));
+    let found = read_inventory(&mut ipmi).unwrap();
+    assert_eq!(found.components[0].rollback, None);
+    assert_eq!(
+        found.components[0].deferred.unwrap().0,
+        [7, 8, 9, 10, 11, 12]
+    );
+}
+
+#[test]
+fn optional_version_reads_preserve_genuine_errors() {
+    for code in [0x82, 0xc0, 0xc3, 0xcc] {
+        let mut script = advertised_optional_versions();
+        script.push(fail(0x2f, &[0, 0, 3], code, &[]));
+        let mut ipmi = Ipmi::new(MockController::new(script));
+        assert!(matches!(
+            read_inventory(&mut ipmi),
+            Err(super::InventoryError::Hpm(IpmiError::Failed {
+                completion_code,
+                ..
+            })) if completion_code == CompletionErrorCode::try_from(code).unwrap()
+        ));
+        assert_eq!(ipmi.inner_mut().sent.len(), 6);
+    }
+
+    let mut script = advertised_optional_versions();
+    script.push(fail(0x2f, &[0, 0, 3], 0x81, &[]));
+    script.push(fail(0x2f, &[0, 0, 4], 0x82, &[]));
+    let mut ipmi = Ipmi::new(MockController::new(script));
+    assert!(matches!(
+        read_inventory(&mut ipmi),
+        Err(super::InventoryError::Hpm(IpmiError::Failed {
+            completion_code: CompletionErrorCode::CommandSpecific(0x82),
+            ..
+        }))
+    ));
+
+    let mut script = advertised_optional_versions();
+    script.push(lost(0x2f, &[0, 0, 3]));
+    let mut ipmi = Ipmi::new(MockController::new(script));
+    assert!(matches!(
+        read_inventory(&mut ipmi),
+        Err(super::InventoryError::Hpm(IpmiError::Connection(
+            "lost response"
+        )))
+    ));
+
+    for response in [vec![0], vec![1, 1, 2, 3, 4, 5, 6]] {
+        let mut script = advertised_optional_versions();
+        script.push(good(0x2f, &[0, 0, 3], &response));
+        let mut ipmi = Ipmi::new(MockController::new(script));
+        assert!(matches!(
+            read_inventory(&mut ipmi),
+            Err(super::InventoryError::Hpm(IpmiError::Command { .. }))
+        ));
+    }
+
+    let mut script = advertised_optional_versions();
+    let mut wrong = good(0x2f, &[0, 0, 3], &[0, 1, 2, 3, 4, 5, 6]);
+    wrong.response_cmd = Some(0x34);
+    script.push(wrong);
+    let mut ipmi = Ipmi::new(MockController::new(script));
+    assert!(matches!(
+        read_inventory(&mut ipmi),
+        Err(super::InventoryError::Hpm(IpmiError::UnexpectedResponse {
+            cmd_sent: 0x2f,
+            cmd_recvd: 0x34,
+            ..
+        }))
+    ));
+
+    let mut script = advertised_optional_versions();
+    script.truncate(2);
+    script.push(fail(0x2f, &[0, 0, 0], 0x81, &[]));
+    let mut ipmi = Ipmi::new(MockController::new(script));
+    assert!(matches!(
+        read_inventory(&mut ipmi),
+        Err(super::InventoryError::Hpm(IpmiError::Failed {
+            completion_code: CompletionErrorCode::CommandSpecific(0x81),
+            ..
+        }))
+    ));
+
+    let mut script = advertised_optional_versions();
+    script.pop();
+    script.push(fail(0x2f, &[0, 0, 1], 0xcb, &[]));
+    let mut ipmi = Ipmi::new(MockController::new(script));
+    assert!(matches!(
+        read_inventory(&mut ipmi),
+        Err(super::InventoryError::Hpm(IpmiError::Failed {
+            completion_code: CompletionErrorCode::RequestedDatapointNotPresent,
+            ..
+        }))
+    ));
+}
+
 #[cfg(feature = "hpm-update")]
 mod firmware {
     use super::*;
@@ -217,6 +349,23 @@ mod firmware {
 
     fn opts(size: u8, blocks: u32) -> UpdateOptions {
         UpdateOptions::new(size, blocks, false).unwrap()
+    }
+
+    #[test]
+    fn empty_optional_slots_do_not_block_write_free_update_preflight() {
+        let image = fixture(&[7], false, false);
+        let package = Package::parse(&image).unwrap();
+        let mut script = advertised_optional_versions();
+        script.push(fail(0x2f, &[0, 0, 3], 0x81, &[]));
+        script.push(fail(0x2f, &[0, 0, 4], 0xcb, &[]));
+        let mut ipmi = Ipmi::new(MockController::new(script));
+        let inventory = read_inventory(&mut ipmi).unwrap();
+        {
+            let updater = Updater::new(&mut ipmi, &package, &inventory, opts(1, 1)).unwrap();
+            assert_eq!(updater.state().phase, Phase::Prepared);
+        }
+        assert_eq!(ipmi.inner_mut().sent.len(), 7);
+        assert!(ipmi.inner_mut().script.is_empty());
     }
 
     #[test]
