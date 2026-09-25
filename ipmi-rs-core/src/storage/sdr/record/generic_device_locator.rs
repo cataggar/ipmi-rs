@@ -2,7 +2,9 @@
 //!
 //! Reference: IPMI 2.0 Specification, Table 43-6 "SDR Type 10h - Generic Device Locator Record"
 
+use crate::app::i2c::{I2cAddress, I2cBus, I2cBusKind, I2cValidationError, MasterWriteRead};
 use crate::connection::LogicalUnit;
+use crate::connection::{Address, Channel};
 use crate::storage::sdr::record::{SensorId, TypeLengthRaw};
 
 use super::{IdentifiableSensor, ParseError};
@@ -14,7 +16,8 @@ use std::num::NonZeroU8;
 /// (record data offsets 0-2).
 #[derive(Debug, Clone)]
 pub struct GenericDeviceRecordKey {
-    /// 7-bit I2C Slave Address of device on the channel.
+    /// 7-bit address of the management controller providing access to the
+    /// device, or zero when the device is directly on IPMB.
     pub device_access_address: u8,
     /// 7-bit I2C Slave Address on the device's bus.
     pub device_slave_address: u8,
@@ -73,6 +76,122 @@ impl IdentifiableSensor for GenericDeviceLocator {
 }
 
 impl GenericDeviceLocator {
+    /// Build a bounded register read for a device at the locator's first address.
+    ///
+    /// The offset write changes the device's address pointer, not its inventory
+    /// contents. Merely parsing/enumerating locators never sends a command.
+    pub fn read(&self, offset: u8, count: usize) -> Result<MasterWriteRead, I2cValidationError> {
+        self.read_at_address(0, offset, count)
+    }
+
+    /// Build a register read at one of the locator's addresses.
+    pub fn read_at_address(
+        &self,
+        address_index: u8,
+        offset: u8,
+        count: usize,
+    ) -> Result<MasterWriteRead, I2cValidationError> {
+        self.read_raw_at_address(address_index, &[offset], count)
+    }
+
+    /// Build a read with a device-specific write prefix, which may be empty.
+    /// Not all generic devices use a one-byte register offset.
+    pub fn read_raw(
+        &self,
+        write_prefix: &[u8],
+        count: usize,
+    ) -> Result<MasterWriteRead, I2cValidationError> {
+        self.read_raw_at_address(0, write_prefix, count)
+    }
+
+    /// Build a device-specific read at one of the locator's addresses.
+    pub fn read_raw_at_address(
+        &self,
+        address_index: u8,
+        write_prefix: &[u8],
+        count: usize,
+    ) -> Result<MasterWriteRead, I2cValidationError> {
+        if count == 0 {
+            return Err(I2cValidationError::EmptyRead);
+        }
+        self.command(address_index, write_prefix, count)
+    }
+
+    /// Build an explicit register write. No write happens until the caller
+    /// sends this command; do not retry it if its outcome is uncertain.
+    pub fn write(&self, offset: u8, data: &[u8]) -> Result<MasterWriteRead, I2cValidationError> {
+        self.write_at_address(0, offset, data)
+    }
+
+    /// Build an explicit register write at one of the locator's addresses.
+    pub fn write_at_address(
+        &self,
+        address_index: u8,
+        offset: u8,
+        data: &[u8],
+    ) -> Result<MasterWriteRead, I2cValidationError> {
+        if data.is_empty() {
+            return Err(I2cValidationError::EmptyWrite);
+        }
+        let mut write = Vec::with_capacity(1 + data.len());
+        write.push(offset);
+        write.extend_from_slice(data);
+        self.write_raw_at_address(address_index, &write)
+    }
+
+    /// Build an explicit device-specific write without assuming a register
+    /// offset. The caller must decide whether it is safe to send.
+    pub fn write_raw(&self, bytes: &[u8]) -> Result<MasterWriteRead, I2cValidationError> {
+        self.write_raw_at_address(0, bytes)
+    }
+
+    /// Build an explicit device-specific write at a locator address.
+    pub fn write_raw_at_address(
+        &self,
+        address_index: u8,
+        bytes: &[u8],
+    ) -> Result<MasterWriteRead, I2cValidationError> {
+        if bytes.is_empty() {
+            return Err(I2cValidationError::EmptyWrite);
+        }
+        self.command(address_index, bytes, 0)
+    }
+
+    fn command(
+        &self,
+        address_index: u8,
+        write: &[u8],
+        read: usize,
+    ) -> Result<MasterWriteRead, I2cValidationError> {
+        if address_index > self.address_span || address_index > 7 {
+            return Err(I2cValidationError::AddressOutsideSpan(address_index));
+        }
+        let key = &self.record_key;
+        let address = key
+            .device_slave_address
+            .checked_add(address_index)
+            .ok_or(I2cValidationError::InvalidAddress(key.device_slave_address))?;
+        let address = I2cAddress::from_7bit(address)?;
+        let channel = Channel::new(key.channel_number)
+            .ok_or(I2cValidationError::InvalidChannel(key.channel_number))?;
+        let bus = I2cBus::new(
+            key.channel_number,
+            key.private_bus_id
+                .map_or(I2cBusKind::Public, |id| I2cBusKind::Private(id.get())),
+        )?;
+        let command = MasterWriteRead::new(bus, address, write.to_vec(), read)?;
+        if key.device_access_address == 0
+            || (key.device_access_address == 0x10 && key.channel_number == 0)
+        {
+            // Zero denotes a device directly on IPMB, not an I2C address.
+            // The local BMC (20h) also needs no bridged target.
+            Ok(command.with_local_lun(key.access_lun))
+        } else {
+            let controller = I2cAddress::from_7bit(key.device_access_address)?;
+            Ok(command.with_controller(Address(controller.wire_value()), channel, key.access_lun))
+        }
+    }
+
     /// Parse a Generic Device Locator Record from raw SDR record data.
     ///
     /// The record data layout is defined in IPMI 2.0 Specification, Table 43-6.
@@ -80,7 +199,7 @@ impl GenericDeviceLocator {
     ///
     /// | Offset | Field                              |
     /// |--------|-----------------------------------|
-    /// | 0      | Device Access Address \[7:1\], \[0\] reserved |
+    /// | 0      | Device Access Address \[7:1\] (0 if directly on IPMB), \[0\] reserved |
     /// | 1      | Device Slave Address, channel ms-bit in \[0\] |
     /// | 2      | \[7:5\] Channel Number (ls-3 bits), \[4:3\] Access LUN, \[2:0\] Private Bus ID |
     /// | 3      | \[7:3\] reserved, \[2:0\] Address Span |
@@ -98,7 +217,8 @@ impl GenericDeviceLocator {
         }
 
         // Byte 0: Device Access Address
-        // [7:1] = 7-bit I2C slave address of device on channel
+        // [7:1] = 7-bit address of controller providing access (0 if
+        //         device directly on IPMB)
         // [0] = reserved
         //
         // Reference: IPMI 2.0 Spec, Table 43-6
@@ -189,5 +309,128 @@ impl GenericDeviceLocator {
 
     pub fn id_string(&self) -> &SensorId {
         &self.id_string
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::i2c::I2cValidationError;
+    use crate::connection::{IpmiCommand, Message};
+
+    fn locator(access: u8, slave: u8, channel_bus_lun: u8) -> GenericDeviceLocator {
+        let data = [
+            access,
+            slave,
+            channel_bus_lun,
+            1,
+            0,
+            0x09,
+            0,
+            7,
+            1,
+            0,
+            0xc3,
+            b'M',
+            b'E',
+            b'M',
+        ];
+        GenericDeviceLocator::parse(&data).unwrap()
+    }
+
+    fn fixture(text: &str) -> GenericDeviceLocator {
+        let data: Vec<u8> = text
+            .split_ascii_whitespace()
+            .map(|byte| u8::from_str_radix(byte, 16).unwrap())
+            .collect();
+        GenericDeviceLocator::parse(&data).unwrap()
+    }
+
+    #[test]
+    fn private_and_public_locators_and_explicit_writes() {
+        let local = fixture(include_str!(
+            "../../../../tests/fixtures/locators/private.hex"
+        ));
+        let read = local.read_at_address(1, 0x70, 64).unwrap();
+        assert_eq!(read.target(), None);
+        assert_eq!(read.target_lun(), LogicalUnit::One);
+        let message: Message = read.into();
+        assert_eq!(message.data(), &[7, 0xa2, 64, 0x70]);
+        assert_eq!(
+            local.read_at_address(2, 0, 1).unwrap_err(),
+            I2cValidationError::AddressOutsideSpan(2)
+        );
+        assert_eq!(local.read(0, 0).unwrap_err(), I2cValidationError::EmptyRead);
+        assert_eq!(
+            local.write(0, &[]).unwrap_err(),
+            I2cValidationError::EmptyWrite
+        );
+        assert!(matches!(
+            local.write(0, &[0; 64]),
+            Err(I2cValidationError::TransferTooLong { write: 65, read: 0 })
+        ));
+        let write: Message = local.write(0x40, &[0xa5; 63]).unwrap().into();
+        assert_eq!(write.data()[..4], [7, 0xa0, 0, 0x40]);
+        assert_eq!(write.data().len(), 67);
+        let read: Message = local.read_raw(&[], 1).unwrap().into();
+        assert_eq!(read.data(), &[7, 0xa0, 1]);
+        let read: Message = local.read_raw(&[0, 0x40], 2).unwrap().into();
+        assert_eq!(read.data(), &[7, 0xa0, 2, 0, 0x40]);
+        let write: Message = local.write_raw(&[0x55]).unwrap().into();
+        assert_eq!(write.data(), &[7, 0xa0, 0, 0x55]);
+        assert_eq!(
+            local.write_raw(&[]).unwrap_err(),
+            I2cValidationError::EmptyWrite
+        );
+
+        let remote = fixture(include_str!(
+            "../../../../tests/fixtures/locators/public.hex"
+        ));
+        let read = remote.read(0, 1).unwrap();
+        assert_eq!(
+            read.target(),
+            Some((Address(0x22), Channel::new(2).unwrap()))
+        );
+        assert_eq!(read.target_lun(), LogicalUnit::Zero);
+        let message: Message = read.into();
+        assert_eq!(message.data(), &[0x20, 0xb0, 1, 0]);
+        assert_eq!(remote.device_type, 0x09);
+        assert_eq!(
+            locator(0x20, 0xa0, 0x80).read(0, 1).unwrap().target(),
+            Some((Address(0x20), Channel::new(4).unwrap()))
+        );
+    }
+
+    #[test]
+    fn direct_on_ipmb_has_no_controller_target() {
+        let direct = fixture(include_str!(
+            "../../../../tests/fixtures/locators/direct-ipmb.hex"
+        ));
+        assert_eq!(direct.record_key.device_access_address, 0);
+        assert_eq!(direct.record_key.private_bus_id, None);
+        let read = direct.read(0x20, 2).unwrap();
+        assert_eq!(read.target(), None);
+        assert_eq!(read.target_lun(), LogicalUnit::Two);
+        let message: Message = read.into();
+        assert_eq!(message.data(), &[0x20, 0xb0, 2, 0x20]);
+        let write = direct.write(0x20, &[0x55]).unwrap();
+        assert_eq!(write.target(), None);
+        assert_eq!(write.target_lun(), LogicalUnit::Two);
+        let message: Message = write.into();
+        assert_eq!(message.data(), &[0x20, 0xb0, 0, 0x20, 0x55]);
+    }
+
+    #[test]
+    fn reject_bad_locator_addresses_and_channel() {
+        assert_eq!(
+            locator(0x20, 0, 0).read(0, 1).unwrap_err(),
+            I2cValidationError::InvalidAddress(0)
+        );
+        // Channel 12 is reserved in the connection API; its high bit is in
+        // the low bit of the locator's slave-address byte.
+        assert_eq!(
+            locator(0x20, 0xa1, 0x80).read(0, 1).unwrap_err(),
+            I2cValidationError::InvalidChannel(12)
+        );
     }
 }

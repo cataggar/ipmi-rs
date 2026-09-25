@@ -24,7 +24,9 @@ pub use user::{
 };
 
 pub mod auth;
+pub mod i2c;
 pub mod sol;
+pub mod spd;
 
 mod reset;
 pub use reset::{ColdReset, UnexpectedResetResponseLength, WarmReset};

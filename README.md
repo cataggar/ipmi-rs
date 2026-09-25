@@ -194,6 +194,7 @@ The following IPMI commands are currently supported in `ipmi-rs-core`:
 | Get User Summary / Access / Name        | App commands 0x44/0x46 |
 | Set User Access / Privilege / Name      | App commands 0x43/0x45 |
 | Enable / Disable / Set / Test User Password | App command 0x47  |
+| I2C Master Write-Read                   | App command 0x52      |
 | Set / Get System Boot Options            | Chassis commands 0x08/0x09 |
 | Set LAN Configuration Parameters        | 23.1                  |
 | Get LAN Configuration Parameters        | 23.2                  |
@@ -300,6 +301,39 @@ recovery plan](../docs/ime.md) explains operational prerequisites, power-loss
 risks, incomplete-update handling and the lack of hardware validation.
 The current RMCP transport rejects arbitrary bridged IPMB routes ([#13](https://github.com/cataggar/ipmi-rs/issues/13));
 there is no silent fallback to the session BMC.
+
+## I2C devices and SPD
+
+`app::i2c::MasterWriteRead` sends one bounded (64-byte-per-direction)
+transaction with an explicit `I2cBus` (channel plus public/private bus) and
+eight-bit, even `I2cAddress`. A device locator obtained from an SDR can build
+an explicit `read(offset, size)` or `write(offset, bytes)` command:
+
+```rust
+use ipmi_rs::app::i2c::{I2cAddress, I2cBus, I2cBusKind};
+use ipmi_rs::app::spd::{Spd, SpdPage};
+
+let bus = I2cBus::new(0, I2cBusKind::Private(0))?;
+let address = I2cAddress::new(0xa0)?;
+let base = ipmi.read_spd_page(bus, address, SpdPage::LegacyBase, 32)?;
+let spd = Spd::decode(base.to_vec())?; // DDR3 or earlier, one 256-byte page
+
+// For DDR4, explicitly select/read BOTH pages instead:
+let base = ipmi.read_spd_page(bus, address, SpdPage::ddr4(0)?, 32)?;
+let upper = ipmi.read_spd_page(bus, address, SpdPage::ddr4(1)?, 32)?;
+let spd = Spd::decode([base.as_slice(), upper.as_slice()].concat())?;
+```
+
+SPD page selection writes only to the **volatile DDR4 page-select device**
+(0x6C/0x6E); it does not program the EEPROM. Register-pointer reads also
+change the device's transient pointer. No SPD decoding, SDR enumeration, or
+generic locator parsing implicitly writes to an EEPROM. Only an explicitly
+sent generic locator `write` command writes device data. A lost response leaves
+its outcome uncertain: do not automatically resend the write, even if a later
+read appears unchanged. Invalid lengths/addresses and short or extra successful
+responses fail instead of being silently padded or truncated. Remote devices
+behind satellite controllers additionally require bridged RMCP routing
+(issue #13); this work does not provide that routing.
 
 ## BMC reset and boot overrides
 
