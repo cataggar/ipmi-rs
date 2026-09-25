@@ -284,6 +284,65 @@ fn duid_and_dhcp_timing_round_trip_multiple_blocks() {
 }
 
 #[test]
+fn full_width_dhcp_timing_response_fixture_decodes_only_six_block_one_values() {
+    let fixture = include_str!("fixtures/lan_wire.txt");
+    let decode = |prefix: &str| {
+        let line = fixture
+            .lines()
+            .find(|line| line.starts_with(prefix))
+            .unwrap();
+        let response = line.split(':').nth(3).unwrap();
+        let raw = GetLanConfigParameters::parse_success_response(&hex(response)).unwrap();
+        match raw
+            .parse_selected(
+                LanConfigParameter::Ipv6DhcpTiming,
+                2,
+                if prefix.ends_with(":00:") { 0 } else { 1 },
+            )
+            .unwrap()
+        {
+            LanConfigParameterData::Ipv6DhcpTiming(block) => block,
+            other => panic!("unexpected timing parameter: {other:?}"),
+        }
+    };
+    let block_zero = decode("3F:02:00:");
+    let block_one = decode("3F:02:01:11 02 01 11 12 13 14 15 16 00");
+    assert_eq!(block_zero.bytes.len(), 16);
+    assert_eq!(block_one.bytes.len(), 16);
+    let decoded = Ipv6DhcpTiming::from_blocks(&block_zero, &block_one).unwrap();
+    assert_eq!(decoded.values[..16], (1..=16).collect::<Vec<_>>());
+    assert_eq!(decoded.values[16..], [0x11, 0x12, 0x13, 0x14, 0x15, 0x16]);
+}
+
+#[test]
+fn rejected_begin_completion_code_does_not_emit_set_complete() {
+    let mut calls = Vec::new();
+    let writes = [(
+        LanConfigParameter::IpAddress,
+        LanConfigParameterRequest::IpAddress(Ipv4Address([192, 0, 2, 1])),
+    )];
+    let result = lan_write_guarded(
+        |command| {
+            calls.push(Message::from(command).data().to_vec());
+            Err::<(), _>(CompletionErrorCode::CommandSpecific(0x81))
+        },
+        Channel::Current,
+        &writes,
+        |code| match code {
+            CompletionErrorCode::CommandSpecific(0x81) => LanBeginFailure::Rejected,
+            _ => LanBeginFailure::Uncertain,
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(LanWriteError::BeginRejected {
+            error: CompletionErrorCode::CommandSpecific(0x81),
+        })
+    ));
+    assert_eq!(calls, [vec![14, 0, 1]]);
+}
+
+#[test]
 fn guarded_writes_attempt_cleanup_and_never_retry_failed_mutations() {
     let channel = Channel::Current;
     let writes = vec![
