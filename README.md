@@ -48,12 +48,16 @@ let device_records = ipmi.sdrs_from(SdrSource::Device)
 An empty advertised source or a next-record ID of `0xffff` ends normally.
 Errors (including metadata, transport, parsing, inconsistent/short chunks,
 and reservation failures) are returned once, not silently mistaken for end of
-records. The iterator reserves the selected source, reads up to 32 record bytes
+records. The iterator reserves a repository only when its Reserve operation is
+advertised, or Device SDRs only when their population is dynamic; otherwise it
+uses reservation ID zero without issuing `0x22`. It reads up to 32 record bytes
 per request, reduces the chunk size on transfer-size completion errors, and
-restarts a record from its header after a cancelled reservation (up to three
-renewals). Unrecoverable errors are not skipped. The older `ipmi.sdrs()` still
-returns plain records from the **repository** and logs then stops on errors;
-prefer the fallible API for complete inventories.
+restarts a record from its header after a cancelled supported reservation (up
+to three renewals). For non-first records with a mismatched header ID, it
+returns the requested ID, which was used for subsequent reads. Unrecoverable
+errors are not skipped. The older `ipmi.sdrs()` still returns plain records
+from the **repository** and logs then stops on errors; prefer the fallible API
+for complete inventories.
 
 For individual commands, `storage::sdr::GetSdr` now names the repository
 operation. `GetDeviceSdr::new(...)` retains its constructor and full-record

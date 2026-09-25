@@ -38,6 +38,7 @@ pub struct DeviceSdrInfo<T> {
     pub lun_1_has_sensors: bool,
     pub lun_2_has_sensors: bool,
     pub lun_3_has_sensors: bool,
+    /// The 24-bit population change indicator on dynamically populated devices.
     pub sensor_population_epoch: Option<u32>,
 }
 
@@ -67,10 +68,10 @@ impl<T> DeviceSdrInfo<T> {
         let lun_1_has_sensors = (data[1] & 0x02) == 0x02;
         let lun_0_has_sensors = (data[1] & 0x01) == 0x01;
 
-        let sensor_population_epoch = if dynamic_population && data.len() < 6 {
+        let sensor_population_epoch = if dynamic_population && data.len() < 5 {
             return None;
         } else if dynamic_population {
-            Some(u32::from_le_bytes([data[2], data[3], data[4], data[5]]))
+            Some(u32::from_le_bytes([data[2], data[3], data[4], 0]))
         } else {
             None
         };
@@ -129,5 +130,24 @@ impl IpmiCommand for GetDeviceSdrInfo<SensorCount> {
 
     fn parse_success_response(data: &[u8]) -> Result<Self::Output, Self::Error> {
         DeviceSdrInfo::parse(data).ok_or(NotEnoughData)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_device_info_has_three_byte_population_change_indicator() {
+        let info =
+            GetDeviceSdrInfo::<SdrCount>::parse_success_response(&[1, 0x81, 0x34, 0x12, 0x56])
+                .unwrap();
+        assert_eq!(info.operation_value.0, 1);
+        assert!(info.dynamic_population);
+        assert_eq!(info.sensor_population_epoch, Some(0x561234));
+        assert!(matches!(
+            GetDeviceSdrInfo::<SdrCount>::parse_success_response(&[1, 0x81, 0x34, 0x12]),
+            Err(NotEnoughData)
+        ));
     }
 }

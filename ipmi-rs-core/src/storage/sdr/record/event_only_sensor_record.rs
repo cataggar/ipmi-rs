@@ -70,7 +70,7 @@ impl EventOnlySensorRecord {
         let direction_sharing_1 = record_data[7];
         let direction_sharing_2 = record_data[8];
 
-        let direction = Direction::try_from((direction_sharing_1 & 0xC) >> 6)?;
+        let direction = Direction::try_from((direction_sharing_1 & 0xC0) >> 6)?;
         let id_string_instance_modifier = match (direction_sharing_1 & 0x30) >> 4 {
             0b00 => Ok(IdStringModifier::Numeric),
             0b01 => Ok(IdStringModifier::Alpha),

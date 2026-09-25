@@ -29,9 +29,7 @@ mod sel;
 pub use sel::{SelIter, SelIterError, SelMutationError};
 
 use ipmi_rs_core::{
-    connection::{
-        CompletionErrorCode, IpmiCommand, NotEnoughData, Request, RequestTargetAddress,
-    },
+    connection::{CompletionErrorCode, IpmiCommand, NotEnoughData, Request, RequestTargetAddress},
     storage::sdr::{self, Record as SdrRecord},
 };
 use std::{collections::HashSet, num::NonZeroU16};
@@ -232,6 +230,7 @@ pub struct FallibleSdrIter<'ipmi, CON> {
     source: Option<SdrSource>,
     initialized: bool,
     reservation: Option<NonZeroU16>,
+    reservation_supported: bool,
     next_id: Option<sdr::RecordId>,
     seen: HashSet<u16>,
     read_limit: u8,
@@ -244,6 +243,7 @@ impl<'ipmi, CON: connection::IpmiConnection> FallibleSdrIter<'ipmi, CON> {
             source,
             initialized: false,
             reservation: None,
+            reservation_supported: false,
             next_id: Some(sdr::RecordId::FIRST),
             seen: HashSet::new(),
             read_limit: 32,
@@ -275,25 +275,30 @@ impl<'ipmi, CON: connection::IpmiConnection> FallibleSdrIter<'ipmi, CON> {
             };
         }
 
-        let count = match self.source.expect("source initialized") {
+        let (count, reservation_supported) = match self.source.expect("source initialized") {
             SdrSource::Repository => {
-                self.ipmi
+                let info = self
+                    .ipmi
                     .send_recv(sdr::GetSdrRepositoryInfo)
-                    .map_err(SdrError::RepositoryInfo)?
-                    .record_count
+                    .map_err(SdrError::RepositoryInfo)?;
+                (
+                    info.record_count,
+                    info.supported_ops.contains(&sdr::SdrOperation::Reserve),
+                )
             }
-            SdrSource::Device => u16::from(
-                self.ipmi
+            SdrSource::Device => {
+                let info = self
+                    .ipmi
                     .send_recv(sdr::GetDeviceSdrInfo::new(sdr::SdrCount))
-                    .map_err(SdrError::DeviceInfo)?
-                    .operation_value
-                    .0,
-            ),
+                    .map_err(SdrError::DeviceInfo)?;
+                (u16::from(info.operation_value.0), info.dynamic_population)
+            }
         };
 
+        self.reservation_supported = reservation_supported;
         if count == 0 {
             self.next_id = None;
-        } else {
+        } else if reservation_supported {
             self.reserve()?;
         }
         self.initialized = true;
@@ -389,6 +394,9 @@ impl<'ipmi, CON: connection::IpmiConnection> FallibleSdrIter<'ipmi, CON> {
             let (body, _) = self.read_bytes(body_id, 5, body_len, Some(next_id))?;
             header.extend_from_slice(&body);
         }
+        if !id.is_first() {
+            header[..2].copy_from_slice(&id.value().to_le_bytes());
+        }
         let record = SdrRecord::parse(&header).map_err(|error| SdrError::Parse {
             record_id: id,
             error,
@@ -410,7 +418,8 @@ impl<'ipmi, CON: connection::IpmiConnection> FallibleSdrIter<'ipmi, CON> {
                     completion_code: CompletionErrorCode::ReservationCancelledOrInvalidId,
                     ..
                 }))
-            ) {
+            ) && self.reservation_supported
+            {
                 if attempt == 3 {
                     return Err(SdrError::ReservationLost(id));
                 }
