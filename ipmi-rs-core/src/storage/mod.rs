@@ -35,6 +35,13 @@ impl From<u32> for Timestamp {
     }
 }
 
+impl Timestamp {
+    /// Raw IPMI timestamp in seconds (zero denotes an unspecified time).
+    pub fn seconds(self) -> u32 {
+        self.0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AllocInfo {
     pub num_alloc_units: Option<NonZeroU16>,
