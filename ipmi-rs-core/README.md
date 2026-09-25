@@ -141,6 +141,11 @@ CP6012 nextboot, product). It returns an unsupported-device error rather than
 trying a vendor packet on a different BMC. The [OEM coverage matrix](../docs/oem-coverage.md)
 tracks unimplemented families, supported hardware, required routes and
 verification limits. Ordinary raw `Message`/`Request` use remains possible.
+The `ipmi-rs` crate's `Ipmi::dell()` additionally checks the 10G–13G iDRAC
+type and per-operation readable capabilities before explicit LCD, NIC, SES
+drive, and power writes. The core `dell::GetPowerCapStatus` remains a simple
+representative read, not the generation-gated higher-level interface.
+
 Intel ME reads additionally require device ID 0, revision 0, IANA 343,
 product 0x0B00 and an explicit bridged IPMB target. Firmware mutations
 are available only through the `ipmi-rs` checked IME workflow; see the

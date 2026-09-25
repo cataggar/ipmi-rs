@@ -11,7 +11,7 @@ at LUN 0. Routing over RMCP is separately tracked in [#13](https://github.com/ca
 
 | Family; source | Hardware/firmware indicated by source | Required routing, operations actually implemented in ipmitool | Typed here; remaining work |
 | --- | --- | --- | --- |
-| [Dell `delloem`](https://github.com/cataggar/ipmitool/blob/33f3a0a1b895e3effabb0ec8d180a0a2f1536128/lib/ipmi_delloem.c#L266-L310) | IANA **674**; iDRAC 10G–13G capabilities vary; some 12G/13G features need a license. | Direct BMC LUN 0, OEM 0x30 plus App system-info, Transport, Sensor and Storage commands: `lcd` get/configure/text/KVM/lock, `mac` DRAC/LOM, `lan` NIC get/set/active, `setled` drive mapping, `powermonitor` status/consumption/history/headroom/cap/clear, `vFlash` card status. | `dell::GetPowerCapStatus` (0x30/0xBA read `[01 FF]`) only; remaining groups and capability gates: **[#33](https://github.com/cataggar/ipmi-rs/issues/33)**. |
+| [Dell `delloem`](https://github.com/cataggar/ipmitool/blob/33f3a0a1b895e3effabb0ec8d180a0a2f1536128/lib/ipmi_delloem.c#L266-L310) | IANA **674**; 10G DRAC, 11G iDRAC6, 12G iDRAC7, 13G iDRAC8; 11G modular forbids LAN selection; 12G/13G modular permits dedicated only; some 12G/13G responses require a license. **Generation mapping is from source, not tested on live hardware.** | Direct BMC LUN 0, OEM 0x30 plus App system-info, Transport, Sensor and Storage commands: `lcd` get/configure/text/KVM/lock, `mac` DRAC/LOM, `lan` NIC get/set/active, `setled` drive mapping, `powermonitor` status/consumption/history/headroom/cap/clear, `vFlash` card status (local Open/WMI only). | `Ipmi::dell()` provides typed reads and explicit guarded writes for all listed groups ([#33](https://github.com/cataggar/ipmi-rs/issues/33)); `dell::GetPowerCapStatus` remains a simple standalone read. Sensor reads require a BMC-owned LUN-0 sensor and SDR-based conversion to watts. Nonlocal sensor routing and hardware-verified firmware capabilities remain unverified; raw messages remain available. |
 | [Sun/Oracle `sunoem`](https://github.com/cataggar/ipmitool/blob/33f3a0a1b895e3effabb0ec8d180a0a2f1536128/lib/ipmi_sunoem.c#L2319-L2429) | Sun IANA **42**; ILOM `getfile` and `getbehavior` require **3.2.0.0+** (source checks version). No product-specific list in the command source. | OEM 0x2E: `version` (0x24), `nacname` (0x29), `ping` (0x23), `led get/set` (0x21/0x22, using SDR generic-device locators and LUN), `sshkey set/del` (0x01/0x02), `cli` (0x19), `getval` (0x2A), `setval` (0x2C, **local host only**), `getfile/getbehavior` via core tunnel (0x44). | `sun::GetVersion` plus checked `Ipmi::sun_*` typed and bounded read/write workflows, including firmware checks and local-only `sun_set_value`; see [Sun ILOM operational guide](sun-ilom.md). |
 | [Kontron `kontronoem`](https://github.com/cataggar/ipmitool/blob/33f3a0a1b895e3effabb0ec8d180a0a2f1536128/lib/ipmi_kontronoem.c#L70-L179) | IANA **15000**. Source explicitly describes `nextboot` for **CP6012** (product **6012**). Other FRU operations require board-specific verification. | OEM 0x3E LUN **3** `setsn` (0x0C read + Storage FRU writes), `setmfgdate` (0x0E read + Storage FRU writes), `nextboot` (0x02 write). `set_large_buffer` (0x3E/0x82) negotiates local and remote/IPMB channel lengths with failure restoration. | `kontron::{GetSerialNumber,GetManufacturingDate,SetNextBoot,SetLargeBuffer}`, plus guarded FRU prepare/apply and explicit recovery; maintenance and hardware limits in **[Kontron maintenance](kontron-maintenance.md)**. FWUM remains **[#36](https://github.com/cataggar/ipmi-rs/issues/36)**. |
 | [Quanta QCT](https://github.com/cataggar/ipmitool/blob/33f3a0a1b895e3effabb0ec8d180a0a2f1536128/lib/ipmi_quantaoem.c#L79-L174) | IANA **7244**; Get Platform ID enumerates **Grantley** (1) and **Purley** (2), with Purley-specific memory SEL location mapping. | Direct BMC LUN 0 OEM 0x36/0x65 `Get Platform ID` `[4C 1C 00 02]`, invoked from the SEL decoder. No Quanta CLI command or mutation is present. | `quanta::GetPlatformId`, rejecting unknown IDs; confirm real hardware and assess typed SEL location (not CLI text): **[#38](https://github.com/cataggar/ipmi-rs/issues/38)**. |
@@ -55,11 +55,44 @@ command completion codes and timeouts are distinct errors. Raw `Message` /
 `Request` and custom `IpmiCommand` paths remain available without this
 automatic check for applications intentionally implementing other commands.
 Typed writes include Kontron CP6012 nextboot, checked board/product FRU updates,
-and explicitly approved Sun LED/key/CLI operations. Sun setval additionally
-requires the host-local device-file transport. None perform automatic retry or
-reset. A timeout **after** dispatch leaves the outcome unknown; confirm
-on-device state before considering another write. The Kontron FRU workflow
-validates both areas and requires retained backups and explicit approval; see
-[maintenance/recovery](kontron-maintenance.md).
+approved Sun LED/key/CLI operations, and the explicitly requested Dell writes
+in `Ipmi::dell()`.
+Sun setval additionally requires the host-local device-file transport.
+None retries after a timeout. Dell's iDRAC
+generation is read from App selector `DD` / block 2 before writes; the
+individual operation probes status/capability before sending. Unknown models,
+locked LCDs, unlicensed/unsupported responses, absent drives and read-only
+power caps fail closed. See [Dell-specific recovery](#dell-generation-guards-and-recovery).
+The Kontron FRU workflow validates both areas and requires retained backups
+and explicit approval; see [maintenance/recovery](kontron-maintenance.md).
+As elsewhere, a timeout **after** dispatch leaves the outcome unknown;
+confirm on-device state before considering another write.
 Do not mark #29 complete until each linked family is implemented or explicitly
 excluded with a recorded rationale and verification limits.
+
+## Dell generation guards and recovery
+
+`Ipmi::dell()` requires IANA 674 and App 0x59/DD block 2 reporting known IMC
+types: 10G `08`, 11G `0A/0B`, Master Lite `0D/0E`, 12G `10/11`, or 13G
+`20/21/22`. Unknown/CMC types fail closed. Every request rechecks IANA.
+Writes recheck IMC type and perform read-only prerequisites: LCD E7 status
+(ViewAndModify required), C2 mode/CF text capacity, NIC 25/29 current
+selection, drive D5 firmware support and BDF mapping, BA cap flags and EA
+min/max budget, or power monitor 9C before clear. No mutation is performed
+implicitly by a read. The 12G/13G dedicated-NIC license error `6F`,
+unsupported `C1/CB` and vFlash embedded unlicensed `33` are surfaced, not
+turned into zero-valued results. A generic connection cannot independently
+prove that it is Open/WMI: callers must assert `LocalVflash::Open/Wmi` only
+for genuinely local connections; ipmitool refuses vFlash over LAN/LAN+.
+
+Only the ipmitool C source and the local R630 *SDR* sample provide model
+information. **No Dell OEM command capture, tested iDRAC firmware version,
+or licensed live BMC run is available.** The `ipmi-rs/tests/oem.rs` fixtures
+cover Dell synthetic command bytes and the decoder tests exercise malformed,
+short, unsupported and unlicensed responses; they are not hardware captures.
+Before deploying writes, schedule a maintenance window, save LCD/NIC/power
+configuration and drive mapping, confirm out-of-band access and target drive,
+and record rollback to the saved values. A NIC change may sever the current
+IPMI connection. On a timeout or partial LCD block write, first re-read the
+actual state via a fresh verified connection; **never blindly replay** a
+mutation or presume a failed send left the device unchanged.
