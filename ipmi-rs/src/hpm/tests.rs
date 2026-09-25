@@ -174,7 +174,7 @@ fn inventory_adapts_to_capabilities_and_checks_reply_shapes() {
             ..
         }))
     ));
-    assert_eq!(NetFn::Picmg.request_value(), 0x2c);
+    assert_eq!(NetFn::Reserved(0x2c).request_value(), 0x2c);
 }
 
 fn advertised_optional_versions() -> Vec<Exchange> {

@@ -78,7 +78,7 @@ fn optional_version<CON: IpmiConnection, const S: u8>(
     match property::<CON, S>(ipmi, component) {
         Ok(version) => Ok(Some(version)),
         Err(InventoryError::Hpm(IpmiError::Failed {
-            netfn: NetFn::Picmg,
+            netfn: NetFn::Reserved(0x2d),
             cmd: 0x2f,
             completion_code:
                 CompletionErrorCode::CommandSpecific(0x81 | 0x83)

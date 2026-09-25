@@ -5,8 +5,10 @@
 
 use crate::connection::{IpmiCommand, Message, NetFn};
 
+const HPM_NETFN: NetFn = NetFn::Reserved(0x2c);
+
 fn request(cmd: u8, data: Vec<u8>) -> Message {
-    Message::new_request(NetFn::Picmg, cmd, data)
+    Message::new_request(HPM_NETFN, cmd, data)
 }
 
 /// Invalid or unsupported HPM.1 response data.
@@ -497,7 +499,7 @@ mod tests {
     #[test]
     fn picmg_reads_parse_exact_bytes() {
         let cap_request: Message = GetTargetCapabilities.into();
-        assert_eq!(cap_request.netfn(), NetFn::Picmg);
+        assert_eq!(cap_request.netfn(), HPM_NETFN);
         assert_eq!(cap_request.cmd(), 0x2e);
         assert_eq!(cap_request.data(), [0]);
         let cap = GetTargetCapabilities::parse_success_response(&[0, 0x10, 0xff, 1, 2, 3, 4, 0x81])
