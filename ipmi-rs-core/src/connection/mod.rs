@@ -197,6 +197,18 @@ pub trait IpmiConnection {
     /// The type of error the can occur when sending a [`Request`] or receiving a [`Response`].
     type Error: core::fmt::Debug + From<Self::SendError> + From<Self::RecvError>;
 
+    /// Explicitly support long, non-resumable mutation workflows.
+    ///
+    /// Fail closed: unknown transports and wrappers must not start such a
+    /// workflow. Implementations may opt in only after establishing that a
+    /// complete image transfer (including identity checks and cleanup) cannot
+    /// exhaust their request correlation space. `&mut T` forwards this flag;
+    /// other wrappers must assess both their own and the inner transport's
+    /// behavior before explicitly opting in.
+    fn supports_long_mutation_workflows(&self) -> bool {
+        false
+    }
+
     /// Send `request` to the remote end of this connection.
     fn send(&mut self, request: &mut Request) -> Result<(), Self::SendError>;
 
@@ -226,6 +238,10 @@ impl<T: IpmiConnection + ?Sized> IpmiConnection for &mut T {
     type SendError = T::SendError;
     type RecvError = T::RecvError;
     type Error = T::Error;
+
+    fn supports_long_mutation_workflows(&self) -> bool {
+        (**self).supports_long_mutation_workflows()
+    }
 
     fn send(&mut self, request: &mut Request) -> Result<(), Self::SendError> {
         (**self).send(request)

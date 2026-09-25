@@ -6,7 +6,7 @@
 //! sent. This does not prove a firmware feature or eliminate device swaps
 //! between the two transactions; those require on-device verification.
 
-pub use ipmi_rs_core::oem::{dell, kontron, quanta, OemCommand};
+pub use ipmi_rs_core::oem::{dell, fwum, kontron, quanta, OemCommand};
 
 /// Bounded Sun/Oracle ILOM commands and workflows.
 pub mod sun;
@@ -43,7 +43,7 @@ pub enum OemError<ConnectionError, CommandError> {
     Command(IpmiError<ConnectionError, CommandError>),
 }
 
-struct TargetDeviceId(Option<(Address, Channel)>);
+pub(crate) struct TargetDeviceId(pub(crate) Option<(Address, Channel)>);
 
 impl From<TargetDeviceId> for Message {
     fn from(_: TargetDeviceId) -> Self {

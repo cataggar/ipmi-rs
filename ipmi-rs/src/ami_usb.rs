@@ -322,6 +322,10 @@ mod linux {
         type RecvError = AmiUsbError;
         type Error = AmiUsbError;
 
+        fn supports_long_mutation_workflows(&self) -> bool {
+            true
+        }
+
         fn send(&mut self, request: &mut Request) -> Result<(), Self::SendError> {
             if self.uncertain {
                 return Err(AmiUsbError::ConnectionUncertain);

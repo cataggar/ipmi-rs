@@ -534,6 +534,10 @@ impl IpmiConnection for File {
     type RecvError = io::Error;
     type Error = io::Error;
 
+    fn supports_long_mutation_workflows(&self) -> bool {
+        true
+    }
+
     fn send(&mut self, request: &mut Request) -> io::Result<()> {
         let mut addr: IpmiAddr = match request.target() {
             RequestTargetAddress::BmcOrIpmb(a, _, lun) if a == self.my_addr => {
