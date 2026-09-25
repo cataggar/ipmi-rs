@@ -36,6 +36,8 @@ pub use kontron_workflow::{
     KontronFruBackup, KontronFruChange, KontronFruError, KontronWriteApproval, KontronWriteFailure,
 };
 
+pub mod hpm;
+
 mod error;
 pub use error::IpmiError;
 

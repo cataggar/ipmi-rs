@@ -22,5 +22,7 @@ pub mod sensor_event;
 
 pub mod transport;
 
+pub mod hpm;
+
 #[cfg(test)]
 mod tests;

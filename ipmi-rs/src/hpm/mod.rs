@@ -1,0 +1,128 @@
+//! HPM.1 component inventory and explicit firmware update workflow.
+//!
+//! Inventory and status reads work without `hpm-update`. Firmware mutation is
+//! opt-in and never triggered by inspecting or parsing a package.
+
+use ipmi_rs_core::{
+    app::{DeviceId, GetDeviceId},
+    connection::{IpmiConnection, NotEnoughData},
+    hpm::{
+        ComponentId, ComponentProperty, FirmwareVersion, GeneralProperties, GetComponentProperty,
+        GetTargetCapabilities, HpmResponseError, TargetCapabilities,
+    },
+};
+
+use crate::{Ipmi, IpmiError};
+
+#[cfg(feature = "hpm-update")]
+pub mod package;
+#[cfg(feature = "hpm-update")]
+pub mod update;
+#[cfg(feature = "hpm-update")]
+pub use ipmi_rs_core::hpm::AbortUpgrade;
+
+#[cfg(test)]
+mod tests;
+
+/// A single component's reported firmware state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ComponentInventory {
+    /// Component index.
+    pub id: ComponentId,
+    /// Raw general component properties.
+    pub general: GeneralProperties,
+    /// Description bytes; may not be valid text.
+    pub description: [u8; 12],
+    /// Currently running firmware version.
+    pub current: FirmwareVersion,
+    /// Reported rollback firmware (only queried when rollback/backup is supported).
+    pub rollback: Option<FirmwareVersion>,
+    /// Reported deferred firmware (only queried when deferred activation is supported).
+    pub deferred: Option<FirmwareVersion>,
+}
+
+/// Read-only device ID, HPM.1 capabilities and all present components.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Inventory {
+    /// Device identity (also used for package compatibility checks).
+    pub device: DeviceId,
+    /// HPM.1 capabilities.
+    pub capabilities: TargetCapabilities,
+    /// Properties for the components present in the capabilities response.
+    pub components: Vec<ComponentInventory>,
+}
+
+/// Error reading device identity or HPM.1 inventory.
+#[derive(Debug)]
+pub enum InventoryError<E> {
+    /// Failed to get the IPMI device ID.
+    Device(IpmiError<E, NotEnoughData>),
+    /// Failed to get or parse PICMG HPM.1 properties.
+    Hpm(IpmiError<E, HpmResponseError>),
+}
+
+fn property<CON: IpmiConnection, const S: u8>(
+    ipmi: &mut Ipmi<CON>,
+    component: ComponentId,
+) -> Result<ComponentProperty, InventoryError<CON::Error>> {
+    ipmi.send_recv(GetComponentProperty::<S>::new(component))
+        .map_err(InventoryError::Hpm)
+}
+
+/// Fetch a complete typed inventory, including optional rollback/deferred
+/// versions when the component advertises support. Sends only read commands.
+pub fn read_inventory<CON: IpmiConnection>(
+    ipmi: &mut Ipmi<CON>,
+) -> Result<Inventory, InventoryError<CON::Error>> {
+    let device = ipmi
+        .send_recv(GetDeviceId)
+        .map_err(InventoryError::Device)?;
+    let capabilities = ipmi
+        .send_recv(GetTargetCapabilities)
+        .map_err(InventoryError::Hpm)?;
+    let mut components = Vec::new();
+    for id in 0..8 {
+        let id = ComponentId::new(id).expect("HPM component number");
+        if capabilities.components & id.bit() == 0 {
+            continue;
+        }
+        let ComponentProperty::General(general) = property::<_, 0>(ipmi, id)? else {
+            unreachable!("selector zero");
+        };
+        let ComponentProperty::Description(description) = property::<_, 2>(ipmi, id)? else {
+            unreachable!("selector two");
+        };
+        let ComponentProperty::Current(current) = property::<_, 1>(ipmi, id)? else {
+            unreachable!("selector one");
+        };
+        let rollback = if general.rollback_backup != 0 {
+            let ComponentProperty::Rollback(version) = property::<_, 3>(ipmi, id)? else {
+                unreachable!("selector three");
+            };
+            Some(version)
+        } else {
+            None
+        };
+        let deferred = if general.deferred_activation {
+            let ComponentProperty::Deferred(version) = property::<_, 4>(ipmi, id)? else {
+                unreachable!("selector four");
+            };
+            Some(version)
+        } else {
+            None
+        };
+        components.push(ComponentInventory {
+            id,
+            general,
+            description,
+            current,
+            rollback,
+            deferred,
+        });
+    }
+    Ok(Inventory {
+        device,
+        capabilities,
+        components,
+    })
+}

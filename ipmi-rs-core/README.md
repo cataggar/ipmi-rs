@@ -251,4 +251,13 @@ Use the opt-in, identity-checked `ipmi_rs::rmcp::Rmcp` TSOL lifecycle rather
 than sending commands directly to unknown devices. TSOL is not RMCP+ SOL or
 Intel ISOL.
 
+`hpm` provides typed PICMG HPM.1 target capabilities, component properties,
+and upgrade/rollback/self-test status reads. Explicit backup/prepare/upload/
+finish/activation/rollback/abort commands require the `hpm-update` feature.
+The higher-level `ipmi-rs::hpm` API validates an entire package before any
+write, bounds the transfer and reports uncertain mutation outcomes without
+implicit retries; see the [HPM.1 usage and recovery guide][hpm].
+
+[hpm]: ../ipmi-rs/README.md#hpm1-firmware-inventory-and-upgrades
+
 [`ipmi-rs`]: https://crates.io/crates/ipmi-rs
