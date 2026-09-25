@@ -72,15 +72,31 @@ pub fn apply_config_file(
 }
 
 fn classify_begin_error<C, P>(err: &IpmiError<C, P>) -> LanBeginFailure {
-    match err {
+    let completion_code = match err {
         IpmiError::Failed {
-            completion_code: CompletionErrorCode::CommandSpecific(0x80..=0x83),
-            ..
+            completion_code, ..
         }
         | IpmiError::Command {
-            completion_code: Some(CompletionErrorCode::CommandSpecific(0x80..=0x83)),
+            completion_code: Some(completion_code),
             ..
-        } => LanBeginFailure::Rejected,
+        } => *completion_code,
+        _ => return LanBeginFailure::Uncertain,
+    };
+    match completion_code {
+        CompletionErrorCode::CommandSpecific(0x80..=0x83)
+        | CompletionErrorCode::NodeBusy
+        | CompletionErrorCode::InvalidCommand
+        | CompletionErrorCode::InvalidCommandForLun
+        | CompletionErrorCode::OutOfSpace
+        | CompletionErrorCode::RequestDataTruncated
+        | CompletionErrorCode::RequestDataLenInvalid
+        | CompletionErrorCode::RequestDataLengthLimitExceeded
+        | CompletionErrorCode::ParameterOutOfRange
+        | CompletionErrorCode::InvalidDataFieldInRequest
+        | CompletionErrorCode::CommandIllegalForSensorOrRecord
+        | CompletionErrorCode::InsufficientPrivilege
+        | CompletionErrorCode::CannotExecuteCommandInCurrentState
+        | CompletionErrorCode::SubFunctionDisabled => LanBeginFailure::Rejected,
         _ => LanBeginFailure::Uncertain,
     }
 }
@@ -190,7 +206,7 @@ fn prepare_writes(config: &LanConfigInput, force_write_all: bool) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ipmi_rs::connection::NetFn;
+    use ipmi_rs::connection::{Message, NetFn};
 
     #[test]
     fn invalid_example_config_fails_before_any_write() {
@@ -230,9 +246,99 @@ mod tests {
             };
             assert_eq!(classify_begin_error(&rejected), LanBeginFailure::Rejected);
         }
+        for code in [
+            CompletionErrorCode::NodeBusy,
+            CompletionErrorCode::InvalidCommand,
+            CompletionErrorCode::RequestDataLenInvalid,
+            CompletionErrorCode::InvalidDataFieldInRequest,
+            CompletionErrorCode::InsufficientPrivilege,
+        ] {
+            let rejected = IpmiError::<(), ()>::Failed {
+                netfn: NetFn::Transport,
+                cmd: 1,
+                completion_code: code,
+                data: Vec::new(),
+            };
+            assert_eq!(classify_begin_error(&rejected), LanBeginFailure::Rejected);
+        }
+        let node_busy_from_command = IpmiError::<(), ()>::Command {
+            error: (),
+            netfn: NetFn::Transport,
+            cmd: 1,
+            completion_code: Some(CompletionErrorCode::NodeBusy),
+            data: Vec::new(),
+        };
+        assert_eq!(
+            classify_begin_error(&node_busy_from_command),
+            LanBeginFailure::Rejected
+        );
+        let timed_out = IpmiError::<(), ()>::Failed {
+            netfn: NetFn::Transport,
+            cmd: 1,
+            completion_code: CompletionErrorCode::ProcessingTimeout,
+            data: Vec::new(),
+        };
+        assert_eq!(classify_begin_error(&timed_out), LanBeginFailure::Uncertain);
         assert_eq!(
             classify_begin_error(&IpmiError::<(), ()>::Connection(())),
             LanBeginFailure::Uncertain
         );
+    }
+
+    #[test]
+    fn node_busy_begin_never_sends_complete_but_lost_ack_does() {
+        let writes = [(
+            LanConfigParameter::IpAddress,
+            LanConfigParameterRequest::IpAddress(ipmi_rs::transport::Ipv4Address([192, 0, 2, 1])),
+        )];
+        let mut calls = Vec::new();
+        let result = lan_write_guarded(
+            |command| {
+                calls.push(Message::from(command).data().to_vec());
+                Err::<(), _>(IpmiError::<(), ()>::Failed {
+                    netfn: NetFn::Transport,
+                    cmd: 1,
+                    completion_code: CompletionErrorCode::NodeBusy,
+                    data: Vec::new(),
+                })
+            },
+            Channel::Current,
+            &writes,
+            classify_begin_error,
+        );
+        assert!(matches!(
+            result,
+            Err(LanWriteError::BeginRejected {
+                error: IpmiError::Failed {
+                    completion_code: CompletionErrorCode::NodeBusy,
+                    ..
+                }
+            })
+        ));
+        assert_eq!(calls, [vec![14, 0, 1]]);
+
+        calls.clear();
+        let result = lan_write_guarded(
+            |command| {
+                let bytes = Message::from(command).data().to_vec();
+                calls.push(bytes.clone());
+                if bytes == [14, 0, 1] {
+                    Err(IpmiError::<(), ()>::Connection(()))
+                } else {
+                    Ok(())
+                }
+            },
+            Channel::Current,
+            &writes,
+            classify_begin_error,
+        );
+        assert!(matches!(
+            result,
+            Err(LanWriteError::BeginUncertain {
+                error: IpmiError::Connection(()),
+                cleanup: None
+            })
+        ));
+        assert_eq!(calls, [vec![14, 0, 1], vec![14, 0, 0]]);
     }
 }

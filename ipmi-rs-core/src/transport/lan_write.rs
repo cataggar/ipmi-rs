@@ -78,7 +78,7 @@ pub fn lan_write_guarded<E: core::fmt::Debug>(
 /// Whether a failed Set In Progress definitely did not acquire the transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LanBeginFailure {
-    /// The BMC definitively rejected the begin (for example, error 0x81).
+    /// The BMC definitively rejected the begin (for example, 0x81 or Node Busy).
     Rejected,
     /// The begin may have succeeded; cleanup is necessary even if it also fails.
     Uncertain,
