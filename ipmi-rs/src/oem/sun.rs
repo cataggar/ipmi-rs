@@ -850,7 +850,7 @@ mod tests {
                 0xc0 | name.len() as u8,
             ];
             record.extend_from_slice(name);
-            self.reply(0x0a, 0x23, 0, &record);
+            self.reply(0x04, 0x21, 0, &record);
         }
     }
 
@@ -951,7 +951,8 @@ mod tests {
         )
         .unwrap();
         let sent = ipmi.release().sent;
-        assert_eq!(sent[0].cmd, 0x23);
+        assert_eq!(sent[0].netfn, 0x04);
+        assert_eq!(sent[0].cmd, 0x21);
         assert_eq!(sent[0].data, [0, 0, 0, 0, 0, 0xff]);
         assert_eq!(sent[1].target, RequestTargetAddress::Bmc(LogicalUnit::Zero));
         assert_eq!(
