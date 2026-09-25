@@ -159,7 +159,7 @@ The following IPMI commands are currently supported in `ipmi-rs-core`:
 
 ## Opt-in OEM commands
 
-The `ipmi_rs::oem::{dell,sun,kontron,quanta}` modules provide a few typed
+The `ipmi_rs::oem::{dell,sun,kontron,quanta,ime}` modules provide a few typed
 vendor operations. Use `Ipmi::send_oem`, **not** `Ipmi::send_recv`, for these
 commands. It first reads the selected device's ID (at the same BMC/bridged
 IPMB destination on LUN 0), checks vendor and any required product ID, then
@@ -183,6 +183,21 @@ hardware, but have no automatic identity guard. The [source-based OEM coverage
 matrix](docs/oem-coverage.md) lists all families, limitations and linked
 implementation issues; compilation and synthetic fixtures do not establish
 full OEM or hardware parity.
+
+### Intel ME firmware inventory and maintenance
+
+`Ipmi::ime_info(target)` reads the selected Intel Manageability Engine's
+version, image/status and update capabilities. `Ipmi::ime_update(target,
+&validated_image)` and `Ipmi::ime_rollback(target)` are explicit, bounded
+workflows, not CLI file handling. `ValidatedImage::new(bytes, expected_size,
+expected_crc8)` requires independently trusted metadata **before** any
+network operation. Each step rechecks the exact device ID 0 / revision 0 /
+Intel IANA 343 / product 0x0B00 at the selected bridged IPMB destination.
+Never resend a mutation after an uncertain outcome. The [maintenance and
+recovery plan](../docs/ime.md) explains operational prerequisites, power-loss
+risks, incomplete-update handling and the lack of hardware validation.
+The current RMCP transport rejects arbitrary bridged IPMB routes ([#13](https://github.com/cataggar/ipmi-rs/issues/13));
+there is no silent fallback to the session BMC.
 
 ## BMC reset and boot overrides
 

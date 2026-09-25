@@ -127,12 +127,16 @@ filter/policy listing and enable/disable, including LAN/serial destination
 does not claim those CLI workflows, destination setup, or full filter-entry
 writes.
 
-OEM typed commands live in the opt-in `oem::{dell,sun,kontron,quanta}`
+OEM typed commands live in the opt-in `oem::{dell,sun,kontron,quanta,ime}`
 namespace, executed with `ipmi_rs::Ipmi::send_oem`. This checks Get Device ID
 at the command's destination before sending (manufacturer and, for Kontron
 CP6012 nextboot, product). It returns an unsupported-device error rather than
 trying a vendor packet on a different BMC. The [OEM coverage matrix](../docs/oem-coverage.md)
 tracks unimplemented families, supported hardware, required routes and
 verification limits. Ordinary raw `Message`/`Request` use remains possible.
+Intel ME reads additionally require device ID 0, revision 0, IANA 343,
+product 0x0B00 and an explicit bridged IPMB target. Firmware mutations
+are available only through the `ipmi-rs` checked IME workflow; see the
+[IME safety plan](../docs/ime.md).
 
 [`ipmi-rs`]: https://crates.io/crates/ipmi-rs

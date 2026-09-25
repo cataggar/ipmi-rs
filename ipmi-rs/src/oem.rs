@@ -8,6 +8,9 @@
 
 pub use ipmi_rs_core::oem::{dell, kontron, quanta, sun, OemCommand};
 
+/// Intel ME inventory and guarded firmware operations.
+pub mod ime;
+
 use crate::{
     app::{DeviceId, GetDeviceId},
     connection::{
