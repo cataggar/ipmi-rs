@@ -337,9 +337,10 @@ state before attempting another mutation.
 
 ## Opt-in OEM commands
 
-The `ipmi_rs::oem::{dell,sun,kontron,quanta,ime}` modules provide a few typed
-vendor operations. Use `Ipmi::send_oem`, **not** `Ipmi::send_recv`, for these
-commands. It first reads the selected device's ID (at the same BMC/bridged
+The `ipmi_rs::oem::{dell,sun,kontron,quanta,ime}` modules provide typed
+vendor operations. Use `Ipmi::send_oem` for the individual foundation
+commands and `Ipmi::dell()` for the generation/capability-checked Dell
+operations. The sender first reads the selected device's ID (at the BMC/bridged
 IPMB destination on LUN 0), checks vendor and any required product ID, then
 sends the command; an identity or unsupported-device error sends **no** OEM
 command. For example:
@@ -409,6 +410,36 @@ read appears unchanged. Invalid lengths/addresses and short or extra successful
 responses fail instead of being silently padded or truncated. Remote devices
 behind satellite controllers additionally require bridged RMCP routing
 (issue #13); this work does not provide that routing.
+## Dell iDRAC OEM commands
+
+Dell's typed client checks manufacturer **674** and the iDRAC type reported by
+App Get System Info selector `DD`, block 2. For example (inside a function
+that already owns `&mut ipmi`):
+
+```rust
+use ipmi_rs::oem::dell::{WriteIntent, LcdMode};
+
+let mut dell = ipmi.dell()?;
+let previous = dell.lcd_config()?;
+let headroom = dell.power_headroom()?;
+// Only under an authorized maintenance window, with a documented rollback:
+dell.set_lcd_mode(WriteIntent, LcdMode::Model)?;
+// Re-read lcd_config() and compare with `previous` to verify the write.
+```
+
+Other reads cover LCD status/caps/text, DRAC/LOM MAC, NIC mode/active link,
+power monitor/instant/headroom/history/budget, BMC-owned power sensors, drive
+mapping and local-only vFlash card information. Explicit `WriteIntent` is
+required for LCD text/config/KVM/lock, NIC selection, drive SES status and
+power-cap enable/limit/clear. Writes recheck iDRAC type and relevant readable
+capabilities. A timeout or partial multi-block LCD write **must not** be
+automatically replayed. Changing the active NIC can disconnect this connection;
+verify the management path and have a rollback plan before any write.
+`PowerBudget::cap` is a `PowerCapValue::Watts(u16)` or
+`PowerCapValue::BtuPerHour(u16)` matching the **unconverted wire value**;
+`min_watts` and `max_watts` are always in watts. Unknown cap units are
+rejected. `set_power_budget` takes watts and writes unit 0, rather than
+silently interpreting a saved BTU/hr cap as watts.
 
 ## HPM.1 firmware inventory and upgrades
 

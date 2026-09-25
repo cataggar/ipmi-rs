@@ -6,10 +6,13 @@
 //! sent. This does not prove a firmware feature or eliminate device swaps
 //! between the two transactions; those require on-device verification.
 
-pub use ipmi_rs_core::oem::{dell, fwum, kontron, quanta, OemCommand};
+pub use ipmi_rs_core::oem::{fwum, kontron, quanta, OemCommand};
 
 /// Bounded Sun/Oracle ILOM commands and workflows.
 pub mod sun;
+
+/// Dell iDRAC commands and generation-checked operations.
+pub mod dell;
 
 /// Intel ME inventory and guarded firmware operations.
 pub mod ime;
