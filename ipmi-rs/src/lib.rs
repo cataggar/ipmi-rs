@@ -427,9 +427,7 @@ impl<CON: connection::IpmiConnection> Iterator for FallibleSdrIter<'_, CON> {
     type Item = Result<SdrRecord, SdrError<CON::Error>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.next_id.is_none() {
-            return None;
-        }
+        self.next_id?;
         if !self.initialized {
             if let Err(err) = self.initialize() {
                 self.next_id = None;
