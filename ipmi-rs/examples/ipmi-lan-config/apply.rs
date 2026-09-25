@@ -6,10 +6,12 @@ use crate::parse::{
 use crate::types::{ConfigInput, LanConfigInput};
 
 use ipmi_rs::{
-    connection::Channel,
+    connection::{Channel, CompletionErrorCode},
     transport::{
-        lan_write_guarded, Ipv6HeaderFlowLabel, LanConfigParameter, LanConfigParameterRequest,
+        lan_write_guarded, Ipv6HeaderFlowLabel, LanBeginFailure, LanConfigParameter,
+        LanConfigParameterRequest, LanWriteError,
     },
+    IpmiError,
 };
 
 type Write = (LanConfigParameter, LanConfigParameterRequest);
@@ -52,15 +54,35 @@ pub fn apply_config_file(
             |command| ipmi.send_recv(command),
             channel,
             &writes,
+            classify_begin_error,
         )
         .map_err(|err| {
+            let outcome = if matches!(&err, LanWriteError::BeginRejected { .. }) {
+                "transaction rejected without taking the lock"
+            } else {
+                "write outcome may be uncertain; do not retry automatically"
+            };
             std::io::Error::other(format!(
-                "LAN channel {} write outcome may be uncertain; do not retry automatically: {err:?}",
-                channel.value()
+                "LAN channel {} {outcome}: {err:?}",
+                channel.value(),
             ))
         })?;
     }
     Ok(())
+}
+
+fn classify_begin_error<C, P>(err: &IpmiError<C, P>) -> LanBeginFailure {
+    match err {
+        IpmiError::Failed {
+            completion_code: CompletionErrorCode::CommandSpecific(0x80..=0x83),
+            ..
+        }
+        | IpmiError::Command {
+            completion_code: Some(CompletionErrorCode::CommandSpecific(0x80..=0x83)),
+            ..
+        } => LanBeginFailure::Rejected,
+        _ => LanBeginFailure::Uncertain,
+    }
 }
 
 fn required<T>(value: Option<T>, name: &str) -> Result<T, String> {
@@ -168,6 +190,7 @@ fn prepare_writes(config: &LanConfigInput, force_write_all: bool) -> Result<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ipmi_rs::connection::NetFn;
 
     #[test]
     fn invalid_example_config_fails_before_any_write() {
@@ -188,10 +211,28 @@ mod tests {
             |_command| -> Result<(), ()> { panic!("no write should be sent") },
             Channel::Current,
             &writes,
+            |_| LanBeginFailure::Uncertain,
         );
         assert!(matches!(
             result,
             Err(ipmi_rs::transport::LanWriteError::Validation(_))
         ));
+    }
+
+    #[test]
+    fn completed_rejections_leave_other_writers_alone_but_lost_ack_is_uncertain() {
+        for code in 0x80..=0x83 {
+            let rejected = IpmiError::<(), ()>::Failed {
+                netfn: NetFn::Transport,
+                cmd: 1,
+                completion_code: CompletionErrorCode::CommandSpecific(code),
+                data: Vec::new(),
+            };
+            assert_eq!(classify_begin_error(&rejected), LanBeginFailure::Rejected);
+        }
+        assert_eq!(
+            classify_begin_error(&IpmiError::<(), ()>::Connection(())),
+            LanBeginFailure::Uncertain
+        );
     }
 }

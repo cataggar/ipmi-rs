@@ -405,7 +405,7 @@ impl Ipv6Duid {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ipv6DhcpTiming {
     pub set_selector: u8,
-    /// 16 bytes in block 0 and 6 bytes in block 1.
+    /// 16 meaningful bytes in block 0 and 6 in block 1 (followed by 10 padding bytes).
     pub values: [u8; 22],
 }
 
@@ -422,18 +422,26 @@ impl Ipv6DhcpTiming {
             return Err(LanConfigError::InvalidBlockSequence);
         }
         length(&first.bytes, 16)?;
-        length(&second.bytes, 6)?;
+        if second.bytes.len() != 6 && second.bytes.len() != 16 {
+            return Err(LanConfigError::InvalidLength {
+                expected: 16,
+                actual: second.bytes.len(),
+            });
+        }
         let mut values = [0; 22];
         values[..16].copy_from_slice(&first.bytes);
-        values[16..].copy_from_slice(&second.bytes);
+        values[16..].copy_from_slice(&second.bytes[..6]);
         Ok(Self {
             set_selector: first.set_selector,
             values,
         })
     }
 
-    /// Return the two individually addressable wire blocks.
+    /// Return two full-width 18-byte wire blocks (including the two selectors).
+    /// The ten unused data bytes in block 1 are zero-filled.
     pub fn blocks(self) -> [Ipv6LanBlock; 2] {
+        let mut second = vec![0; 16];
+        second[..6].copy_from_slice(&self.values[16..]);
         [
             Ipv6LanBlock {
                 set_selector: self.set_selector,
@@ -443,7 +451,7 @@ impl Ipv6DhcpTiming {
             Ipv6LanBlock {
                 set_selector: self.set_selector,
                 block_selector: 1,
-                bytes: self.values[16..].to_vec(),
+                bytes: second,
             },
         ]
     }

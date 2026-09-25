@@ -9,15 +9,17 @@ use super::{
 
 /// Apply one LAN configuration transaction: begin, ordered writes, commit, cleanup.
 ///
-/// All requests are validated *before* begin. Failed begin is followed only by
-/// cleanup; failed write stops subsequent writes and skips commit. Every path
-/// after begin attempts Set Complete, including uncertain connection failures.
-/// A failed cleanup is returned alongside the primary error. No command is
-/// retried. Applications must confirm network-disruptive changes separately.
+/// All requests are validated *before* begin. The caller classifies a failed
+/// begin: a confirmed rejection leaves another writer's lock untouched, while
+/// an uncertain outcome (e.g. a lost acknowledgement) attempts cleanup.
+/// Failed writes stop subsequent writes and skip commit. Every path after a
+/// successful begin attempts Set Complete. A failed cleanup is returned
+/// alongside the primary error. No command is retried.
 pub fn lan_write_guarded<E: core::fmt::Debug>(
     mut send: impl FnMut(SetLanConfigParameters) -> Result<(), E>,
     channel: Channel,
     writes: &[(LanConfigParameter, LanConfigParameterRequest)],
+    classify_begin: impl FnOnce(&E) -> LanBeginFailure,
 ) -> Result<(), LanWriteError<E>> {
     let mut validated = Vec::with_capacity(writes.len());
     for (parameter, request) in writes {
@@ -44,8 +46,11 @@ pub fn lan_write_guarded<E: core::fmt::Debug>(
             .expect("valid state")
     };
     if let Err(error) = send(status(LanSetInProgress::InProgress)) {
+        if classify_begin(&error) == LanBeginFailure::Rejected {
+            return Err(LanWriteError::BeginRejected { error });
+        }
         let cleanup = send(status(LanSetInProgress::Complete)).err();
-        return Err(LanWriteError::Begin { error, cleanup });
+        return Err(LanWriteError::BeginUncertain { error, cleanup });
     }
     for (index, command) in validated.into_iter().enumerate() {
         if let Err(error) = send(command) {
@@ -70,13 +75,24 @@ pub fn lan_write_guarded<E: core::fmt::Debug>(
     }
 }
 
+/// Whether a failed Set In Progress definitely did not acquire the transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LanBeginFailure {
+    /// The BMC definitively rejected the begin (for example, error 0x81).
+    Rejected,
+    /// The begin may have succeeded; cleanup is necessary even if it also fails.
+    Uncertain,
+}
+
 /// Transaction failure; an unacknowledged write or cleanup may have succeeded.
 #[derive(Debug)]
 pub enum LanWriteError<E> {
     /// Invalid requests: nothing was sent.
     Validation(LanConfigError),
-    /// Begin failed, and a cleanup was still attempted.
-    Begin { error: E, cleanup: Option<E> },
+    /// Begin was definitively rejected; cleanup was not sent.
+    BeginRejected { error: E },
+    /// Begin may have succeeded; cleanup was attempted and its error retained.
+    BeginUncertain { error: E, cleanup: Option<E> },
     /// Write, commit, or cleanup failed; inspect each outcome. Never retry blindly.
     Uncertain {
         write: Option<(usize, E)>,

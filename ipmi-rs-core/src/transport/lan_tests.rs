@@ -233,9 +233,36 @@ fn duid_and_dhcp_timing_round_trip_multiple_blocks() {
     };
     let [first, second] = timing.blocks();
     assert_eq!(first.wire().len(), 18);
-    assert_eq!(second.wire().len(), 8);
+    assert_eq!(second.wire().len(), 18);
+    assert_eq!(&second.bytes[..6], &[9; 6]);
+    assert_eq!(&second.bytes[6..], &[0; 10]);
+    let command: Message = SetLanConfigParameters::checked(
+        Channel::Current,
+        LanConfigParameterRequest::Ipv6DhcpTiming(second.clone()),
+    )
+    .unwrap()
+    .into();
+    assert_eq!(&command.data()[..4], &[14, 63, 2, 1]);
+    assert_eq!(command.data().len(), 20);
     assert_eq!(
         Ipv6DhcpTiming::from_blocks(&first, &second).unwrap(),
+        timing
+    );
+    let short = Ipv6LanBlock::new(2, 1, second.bytes[..6].to_vec()).unwrap();
+    assert_eq!(Ipv6DhcpTiming::from_blocks(&first, &short).unwrap(), timing);
+    assert!(SetLanConfigParameters::checked(
+        Channel::Current,
+        LanConfigParameterRequest::Ipv6DhcpTiming(short),
+    )
+    .is_err());
+    let padded = Ipv6LanBlock::new(2, 1, {
+        let mut value = second.bytes.clone();
+        value[15] = 0xff;
+        value
+    })
+    .unwrap();
+    assert_eq!(
+        Ipv6DhcpTiming::from_blocks(&first, &padded).unwrap(),
         timing
     );
     assert_eq!(
@@ -277,6 +304,7 @@ fn guarded_writes_attempt_cleanup_and_never_retry_failed_mutations() {
         },
         channel,
         &writes,
+        |_| LanBeginFailure::Uncertain,
     )
     .unwrap();
     assert_eq!(
@@ -302,6 +330,7 @@ fn guarded_writes_attempt_cleanup_and_never_retry_failed_mutations() {
         },
         channel,
         &writes,
+        |_| LanBeginFailure::Uncertain,
     );
     assert!(matches!(
         result,
@@ -328,15 +357,61 @@ fn guarded_writes_attempt_cleanup_and_never_retry_failed_mutations() {
         },
         channel,
         &writes,
+        |_| LanBeginFailure::Uncertain,
     );
     assert!(matches!(
         result,
-        Err(LanWriteError::Begin {
+        Err(LanWriteError::BeginUncertain {
             error: "state",
             cleanup: Some("state")
         })
     ));
-    assert_eq!(calls.len(), 2);
+    assert_eq!(calls, [vec![14, 0, 1], vec![14, 0, 0]]);
+    calls.clear();
+    let result = lan_write_guarded(
+        |cmd| {
+            let bytes = Message::from(cmd).data().to_vec();
+            calls.push(bytes.clone());
+            if bytes == [14, 0, 1] {
+                Err("already in progress")
+            } else {
+                Ok(())
+            }
+        },
+        channel,
+        &writes,
+        |_| LanBeginFailure::Rejected,
+    );
+    assert!(matches!(
+        result,
+        Err(LanWriteError::BeginRejected {
+            error: "already in progress"
+        })
+    ));
+    assert_eq!(calls, [vec![14, 0, 1]]);
+    calls.clear();
+    let result = lan_write_guarded(
+        |cmd| {
+            let bytes = Message::from(cmd).data().to_vec();
+            calls.push(bytes.clone());
+            if bytes == [14, 0, 1] {
+                Err("lost ACK")
+            } else {
+                Ok(())
+            }
+        },
+        channel,
+        &writes,
+        |_| LanBeginFailure::Uncertain,
+    );
+    assert!(matches!(
+        result,
+        Err(LanWriteError::BeginUncertain {
+            error: "lost ACK",
+            cleanup: None
+        })
+    ));
+    assert_eq!(calls, [vec![14, 0, 1], vec![14, 0, 0]]);
     let mut calls = Vec::new();
     let result = lan_write_guarded(
         |cmd| {
@@ -350,6 +425,7 @@ fn guarded_writes_attempt_cleanup_and_never_retry_failed_mutations() {
         },
         channel,
         &writes,
+        |_| LanBeginFailure::Uncertain,
     );
     assert!(matches!(
         result,
@@ -372,7 +448,8 @@ fn guarded_writes_attempt_cleanup_and_never_retry_failed_mutations() {
                 Ok::<_, &str>(())
             },
             channel,
-            &invalid
+            &invalid,
+            |_| LanBeginFailure::Uncertain,
         ),
         Err(LanWriteError::Validation(
             LanConfigError::MismatchedParameter
@@ -390,6 +467,7 @@ fn guarded_writes_attempt_cleanup_and_never_retry_failed_mutations() {
             LanConfigParameter::Other(230),
             LanConfigParameterRequest::Raw(vec![0xde, 0xad]),
         )],
+        |_| LanBeginFailure::Uncertain,
     )
     .unwrap();
     assert_eq!(raw_calls[1], vec![14, 230, 0xde, 0xad]);
@@ -397,6 +475,7 @@ fn guarded_writes_attempt_cleanup_and_never_retry_failed_mutations() {
         |_cmd| -> Result<(), &str> { panic!("empty transaction must not send") },
         channel,
         &[],
+        |_| LanBeginFailure::Uncertain,
     )
     .is_ok());
 }

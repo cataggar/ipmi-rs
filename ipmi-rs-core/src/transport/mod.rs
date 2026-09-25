@@ -21,7 +21,7 @@ pub use lan_types::{
     Ipv6TimingSupport, LanAlertDestinationAddress, LanAlertDestinationType, LanArpControl,
     LanBadPasswordThreshold, LanConfigError, LanIpv4Header, LanSetInProgress, LanVlanId,
 };
-pub use lan_write::{ipv6_static_router_writes, lan_write_guarded, LanWriteError};
+pub use lan_write::{ipv6_static_router_writes, lan_write_guarded, LanBeginFailure, LanWriteError};
 pub use set_lan_configuration_parameters::{LanConfigParameterRequest, SetLanConfigParameters};
 pub use sol::{
     sol_write_guarded, GetSolConfig, SetSolConfig, SolBitRate, SolConfigError, SolConfigRaw,

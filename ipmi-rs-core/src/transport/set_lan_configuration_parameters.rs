@@ -292,7 +292,7 @@ impl LanConfigParameterRequest {
                 }
                 if matches!(self, R::Ipv6DhcpTiming(_))
                     && ((value.block_selector == 0 && value.bytes.len() != 16)
-                        || (value.block_selector == 1 && value.bytes.len() != 6)
+                        || (value.block_selector == 1 && value.bytes.len() != 16)
                         || value.block_selector > 1)
                 {
                     return Err(LanConfigError::InvalidBlockSequence);
