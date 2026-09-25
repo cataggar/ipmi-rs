@@ -36,6 +36,34 @@ host, or retry when the outcome is unknown after a timeout. Controllers/BIOS
 may not support optional identify force-on, mailbox, service partitions or
 individual policies; completion errors remain visible.
 
+`sensor_event::GetSensorReading` continues to return `RawSensorReading`.
+Its `flags()` reports availability, scanning and event-message enablement;
+`state_bytes()` retains both optional discrete-state bytes. Call
+`raw.discrete_for(&full_or_compact_sdr)` to decode asserted offsets using the
+SDR's event/reading type, sensor type and supported-reading mask. Each
+`DiscreteState` includes its offset even when it has no standard description
+or was not advertised in the SDR. Unavailable readings report no asserted
+states. A missing required state byte is an error.
+
+`sensor_event::GetSensorThresholds::for_sensor_key` returns a six-position
+`SensorThresholds` mask and raw values; absent mask bits are `None`, not zero.
+Use `validate_for(&sdr)` to compare the reported mask with the SDR, and
+`value(kind, &full_sdr)` for linear analog conversion to `Value` with the SDR's
+units. `SetSensorThresholds::new(&full_sdr, &[(kind, setting)])` is an explicit,
+validated write: supply `ThresholdSetting::Raw(byte)` or
+`ThresholdSetting::Converted(Value::new(full_sdr.common().sensor_units, value))`
+for each distinct, settable threshold. Converted values require matching
+units and a linear analog SDR; non-finite/out-of-range values are rejected
+instead of clamped. Thresholds supplied together must be ordered, but
+**partial writes cannot validate omitted thresholds against current BMC
+values**. Completion-code errors retain the code. Never retry a threshold
+write automatically after a timeout or ambiguous response.
+
+The sensor-key constructors carry the SDR owner address, channel and LUN.
+**Remote sensors on satellite controllers additionally need bridged RMCP/IPMB
+support** in the transport; using a sensor key does not provide that missing
+bridging by itself.
+
 SOL commands are in `app::sol` (`ActivateSol`, `DeactivateSol`,
 `SolInstance`) and `transport` (`GetSolConfig`, `SetSolConfig`,
 `SolParameterValue`, `sol_write_guarded`). Configuration writes are always

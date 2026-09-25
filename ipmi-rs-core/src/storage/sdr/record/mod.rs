@@ -1,5 +1,5 @@
 mod full_sensor_record;
-pub use full_sensor_record::FullSensorRecord;
+pub use full_sensor_record::{FullSensorRecord, ThresholdValueError};
 
 mod compact_sensor_record;
 mod event_only_sensor_record;
@@ -22,7 +22,7 @@ use crate::storage::sdr::record::mc_device_locator::McDeviceLocatorRecord;
 
 use super::{event_reading_type_code::EventReadingTypeCodes, RecordId, SensorType, Unit};
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Value {
     units: SensorUnits,
     value: f32,
@@ -31,6 +31,14 @@ pub struct Value {
 impl Value {
     pub fn new(units: SensorUnits, value: f32) -> Self {
         Self { units, value }
+    }
+
+    pub fn units(&self) -> SensorUnits {
+        self.units
+    }
+
+    pub fn value(&self) -> f32 {
+        self.value
     }
 
     pub fn display(&self, short: bool) -> String {
@@ -271,8 +279,7 @@ pub enum EventKind {
     GoingLow,
 }
 
-#[derive(Debug, Clone, Copy)]
-
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Thresholds {
     pub lower_non_recoverable: bool,
     pub lower_critical: bool,
@@ -295,7 +302,7 @@ impl Thresholds {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThresholdKind {
     LowerNonCritical,
     LowerCritical,
@@ -306,6 +313,22 @@ pub enum ThresholdKind {
 }
 
 impl ThresholdKind {
+    /// Mask bit and position in the six-byte Get/Set Sensor Thresholds payload.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::LowerNonCritical => 0,
+            Self::LowerCritical => 1,
+            Self::LowerNonRecoverable => 2,
+            Self::UpperNonCritical => 3,
+            Self::UpperCritical => 4,
+            Self::UpperNonRecoverable => 5,
+        }
+    }
+
+    pub const fn mask(self) -> u8 {
+        1 << self.index()
+    }
+
     pub fn variants() -> impl Iterator<Item = Self> {
         [
             Self::LowerNonCritical,
@@ -389,7 +412,7 @@ impl SensorCapabilities {
     ) -> Self {
         let ignore = (caps & 0x80) == 0x80;
         let auto_rearm = (caps & 0x40) == 0x40;
-        let hysteresis = match caps & 0x30 >> 4 {
+        let hysteresis = match (caps & 0x30) >> 4 {
             0b00 => HysteresisCapability::NoneOrUnspecified,
             0b01 => HysteresisCapability::Readable,
             0b10 => HysteresisCapability::ReadableAndSettable,
@@ -407,8 +430,8 @@ impl SensorCapabilities {
             lower_critical: ((assert_lower_thrsd >> 13) & 0x1) == 1,
             lower_non_critical: ((assert_lower_thrsd >> 12) & 0x1) == 1,
             upper_non_recoverable: ((deassert_upper_thrshd >> 14) & 0x1) == 1,
-            upper_critical: ((deassert_upper_thrshd >> 14) & 0x1) == 1,
-            upper_non_critical: ((deassert_upper_thrshd >> 14) & 0x1) == 1,
+            upper_critical: ((deassert_upper_thrshd >> 13) & 0x1) == 1,
+            upper_non_critical: ((deassert_upper_thrshd >> 12) & 0x1) == 1,
         };
 
         let threshold_set_mask = Thresholds {
@@ -481,7 +504,7 @@ pub enum ModifierUnit {
     BaseUnitMulByModifier(Unit),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SensorUnits {
     pub rate: Option<RateUnit>,
     pub modifier: Option<ModifierUnit>,
@@ -617,7 +640,10 @@ impl<'a> TryFrom<TypeLengthRaw<'a>> for SensorId {
 
         let length = value & 0x1F;
 
-        let data = &data[..(length as usize).min(data.len())];
+        if data.len() < length as usize {
+            return Err(ParseError::NotEnoughData);
+        }
+        let data = &data[..length as usize];
 
         let id = match type_code {
             0b00 => SensorId::Unicode(
@@ -852,6 +878,8 @@ pub struct SensorRecordCommon {
     pub entity_instance: EntityInstance,
     pub initialization: SensorInitialization,
     pub capabilities: SensorCapabilities,
+    /// SDR reading-state mask (bits 0..=14) for discrete sensors.
+    pub discrete_reading_mask: u16,
     pub ty: SensorType,
     pub event_reading_type_code: EventReadingTypeCodes,
     pub sensor_units: SensorUnits,
@@ -864,7 +892,7 @@ impl SensorRecordCommon {
     /// You _must_ remember to [`SensorRecordCommon::set_id`] once the ID of the
     /// record has been parsed.
     pub(crate) fn parse_without_id(record_data: &[u8]) -> Result<(Self, &[u8]), ParseError> {
-        if record_data.len() < 17 {
+        if record_data.len() < 18 {
             return Err(ParseError::NotEnoughData);
         }
 
@@ -910,6 +938,7 @@ impl SensorRecordCommon {
                 entity_instance,
                 initialization,
                 capabilities,
+                discrete_reading_mask: settable_thrsd_readable_thrsd_mask & 0x7FFF,
                 ty: sensor_type,
                 event_reading_type_code,
                 sensor_units,

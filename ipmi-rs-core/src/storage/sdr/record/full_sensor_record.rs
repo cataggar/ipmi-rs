@@ -2,6 +2,17 @@ use std::num::NonZeroU8;
 
 use super::*;
 
+/// A threshold cannot be converted using this sensor's linear raw encoding.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ThresholdValueError {
+    UnsupportedFormat,
+    NonLinear,
+    WrongUnits,
+    NonFinite,
+    ZeroSlope,
+    OutOfRange,
+}
+
 #[derive(Debug, Clone)]
 
 pub struct FullSensorRecord {
@@ -46,7 +57,7 @@ impl DirectionalSensor for FullSensorRecord {
 
 impl FullSensorRecord {
     pub fn parse(record_data: &[u8]) -> Result<Self, ParseError> {
-        if record_data.len() < 15 {
+        if record_data.len() < 43 {
             return Err(ParseError::NotEnoughData);
         }
 
@@ -62,7 +73,7 @@ impl FullSensorRecord {
 
         let (mut common, record_data) = SensorRecordCommon::parse_without_id(record_data)?;
 
-        if record_data.len() < 24 {
+        if record_data.len() < 25 {
             return Err(ParseError::NotEnoughData);
         }
 
@@ -77,7 +88,7 @@ impl FullSensorRecord {
             0
         };
 
-        let m = i16::from_le_bytes([m_lsb, m_sign | (m_msb_tolerance >> 6) & 0x1]);
+        let m = i16::from_le_bytes([m_lsb, m_sign | (m_msb_tolerance >> 6) & 0x3]);
 
         let tolerance = m_msb_tolerance & 0x3F;
 
@@ -225,13 +236,64 @@ impl FullSensorRecord {
 
         let value = match format {
             DataFormat::Unsigned => value as f32,
-            DataFormat::OnesComplement => !value as i8 as f32,
+            DataFormat::OnesComplement if value & 0x80 != 0 => -(!value as f32),
+            DataFormat::OnesComplement => value as f32,
             DataFormat::TwosComplement => value as i8 as f32,
         };
 
         let value = (m * value + b) * result_mul;
 
         Some(Value::new(self.common().sensor_units, value))
+    }
+
+    /// Convert a raw threshold using the SDR's linear M/B/exponent formula.
+    /// Nonlinear and discrete formats cannot be reliably converted.
+    pub fn threshold_value(&self, raw: u8) -> Option<Value> {
+        if !matches!(self.linearization, Linearization::Linear) {
+            return None;
+        }
+        self.convert(raw)
+    }
+
+    /// Invert the linear SDR formula, rounding to the nearest representable raw reading.
+    ///
+    /// `value` must carry this sensor's units. Out-of-range and non-finite values
+    /// are errors rather than being silently clamped or wrapped.
+    pub fn threshold_raw(&self, value: Value) -> Result<u8, ThresholdValueError> {
+        if value.units() != self.common().sensor_units {
+            return Err(ThresholdValueError::WrongUnits);
+        }
+        if !value.value().is_finite() {
+            return Err(ThresholdValueError::NonFinite);
+        }
+        if !matches!(self.linearization, Linearization::Linear) {
+            return Err(ThresholdValueError::NonLinear);
+        }
+        let format = self
+            .analog_data_format
+            .ok_or(ThresholdValueError::UnsupportedFormat)?;
+        if self.m == 0 {
+            return Err(ThresholdValueError::ZeroSlope);
+        }
+
+        let b = f64::from(self.b) * 10f64.powi(i32::from(self.b_exponent));
+        let result = ((f64::from(value.value()) / 10f64.powi(i32::from(self.result_exponent))) - b)
+            / f64::from(self.m);
+        let (min, max) = match format {
+            DataFormat::Unsigned => (0.0, 255.0),
+            DataFormat::OnesComplement => (-127.0, 127.0),
+            DataFormat::TwosComplement => (-128.0, 127.0),
+        };
+        if !result.is_finite() || result < min || result > max {
+            return Err(ThresholdValueError::OutOfRange);
+        }
+        let rounded = result.round() as i16;
+        Ok(match format {
+            DataFormat::Unsigned => rounded as u8,
+            DataFormat::TwosComplement => rounded as i8 as u8,
+            DataFormat::OnesComplement if rounded < 0 => !(rounded.unsigned_abs() as u8),
+            DataFormat::OnesComplement => rounded as u8,
+        })
     }
 
     pub fn display_reading(&self, value: u8) -> Option<String> {

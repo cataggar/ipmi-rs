@@ -38,7 +38,7 @@ impl DirectionalSensor for CompactSensorRecord {
 
 impl CompactSensorRecord {
     pub fn parse(record_data: &[u8]) -> Result<Self, ParseError> {
-        if record_data.len() < 26 {
+        if record_data.len() < 27 {
             return Err(ParseError::NotEnoughData);
         }
 
@@ -47,11 +47,11 @@ impl CompactSensorRecord {
         let direction_sharing_1 = record_data[0];
         let direction_sharing_2 = record_data[1];
 
-        let direction = Direction::try_from((direction_sharing_1 & 0xC) >> 6)?;
+        let direction = Direction::try_from((direction_sharing_1 & 0xC0) >> 6)?;
         let id_string_instance_modifier = match (direction_sharing_1 & 0x30) >> 4 {
             0b00 => IdStringModifier::Numeric,
             0b01 => IdStringModifier::Alpha,
-            _ => panic!("Invalid ID string modifier, no fallback available."),
+            v => return Err(ParseError::InvalidIdStringModifier(v)),
         };
 
         let share_count = direction_sharing_1 & 0xF;

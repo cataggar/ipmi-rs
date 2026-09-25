@@ -1,5 +1,5 @@
 use crate::{
-    connection::{Address, Channel, IpmiCommand, Message, NotEnoughData},
+    connection::{Address, Channel, IpmiCommand, LogicalUnit, Message, NotEnoughData},
     storage::sdr::record::{SensorKey, SensorNumber},
 };
 
@@ -39,6 +39,7 @@ pub struct GetSensorReading {
     sensor_number: SensorNumber,
     address: Address,
     channel: Channel,
+    lun: LogicalUnit,
 }
 
 impl GetSensorReading {
@@ -47,6 +48,7 @@ impl GetSensorReading {
             sensor_number,
             address,
             channel,
+            lun: LogicalUnit::Zero,
         }
     }
 
@@ -55,6 +57,7 @@ impl GetSensorReading {
             sensor_number: value.sensor_number,
             address: Address(value.owner_id.into()),
             channel: value.owner_channel,
+            lun: value.owner_lun,
         }
     }
 }
@@ -80,5 +83,9 @@ impl IpmiCommand for GetSensorReading {
 
     fn target(&self) -> Option<(Address, Channel)> {
         Some((self.address, self.channel))
+    }
+
+    fn target_lun(&self) -> LogicalUnit {
+        self.lun
     }
 }
