@@ -293,7 +293,6 @@ impl<CON: IpmiConnection> Ipmi<CON> {
                     if locator.entity_instance & 0x80 != 0
                         || locator.record_key.device_access_address == 0
                         || locator.record_key.device_slave_address == 0
-                        || Channel::new(locator.record_key.channel_number).is_none()
                     {
                         return Err(SunError::InvalidInput("not a physical LED locator"));
                     }
@@ -322,17 +321,9 @@ impl<CON: IpmiConnection> Ipmi<CON> {
             LedType::Locator if locator.oem_reserved <= 3 => locator.oem_reserved,
             LedType::Locator => return Err(SunError::InvalidInput("invalid locator LED type")),
         };
-        let target = if access == 0x20 && key.channel_number == 0 {
-            None
-        } else {
-            Some((
-                Address(access),
-                Channel::new(key.channel_number).expect("channel validated"),
-            ))
-        };
         Ok((
             Destination {
-                target,
+                target: None, // Access address is payload, not the ILOM destination.
                 lun: key.access_lun,
             },
             vec![
@@ -403,7 +394,10 @@ impl<CON: IpmiConnection> Ipmi<CON> {
     ) -> Result<(), SunError<CON::Error>> {
         validate_user(user_id).map_err(SunError::InvalidInput)?;
         validate_public_key(public_key).map_err(SunError::InvalidInput)?;
-        let bytes = public_key.as_bytes();
+        let bytes = public_key
+            .strip_suffix('\n')
+            .unwrap_or(public_key)
+            .as_bytes();
         for (i, chunk) in bytes.chunks(64).enumerate() {
             let marker = if i == (bytes.len() - 1) / 64 {
                 0xff
@@ -943,7 +937,7 @@ mod tests {
     }
 
     #[test]
-    fn physical_led_uses_live_locator_channel_lun_and_confirmed_state() {
+    fn physical_led_routes_to_ilom_and_keeps_locator_access_in_payload() {
         let mut mock = Mock::default();
         mock.locator(b"LED0");
         mock.sun(0x21, &[1]);
@@ -959,16 +953,17 @@ mod tests {
         let sent = ipmi.release().sent;
         assert_eq!(sent[0].cmd, 0x23);
         assert_eq!(sent[0].data, [0, 0, 0, 0, 0, 0xff]);
-        let channel = Channel::new(2).unwrap();
-        assert_eq!(
-            sent[1].target,
-            RequestTargetAddress::BmcOrIpmb(Address(0x40), channel, LogicalUnit::Zero)
-        );
+        assert_eq!(sent[1].target, RequestTargetAddress::Bmc(LogicalUnit::Zero));
         assert_eq!(
             sent[2].target,
-            RequestTargetAddress::BmcOrIpmb(Address(0x40), channel, LogicalUnit::Three)
+            RequestTargetAddress::Bmc(LogicalUnit::Three)
         );
         assert_eq!(sent[2].data, [0x42, 3, 0x40, 3, 0x17, 1, 0]);
+        assert_eq!(sent[3].target, RequestTargetAddress::Bmc(LogicalUnit::Zero));
+        assert_eq!(
+            sent[4].target,
+            RequestTargetAddress::Bmc(LogicalUnit::Three)
+        );
         assert_eq!(sent[4].data, [0x42, 3, 0x40, 3, 4, 0x17, 1, 0, 0]);
 
         let mut mock = Mock::default();
@@ -979,7 +974,11 @@ mod tests {
             ipmi.sun_set_led(WriteIntent::Approved, "LED0", LedType::Locate, LedMode::On),
             Err(SunError::Oem(OemError::UnsupportedDevice { .. }))
         ));
-        assert_eq!(count(&ipmi.release().sent, 0x22), 0);
+        let sent = ipmi.release().sent;
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1].target, RequestTargetAddress::Bmc(LogicalUnit::Zero));
+        assert_eq!(count(&sent, 0x21), 0);
+        assert_eq!(count(&sent, 0x22), 0);
 
         let mut mock = Mock::default();
         mock.locator(b"LED0");
@@ -1031,6 +1030,48 @@ mod tests {
         let mut ipmi = Ipmi::new(mock);
         ipmi.sun_delete_ssh_key(WriteIntent::Approved, 63).unwrap();
         assert_eq!(ipmi.release().sent[1].data, [63]);
+    }
+
+    #[test]
+    fn sshkey_maximum_with_newline_uses_only_256_blocks_and_one_final_marker() {
+        let prefix =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBERERERERERERERERERERERERERERERERERERERERER ";
+        let key = format!("{}{}", prefix, "a".repeat(16384 - prefix.len()));
+        assert_eq!(key.len(), 16384);
+        let with_newline = format!("{key}\n");
+        let mut mock = Mock::default();
+        for _ in 0..256 {
+            mock.sun(0x01, &[]);
+        }
+        let mut ipmi = Ipmi::new(mock);
+        ipmi.sun_set_ssh_key(WriteIntent::Approved, 2, &with_newline)
+            .unwrap();
+        let sent = ipmi.release().sent;
+        let blocks: Vec<_> = sent
+            .iter()
+            .filter(|packet| packet.netfn == 0x2e && packet.cmd == 0x01)
+            .collect();
+        assert_eq!(blocks.len(), 256);
+        for (index, block) in blocks.iter().enumerate() {
+            assert_eq!(block.data.len(), 67);
+            assert_eq!(block.data[0], 2);
+            assert_eq!(block.data[1], if index == 255 { 0xff } else { index as u8 });
+            assert_eq!(block.data[2], 64);
+        }
+        let transmitted: Vec<_> = blocks
+            .iter()
+            .flat_map(|block| &block.data[3..])
+            .copied()
+            .collect();
+        assert_eq!(transmitted, key.as_bytes());
+
+        let mut ipmi = Ipmi::new(Mock::default());
+        let oversized = format!("{key}a\n");
+        assert!(matches!(
+            ipmi.sun_set_ssh_key(WriteIntent::Approved, 2, &oversized),
+            Err(SunError::InvalidInput(_))
+        ));
+        assert!(ipmi.release().sent.is_empty());
     }
 
     #[test]
@@ -1111,6 +1152,20 @@ mod tests {
         assert_eq!(&sent[3].data[..13], b"\x0bDIAG_PASSED\0");
         assert_eq!(sent[3].data.len(), 21);
         assert_eq!(&sent[5].data[17..21], &[0, 0, 0, 1]);
+
+        let mut mock = Mock::default();
+        mock.version(3, 2);
+        let mut full_block = vec![0; 9 + 1024];
+        full_block[4..8].copy_from_slice(&1024u32.to_be_bytes());
+        full_block[8] = 1;
+        full_block[9..].fill(0xa5);
+        mock.sun(0x44, &full_block);
+        let mut ipmi = Ipmi::new(mock);
+        assert_eq!(
+            ipmi.sun_get_file("DIAG_PASSED", 1024).unwrap(),
+            vec![0xa5; 1024]
+        );
+        assert_eq!(count(&ipmi.release().sent, 0x44), 1);
 
         let mut mock = Mock::default();
         mock.version(3, 2);
