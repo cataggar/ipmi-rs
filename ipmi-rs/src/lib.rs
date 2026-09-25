@@ -9,7 +9,9 @@ pub use ipmi_rs_core::*;
 mod file;
 
 #[cfg(feature = "unix-file")]
-pub use file::File;
+pub use file::{
+    File, OpenIpmiEvent, OpenIpmiEventError, OpenIpmiEventReceiver, OpenIpmiEventSetupError,
+};
 
 pub mod rmcp;
 
@@ -33,6 +35,8 @@ pub use sel::{SelIter, SelIterError, SelMutationError};
 
 mod fru;
 pub use fru::{FruReadError, FruWriteError};
+
+pub mod events;
 
 use ipmi_rs_core::{
     connection::{CompletionErrorCode, IpmiCommand, NotEnoughData, Request, RequestTargetAddress},
