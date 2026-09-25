@@ -9,6 +9,13 @@ The commands are opt-in library APIs, not automatic discovery or a CLI.
 | Get manufacturing date for `setmfgdate` | OEM `0x3e/0x0e`, LUN **3**, `b4 90 91 8b`; exactly three raw date bytes. | Same vendor gate. Date is copied as FRU minutes-since-1996 bytes, **without** local-time conversion. |
 | CP6012 `nextboot` | OEM `0x3e/0x02`, LUN **3**, `b4 90 91 8b 9d <device> ff`; empty success reply. Device codes BIOS=0, FDD=1, HDD=2, CDROM=3, network=4. | Same target must report IANA **15000**, product **6012**. A lost response is **not replayed**; inspect the boot configuration before deciding on another operation. |
 | Large buffer | OEM `0x3e/0x82`, LUN **0**, `[0e,size]` for current interface; `[00,size]` for local IPMB. Empty success reply. | Identity-check each target. For a remote target, negotiate **local current → local IPMB → remote current**. On failure restore all attempted channels in reverse order to size **0** (default), returning any cleanup errors. A prior nonzero buffer setting cannot be discovered by this command and is **not** recoverable automatically. |
+
+For remote buffer negotiation, the remote **full Get Device ID** (including
+manufacturer and product) is read *before any local buffer mutation*. Only
+Kontron IANA 15000 is supported, independent of product (FWUM uses other
+boards); the full identity is compared again before remote dispatch. A wrong
+vendor causes **no local or remote `0x82` request**. A later identity change
+triggers local cleanup without sending a buffer command to the changed remote.
 | FRU info/read/write | Storage `0x0a/0x10` `[00]` → `[size_lo,size_hi,access]`; `0x0a/0x11` `[00,offset_lo,offset_hi,count]` → `[count,data…]`; `0x0a/0x12` `[00,offset_lo,offset_hi,data…]` → `[count]`. | FRU ID **0**, LUN **0**, **same destination** as the OEM request. Word-access FRUs divide the wire offset/count by two; reads and writes use ≤16-byte chunks. No write retries. |
 
 Specify `FruDevice::BUILTIN` for the local controller, or
@@ -41,7 +48,16 @@ No other FRU IDs or LUNs are supported by this workflow.
    It rechecks the **full Get Device ID**, size/access, original full image,
    and identity again immediately before writes. It writes only changed
    complete areas, including their recalculated checksum bytes, and reads
-   back the entire image, validating equality and checksum/layout.
+   back the entire image, validating equality and checksum/layout. For RMCP
+   it first checks the **remaining** 64-sequence session budget against
+   identity, info/read (including a fresh full readback), and all bounded
+   write chunks. It reserves the future request sequences across each
+   phase so queue polls cannot consume the write/readback floor. A second
+   budget check after preflight rejects transfer-size shrinkage or additional
+   queue activity **before any write**. Boot and local/IPMB buffer setup
+   similarly reserve sequences before mutations (the buffer calculation
+   includes failure cleanup). Rejection requires a fresh connection/session
+   or a smaller FRU; there is **no mid-write session renewal or sequence reuse**.
 4. If a chunk fails, **stop**: its error gives the area, byte offset,
    previously acknowledged bytes and best-effort raw observation (which may
    itself fail). Even a completion-code rejection or short acknowledgement
@@ -72,7 +88,10 @@ to `Z123` produces `b6`/`23`, while setting the board date to `01 02 03`
 produces `2d`. Unit/integration fault injection covers wrong IANA/product,
 bad area checksums/lengths, short fields, IPMB targets, word access, changed
 identity/image, lost/short/rejected partial writes, readback mismatch,
-explicit recovery, ambiguous boot, and buffer failure/restoration.
+explicit recovery, ambiguous boot, and buffer failure/restoration. A
+64-sequence bridged-session fixture rejects 128-/256-byte FRUs before
+writes; a compact 40-byte, source-format FRU completes on a push-reply
+session without recycling sequence numbers.
 
 The upstream [Kontron SEL transcript](https://github.com/cataggar/ipmitool/blob/33f3a0a1b895e3effabb0ec8d180a0a2f1536128/tests/transcripts/sel_kontron.tr)
 identifies a manufacturer in SEL data; it **does not capture these commands
@@ -82,4 +101,8 @@ are vendor-gated but must be verified against the specific board/firmware
 before use. FWUM, different field encodings/lengths, FRU ID ≠0, and
 undocumented buffer sizes are unsupported. Readback is not a substitute
 for a maintenance window or physical recovery if a controller changes state
-while a write is in flight.
+while a write is in flight. BMCs requiring repeated Get Message queue polls
+may exhaust the *unreserved* poll allowance or time out (including on a
+readback): a reserved sequence floor prevents sequence exhaustion but cannot
+promise that an unsupported board delivers replies. Stop and inspect an
+ambiguous write; do not replay it.

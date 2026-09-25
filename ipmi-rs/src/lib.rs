@@ -32,8 +32,8 @@ pub mod fwum;
 
 mod kontron_workflow;
 pub use kontron_workflow::{
-    KontronArea, KontronBufferError, KontronBufferStep, KontronFruBackup, KontronFruChange,
-    KontronFruError, KontronWriteApproval, KontronWriteFailure,
+    KontronArea, KontronBootError, KontronBufferError, KontronBufferFailure, KontronBufferStep,
+    KontronFruBackup, KontronFruChange, KontronFruError, KontronWriteApproval, KontronWriteFailure,
 };
 
 mod error;

@@ -97,6 +97,20 @@ pub enum KontronWriteFailure<E> {
     Count(FruCommandError),
 }
 
+/// CP6012 boot write rejected before dispatch, or attempted exactly once.
+#[derive(Debug)]
+pub enum KontronBootError<E> {
+    /// Insufficient RMCP session sequences for identity and boot write.
+    SequenceBudget {
+        /// Sequences needed by the two commands.
+        needed: usize,
+        /// Available sequences.
+        available: usize,
+    },
+    /// Identity, completion, or transport error; a dispatched write is ambiguous.
+    Command(OemError<E, UnexpectedResponseLength>),
+}
+
 /// Preparation, identity, transfer or verification failure. On a write
 /// failure no area is automatically replayed or restored: keep the change's
 /// backup, inspect the observed bytes and decide on manual recovery.
@@ -122,6 +136,14 @@ pub enum KontronFruError<E> {
     Inventory(FruParseError),
     /// FRU size/access or the full Get Device ID changed since preparation.
     TargetChanged,
+    /// Too few non-reusable transport sequences remain for the complete
+    /// checked operation. No FRU write was sent.
+    SequenceBudget {
+        /// Minimum sequences needed for identity, transfers and readback.
+        needed: usize,
+        /// Remaining transport sequences.
+        available: usize,
+    },
     /// The FRU image changed since preparation; no write was sent.
     InventoryChanged,
     /// A transfer failed before it could be sent.
@@ -203,6 +225,36 @@ fn replace_serial(
 }
 
 impl<C: IpmiConnection> Ipmi<C> {
+    fn reserve_kontron_fru_budget(
+        &mut self,
+        needed: usize,
+    ) -> Result<bool, KontronFruError<C::Error>> {
+        let Some(available) = self.inner_mut().ipmb_sequence_budget() else {
+            return Ok(false);
+        };
+        if available < needed || !self.inner_mut().reserve_ipmb_sequences(needed) {
+            return Err(KontronFruError::SequenceBudget { needed, available });
+        }
+        Ok(true)
+    }
+
+    fn fru_sequence_cost(
+        change: &KontronFruChange,
+        before: &[u8],
+        desired: &[u8],
+        preflight: bool,
+        readback_commands: usize,
+    ) -> usize {
+        let chunks = change.backup.image.len().div_ceil(DEFAULT_CHUNK_BYTES);
+        let writes = [&change.backup.board, &change.backup.product]
+            .iter()
+            .filter(|span| before[span.start..span.end] != desired[span.start..span.end])
+            .map(|span| (span.end - span.start).div_ceil(DEFAULT_CHUNK_BYTES))
+            .sum::<usize>();
+        let commands = writes + readback_commands + usize::from(preflight) * (4 + chunks);
+        commands * if change.device.target.is_some() { 2 } else { 1 }
+    }
+
     fn kontron_identity(
         &mut self,
         target: Option<(Address, Channel)>,
@@ -308,21 +360,54 @@ impl<C: IpmiConnection> Ipmi<C> {
         change: &KontronFruChange,
         _approval: KontronWriteApproval,
     ) -> Result<(), KontronFruError<C::Error>> {
-        self.kontron_identity(change.device.target, Some(&change.identity))?;
-        let info = self
-            .fru_info(change.device)
-            .map_err(KontronFruError::Info)?;
-        if info != change.info {
-            return Err(KontronFruError::TargetChanged);
+        let readback = 1 + change.backup.image.len().div_ceil(DEFAULT_CHUNK_BYTES);
+        let needed = Self::fru_sequence_cost(
+            change,
+            change.backup.image(),
+            &change.proposed,
+            true,
+            readback,
+        );
+        let reserved = self.reserve_kontron_fru_budget(needed)?;
+        let result = (|| {
+            self.kontron_identity(change.device.target, Some(&change.identity))?;
+            let info = self
+                .fru_info(change.device)
+                .map_err(KontronFruError::Info)?;
+            if info != change.info {
+                return Err(KontronFruError::TargetChanged);
+            }
+            let before_read = self.inner_mut().ipmb_sequence_budget();
+            let current = self
+                .read_fru_image(change.device)
+                .map_err(KontronFruError::Read)?;
+            if current != change.backup.image {
+                return Err(KontronFruError::InventoryChanged);
+            }
+            let after_read = self.inner_mut().ipmb_sequence_budget();
+            let readback_cost = before_read
+                .zip(after_read)
+                .map_or(readback, |(before, after)| {
+                    readback.max(
+                        before
+                            .saturating_sub(after)
+                            .div_ceil(if change.device.target.is_some() { 2 } else { 1 }),
+                    )
+                });
+            let still_needed =
+                Self::fru_sequence_cost(change, &current, &change.proposed, false, readback_cost)
+                    + if change.device.target.is_some() { 2 } else { 1 };
+            if reserved {
+                self.inner_mut().release_ipmb_sequences();
+                self.reserve_kontron_fru_budget(still_needed)?;
+            }
+            self.kontron_identity(change.device.target, Some(&change.identity))?;
+            self.write_kontron_areas(change, &current, &change.proposed, info)
+        })();
+        if reserved {
+            self.inner_mut().release_ipmb_sequences();
         }
-        let current = self
-            .read_fru_image(change.device)
-            .map_err(KontronFruError::Read)?;
-        if current != change.backup.image {
-            return Err(KontronFruError::InventoryChanged);
-        }
-        self.kontron_identity(change.device.target, Some(&change.identity))?;
-        self.write_kontron_areas(change, &current, &change.proposed, info)
+        result
     }
 
     /// Explicit *manual* restoration after diagnosing an incomplete/ambiguous
@@ -356,8 +441,19 @@ impl<C: IpmiConnection> Ipmi<C> {
         {
             return Err(KontronFruError::InventoryChanged);
         }
-        self.kontron_identity(change.device.target, Some(&change.identity))?;
-        self.write_kontron_areas(change, &current, &change.backup.image, info)
+        let readback = 1 + change.backup.image.len().div_ceil(DEFAULT_CHUNK_BYTES);
+        let needed =
+            Self::fru_sequence_cost(change, &current, &change.backup.image, false, readback)
+                + if change.device.target.is_some() { 2 } else { 1 };
+        let reserved = self.reserve_kontron_fru_budget(needed)?;
+        let result = (|| {
+            self.kontron_identity(change.device.target, Some(&change.identity))?;
+            self.write_kontron_areas(change, &current, &change.backup.image, info)
+        })();
+        if reserved {
+            self.inner_mut().release_ipmb_sequences();
+        }
+        result
     }
 
     fn write_kontron_areas(
@@ -421,8 +517,23 @@ impl<C: IpmiConnection> Ipmi<C> {
         target: Option<(Address, Channel)>,
         device: BootDevice,
         _approval: KontronWriteApproval,
-    ) -> Result<(), OemError<C::Error, UnexpectedResponseLength>> {
-        self.send_oem(SetNextBoot(device).at(target))
+    ) -> Result<(), KontronBootError<C::Error>> {
+        let needed = if target.is_some() { 4 } else { 2 };
+        let reserved = if let Some(available) = self.inner_mut().ipmb_sequence_budget() {
+            if available < needed || !self.inner_mut().reserve_ipmb_sequences(needed) {
+                return Err(KontronBootError::SequenceBudget { needed, available });
+            }
+            true
+        } else {
+            false
+        };
+        let result = self
+            .send_oem(SetNextBoot(device).at(target))
+            .map_err(KontronBootError::Command);
+        if reserved {
+            self.inner_mut().release_ipmb_sequences();
+        }
+        result
     }
 
     /// Negotiate buffer size for a local Kontron or for a Kontron IPMB
@@ -435,6 +546,55 @@ impl<C: IpmiConnection> Ipmi<C> {
         target: Option<(Address, Channel)>,
         size: u8,
     ) -> Result<(), KontronBufferError<C::Error>> {
+        let needed = if target.is_some() { 20 } else { 4 };
+        let reserved = if let Some(available) = self.inner_mut().ipmb_sequence_budget() {
+            if available < needed || !self.inner_mut().reserve_ipmb_sequences(needed) {
+                return Err(KontronBufferError {
+                    step: KontronBufferStep::LocalCurrent,
+                    source: KontronBufferFailure::SequenceBudget { needed, available },
+                    restore: Vec::new(),
+                });
+            }
+            true
+        } else {
+            false
+        };
+        let result = self.configure_kontron_buffer(target, size);
+        if reserved {
+            self.inner_mut().release_ipmb_sequences();
+        }
+        result
+    }
+
+    fn configure_kontron_buffer(
+        &mut self,
+        target: Option<(Address, Channel)>,
+        size: u8,
+    ) -> Result<(), KontronBufferError<C::Error>> {
+        let remote_identity = if let Some(target) = target {
+            let identity =
+                self.oem_device_id(Some(target))
+                    .map_err(|error| KontronBufferError {
+                        step: KontronBufferStep::RemoteCurrent,
+                        source: KontronBufferFailure::Identity(OemError::Identity(error)),
+                        restore: Vec::new(),
+                    })?;
+            if identity.manufacturer_id != 15000 {
+                return Err(KontronBufferError {
+                    step: KontronBufferStep::RemoteCurrent,
+                    source: KontronBufferFailure::Identity(OemError::UnsupportedDevice {
+                        manufacturer_id: identity.manufacturer_id,
+                        product_id: identity.product_id,
+                        expected_manufacturer_id: 15000,
+                        expected_product_id: None,
+                    }),
+                    restore: Vec::new(),
+                });
+            }
+            Some(identity)
+        } else {
+            None
+        };
         let steps = [
             (
                 KontronBufferStep::LocalCurrent,
@@ -450,9 +610,33 @@ impl<C: IpmiConnection> Ipmi<C> {
         ];
         let count = if target.is_some() { 3 } else { 1 };
         for (index, &(step, destination, channel)) in steps[..count].iter().enumerate() {
-            if let Err(source) = self.send_oem(SetLargeBuffer { channel, size }.at(destination)) {
+            let identity_check =
+                if let Some(expected) = remote_identity.as_ref().filter(|_| index == 2) {
+                    self.oem_device_id(target)
+                        .map_err(|error| KontronBufferFailure::Identity(OemError::Identity(error)))
+                        .and_then(|current| {
+                            if current == *expected {
+                                Ok(())
+                            } else {
+                                Err(KontronBufferFailure::TargetChanged)
+                            }
+                        })
+                } else {
+                    Ok(())
+                };
+            let outcome = identity_check.and_then(|()| {
+                self.send_oem(SetLargeBuffer { channel, size }.at(destination))
+                    .map_err(KontronBufferFailure::Command)
+            });
+            if let Err(source) = outcome {
                 let mut restore = Vec::new();
-                for &(restore_step, restore_target, restore_channel) in steps[..=index].iter().rev()
+                let attempted = index
+                    + usize::from(matches!(
+                        source,
+                        KontronBufferFailure::Command(OemError::Command(_))
+                    ));
+                for &(restore_step, restore_target, restore_channel) in
+                    steps[..attempted].iter().rev()
                 {
                     if let Err(error) = self.send_oem(
                         SetLargeBuffer {
@@ -492,7 +676,25 @@ pub struct KontronBufferError<E> {
     /// Failed negotiation step.
     pub step: KontronBufferStep,
     /// Original failure.
-    pub source: OemError<E, UnexpectedResponseLength>,
+    pub source: KontronBufferFailure<E>,
     /// Failed restores in reverse order (remote, local IPMB, local current).
     pub restore: Vec<(KontronBufferStep, OemError<E, UnexpectedResponseLength>)>,
+}
+
+/// Reason a buffer negotiation failed before or after dispatch.
+#[derive(Debug)]
+pub enum KontronBufferFailure<E> {
+    /// Insufficient RMCP session sequences to reserve both setup and cleanup.
+    SequenceBudget {
+        /// Sequences needed for setup and possible cleanup.
+        needed: usize,
+        /// Available sequences.
+        available: usize,
+    },
+    /// Remote identity query failed or vendor did not match, with no mutations.
+    Identity(OemError<E, NotEnoughData>),
+    /// The remote Get Device ID changed after the initial check.
+    TargetChanged,
+    /// The buffer OEM request failed.
+    Command(OemError<E, UnexpectedResponseLength>),
 }

@@ -10,8 +10,8 @@ use ipmi_rs::{
         OemCommand, OemError,
     },
     storage::fru::{FruAccess, FruDevice, FruInventory},
-    Ipmi, IpmiError, KontronArea, KontronBufferStep, KontronFruError, KontronWriteApproval,
-    KontronWriteFailure,
+    Ipmi, IpmiError, KontronArea, KontronBootError, KontronBufferFailure, KontronBufferStep,
+    KontronFruError, KontronWriteApproval, KontronWriteFailure,
 };
 
 fn original_image() -> Vec<u8> {
@@ -19,6 +19,30 @@ fn original_image() -> Vec<u8> {
         .split_whitespace()
         .map(|byte| u8::from_str_radix(byte, 16).unwrap())
         .collect()
+}
+
+fn compact_image() -> Vec<u8> {
+    let mut header = vec![1u8, 0, 0, 1, 3, 0, 0, 0];
+    let mut board = vec![
+        1, 2, 0, 0x10, 0x20, 0x30, 0xc0, 0xc0, 0xc2, b'B', b'0', 0xc0, 0xc0, 0xc1,
+    ];
+    let mut product = vec![
+        1, 2, 0, 0xc0, 0xc0, 0xc0, 0xc0, 0xc2, b'S', b'0', 0xc0, 0xc0, 0xc1,
+    ];
+    for area in [&mut header, &mut board, &mut product] {
+        if area.len() > 8 {
+            area.resize(15, 0);
+        } else {
+            area.pop();
+        }
+        let sum = area.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+        area.push(sum.wrapping_neg());
+    }
+    header.extend(board);
+    header.extend(product);
+    assert_eq!(header.len(), 40);
+    FruInventory::parse(&header).unwrap();
+    header
 }
 
 fn approve() -> KontronWriteApproval {
@@ -57,11 +81,19 @@ struct Mock {
     manufacturer: u32,
     product: u16,
     remote_manufacturer: u32,
+    remote_product: Option<u16>,
+    remote_product_changes_after: Option<usize>,
+    remote_identity_calls: usize,
     serial: Vec<u8>,
     date: [u8; 3],
     faults: HashMap<(u8, u8, usize), Fault>,
     calls: HashMap<(u8, u8), usize>,
     corrupt_after_write: bool,
+    read_limit: Option<usize>,
+    sequence_budget: Option<usize>,
+    reserved_sequences: Option<usize>,
+    local_buffers: [u8; 2],
+    remote_buffer: u8,
 }
 
 impl Mock {
@@ -125,6 +157,15 @@ impl IpmiConnection for Mock {
             data: data.clone(),
             target,
         });
+        if let Some(available) = &mut self.sequence_budget {
+            let used = if Mock::is_remote(target) { 2 } else { 1 };
+            assert!(*available >= used);
+            *available -= used;
+            if let Some(reserved) = &mut self.reserved_sequences {
+                assert!(*reserved >= used);
+                *reserved -= used;
+            }
+        }
         let count = self.calls.entry((netfn, command)).or_default();
         *count += 1;
         let fault = self.faults.get(&(netfn, command, *count)).copied();
@@ -134,16 +175,39 @@ impl IpmiConnection for Mock {
         if matches!(fault, Some(Fault::Reject)) {
             return Ok(Self::response(netfn, command, 0x80, &[]));
         }
+        if netfn == 0x0a
+            && command == 0x11
+            && self
+                .read_limit
+                .is_some_and(|limit| data[3] as usize > limit)
+        {
+            return Ok(Self::response(netfn, command, 0xca, &[]));
+        }
         let result = match (netfn, command) {
             (0x06, 0x01) => {
                 assert_eq!(target.lun(), LogicalUnit::Zero);
+                if Self::is_remote(target) {
+                    self.remote_identity_calls += 1;
+                }
                 let vendor = if Self::is_remote(target) {
                     self.remote_manufacturer
                 } else {
                     self.manufacturer
                 }
                 .to_le_bytes();
-                let product = self.product.to_le_bytes();
+                let product = if Self::is_remote(target) {
+                    if self
+                        .remote_product_changes_after
+                        .is_some_and(|limit| self.remote_identity_calls > limit)
+                    {
+                        6011
+                    } else {
+                        self.remote_product.unwrap_or(self.product)
+                    }
+                } else {
+                    self.product
+                }
+                .to_le_bytes();
                 vec![
                     1, 1, 1, 0x23, 0x51, 0, vendor[0], vendor[1], vendor[2], product[0], product[1],
                 ]
@@ -168,6 +232,11 @@ impl IpmiConnection for Mock {
             (0x3e, 0x82) => {
                 assert_eq!(target.lun(), LogicalUnit::Zero);
                 assert!(data[0] == 0 || data[0] == 0x0e);
+                if Self::is_remote(target) {
+                    self.remote_buffer = data[1];
+                } else {
+                    self.local_buffers[usize::from(data[0] == 0)] = data[1];
+                }
                 vec![]
             }
             (0x0a, 0x10) => {
@@ -213,6 +282,22 @@ impl IpmiConnection for Mock {
         };
         Ok(Self::response(netfn, command, 0, &result))
     }
+
+    fn ipmb_sequence_budget(&self) -> Option<usize> {
+        self.sequence_budget
+    }
+
+    fn reserve_ipmb_sequences(&mut self, minimum: usize) -> bool {
+        if self.reserved_sequences.is_some() || self.sequence_budget.is_none_or(|n| n < minimum) {
+            return false;
+        }
+        self.reserved_sequences = Some(minimum);
+        true
+    }
+
+    fn release_ipmb_sequences(&mut self) {
+        self.reserved_sequences = None;
+    }
 }
 
 #[test]
@@ -253,10 +338,10 @@ fn vendor_product_mismatch_and_lost_nextboot_never_send_or_replay() {
     let mut ipmi = Ipmi::new(mock);
     assert!(matches!(
         ipmi.kontron_set_next_boot(None, BootDevice::Bios, approve()),
-        Err(OemError::UnsupportedDevice {
+        Err(KontronBootError::Command(OemError::UnsupportedDevice {
             expected_product_id: Some(6012),
             ..
-        })
+        }))
     ));
     assert_eq!(ipmi.release().sent.len(), 1);
 
@@ -265,7 +350,9 @@ fn vendor_product_mismatch_and_lost_nextboot_never_send_or_replay() {
     let mut ipmi = Ipmi::new(mock);
     assert!(matches!(
         ipmi.kontron_set_next_boot(None, BootDevice::Bios, approve()),
-        Err(OemError::Command(IpmiError::Connection(MockError::Lost)))
+        Err(KontronBootError::Command(OemError::Command(
+            IpmiError::Connection(MockError::Lost)
+        )))
     ));
     assert_eq!(ipmi.release().count(0x3e, 0x02), 1);
 }
@@ -314,6 +401,86 @@ fn serial_preparation_backs_up_both_areas_and_writes_only_changed_areas() {
                 LogicalUnit::Zero
             )));
     }
+}
+
+#[test]
+fn remote_128_and_256_byte_images_fail_budget_before_any_write() {
+    for size in [128, 256] {
+        let mut mock = Mock::new();
+        mock.image.resize(size, 0);
+        mock.sequence_budget = Some(64);
+        let mut ipmi = Ipmi::new(mock);
+        let change = ipmi.prepare_kontron_serial(bridged()).unwrap();
+        let available = ipmi.inner_mut().ipmb_sequence_budget().unwrap();
+        let result = ipmi.apply_kontron_fru_change(&change, approve());
+        assert!(matches!(
+            result,
+            Err(KontronFruError::SequenceBudget {
+                needed,
+                available: observed
+            }) if needed > observed && observed == available
+        ));
+        let mock = ipmi.release();
+        assert_eq!(mock.count(0x0a, 0x12), 0);
+        assert_eq!(mock.sequence_budget, Some(available));
+        assert!(mock.reserved_sequences.is_none());
+    }
+}
+
+#[test]
+fn small_bridged_fru_can_write_and_verify_inside_64_sequence_session() {
+    let mut mock = Mock::new();
+    mock.image = compact_image();
+    mock.serial = b"Z1".to_vec();
+    mock.sequence_budget = Some(64);
+    let mut ipmi = Ipmi::new(mock);
+    let change = ipmi.prepare_kontron_serial(bridged()).unwrap();
+    assert_eq!(change.backup().board().len(), 16);
+    assert_eq!(change.backup().product().len(), 16);
+    ipmi.apply_kontron_fru_change(&change, approve()).unwrap();
+    let mock = ipmi.release();
+    assert_eq!(mock.image, change.proposed_image());
+    assert_eq!(mock.count(0x0a, 0x12), 2);
+    assert!(mock.sequence_budget.unwrap() > 0);
+    assert!(mock.reserved_sequences.is_none());
+}
+
+#[test]
+fn read_shrink_spends_budget_before_write_and_fails_closed() {
+    let mut mock = Mock::new();
+    mock.image = compact_image();
+    mock.serial = b"Z1".to_vec();
+    mock.sequence_budget = Some(50);
+    let mut ipmi = Ipmi::new(mock);
+    let change = ipmi.prepare_kontron_serial(bridged()).unwrap();
+    ipmi.inner_mut().read_limit = Some(8);
+    assert!(matches!(
+        ipmi.apply_kontron_fru_change(&change, approve()),
+        Err(KontronFruError::SequenceBudget { .. })
+    ));
+    assert_eq!(ipmi.release().count(0x0a, 0x12), 0);
+}
+
+#[test]
+fn exhausted_bridge_budget_rejects_boot_and_buffer_before_mutation() {
+    let mut mock = Mock::new();
+    mock.sequence_budget = Some(3);
+    let mut ipmi = Ipmi::new(mock);
+    assert!(matches!(
+        ipmi.kontron_set_next_boot(bridged().target, BootDevice::Bios, approve()),
+        Err(KontronBootError::SequenceBudget {
+            needed: 4,
+            available: 3
+        })
+    ));
+    assert!(matches!(
+        ipmi.kontron_set_large_buffer(bridged().target, 32),
+        Err(ipmi_rs::KontronBufferError {
+            source: KontronBufferFailure::SequenceBudget { .. },
+            ..
+        })
+    ));
+    assert!(ipmi.release().sent.is_empty());
 }
 
 #[test]
@@ -558,19 +725,47 @@ fn buffer_restore_failure_is_reported_and_remote_vendor_is_never_sent_oem() {
 
     let mut mock = Mock::new();
     mock.remote_manufacturer = 42;
+    mock.local_buffers = [48, 64];
+    mock.remote_buffer = 32;
     let mut ipmi = Ipmi::new(mock);
     let error = ipmi
         .kontron_set_large_buffer(bridged().target, 80)
         .unwrap_err();
     assert_eq!(error.step, KontronBufferStep::RemoteCurrent);
-    let requests: Vec<_> = ipmi
-        .release()
+    assert!(matches!(
+        error.source,
+        KontronBufferFailure::Identity(OemError::UnsupportedDevice { .. })
+    ));
+    assert!(error.restore.is_empty());
+    let mock = ipmi.release();
+    assert_eq!(mock.local_buffers, [48, 64]);
+    assert_eq!(mock.remote_buffer, 32);
+    let requests = mock.sent;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].command, 0x01);
+    assert!(requests.iter().all(|sent| sent.command != 0x82));
+}
+
+#[test]
+fn remote_product_change_after_local_setup_never_mutates_changed_remote() {
+    let mut mock = Mock::new();
+    mock.remote_product_changes_after = Some(1);
+    let mut ipmi = Ipmi::new(mock);
+    let error = ipmi
+        .kontron_set_large_buffer(bridged().target, 80)
+        .unwrap_err();
+    assert!(matches!(error.source, KontronBufferFailure::TargetChanged));
+    assert!(error.restore.is_empty());
+    let mock = ipmi.release();
+    assert_eq!(mock.remote_buffer, 0);
+    assert_eq!(mock.local_buffers, [0, 0]);
+    let buffer_commands: Vec<_> = mock
         .sent
-        .into_iter()
+        .iter()
         .filter(|sent| sent.command == 0x82)
         .collect();
-    assert_eq!(requests.len(), 4);
-    assert!(requests
+    assert_eq!(buffer_commands.len(), 4);
+    assert!(buffer_commands
         .iter()
-        .all(|sent| { matches!(sent.target, RequestTargetAddress::Bmc(LogicalUnit::Zero)) }));
+        .all(|sent| matches!(sent.target, RequestTargetAddress::Bmc(LogicalUnit::Zero))));
 }

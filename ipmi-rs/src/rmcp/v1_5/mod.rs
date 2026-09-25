@@ -86,6 +86,18 @@ impl core::fmt::Debug for State {
 }
 
 impl State {
+    pub(super) fn ipmb_sequence_budget(&self) -> usize {
+        self.ipmb_state.remaining_sequences()
+    }
+
+    pub(super) fn reserve_ipmb_sequences(&mut self, minimum: usize) -> bool {
+        self.ipmb_state.reserve_sequences(minimum)
+    }
+
+    pub(super) fn release_ipmb_sequences(&mut self) {
+        self.ipmb_state.release_sequences();
+    }
+
     fn send_payload(
         &mut self,
         payload: Vec<u8>,
@@ -291,6 +303,7 @@ impl IpmiConnection for State {
                             self.ipmb_state.stop_polling();
                             continue;
                         }
+                        Err(RmcpIpmiSendError::IpmbSequenceReserved) => continue,
                         Err(error) => return Err(RmcpIpmiReceiveError::BridgePollSend(error)),
                     };
                     self.send_payload(poll, deadline)
