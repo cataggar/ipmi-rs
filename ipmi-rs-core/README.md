@@ -73,7 +73,10 @@ in 100 ms units and host-power consequences on expiry. `app::system_info`
 provides versioned Get, per-set Set, typed set-in-progress, bounded strings
 and a guarded multi-set write with visible cleanup errors after a confirmed
 begin. A failed begin is not cleaned up automatically, since the lock may
-belong to another writer. Mutations may
+belong to another writer. Select `SystemInfoCommitMode::CompleteOnly` for
+controllers that do not support optional Commit Write (`2`), or
+`CommitThenComplete` when they do; unsupported commit is not used as a
+capability probe, and both modes attempt Set Complete. Mutations may
 require Operator or Administrator privilege and a lost reply means the
 outcome is unknown: do not automatically retry.
 

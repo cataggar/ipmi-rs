@@ -299,13 +299,38 @@ standard parameters 0–7. Get returns a revision-checked response; use
 `to_writes()` splits into a 14-byte first set and subsequent 16-byte sets.
 To update multiple sets, explicitly send parameter-0
 `SetSystemInfoParameter::set_in_progress` values (`InProgress`,
-`CommitWrite`, `Complete`), or explicitly invoke `system_info_write_guarded`
-with an `Ipmi::send_recv` closure and the validated `SystemInfoString`. The
-guard attempts set-complete cleanup after an acknowledged begin and reports
-begin, block, commit and cleanup failures separately. If begin fails, it does
-not release a lock that may belong to another writer; inspect an ambiguous
-outcome and decide how to recover. Unsupported/read-only/already-in-progress
-completion codes are preserved; other completion codes remain in `IpmiError`.
+`CommitWrite`, `Complete`), or invoke `system_info_write_guarded` with an
+`Ipmi::send_recv` closure and a validated `SystemInfoString`. **Choose**
+`SystemInfoCommitMode::CompleteOnly` when the controller accepts In Progress
+and Set Complete but rejects the optional Commit Write (`2`), as on some
+OpenBMC controllers. Use `CommitThenComplete` only if the target supports it:
+
+```rust,ignore
+use ipmi_rs::app::system_info::{
+    system_info_write_guarded, SystemInfoCommitMode, SystemInfoEncoding,
+    SystemInfoSelector, SystemInfoString,
+};
+
+let name = SystemInfoString::new(
+    SystemInfoSelector::SystemName,
+    SystemInfoEncoding::Utf8,
+    b"host-1".to_vec(),
+)?;
+let outcome = system_info_write_guarded(
+    |command| ipmi.send_recv(command),
+    &name,
+    SystemInfoCommitMode::CompleteOnly,
+);
+// Handle outcome (including any uncertain write or cleanup failure).
+```
+
+The helper does not probe for optional commit support by mutating the BMC.
+After an acknowledged begin, it attempts set-complete cleanup even if a
+block or optional commit fails, and reports begin, block, commit and cleanup
+errors separately. If begin fails, it does not release a lock that may belong
+to another writer; inspect an ambiguous outcome and decide how to recover.
+Unsupported/read-only/already-in-progress completion codes are preserved;
+other completion codes remain in `IpmiError`.
 String and watchdog writes, including transaction-state writes, are sent
 **once**, not retried after a possibly-applied request. A timeout or lost
 acknowledgement leaves the outcome **unknown**; readback can show current

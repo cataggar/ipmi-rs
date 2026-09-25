@@ -595,17 +595,32 @@ pub enum SystemInfoError {
     Rejected(SystemInfoRejection),
 }
 
-/// At most one begin, each block once, one commit, and one set-complete cleanup.
+/// Whether to send the optional Commit Write transaction state.
+///
+/// Some controllers accept In Progress and Set Complete but reject Commit
+/// Write (`2`). Select the mode for the target controller explicitly; this
+/// helper does not probe by sending a possibly unsupported mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SystemInfoCommitMode {
+    /// Finish by sending Set Complete (`0`) without Commit Write.
+    CompleteOnly,
+    /// Send Commit Write (`2`), then Set Complete (`0`).
+    CommitThenComplete,
+}
+
+/// At most one begin, each block once, an optional commit, and one cleanup.
 ///
 /// A failed write is *not* retried. Even a timeout may mean it was applied.
 /// If begin fails, no cleanup is sent: the lock might belong to someone else.
 /// The caller must decide how to recover from an ambiguous begin outcome.
 /// After an acknowledged begin, this helper reports the first failed block
-/// and cleanup/commit outcomes;
-/// it cannot make a multi-message operation atomic on an unreliable link.
+/// and cleanup/commit outcomes. Even if an optional commit is rejected,
+/// Set Complete is still attempted, and both errors remain visible. The helper
+/// cannot make a multi-message operation atomic on an unreliable link.
 pub fn system_info_write_guarded<E>(
     mut send: impl FnMut(SetSystemInfoParameter) -> Result<(), E>,
     value: &SystemInfoString,
+    commit_mode: SystemInfoCommitMode,
 ) -> Result<(), SystemInfoWriteError<E>> {
     let writes = value.to_writes();
     let state = |v| SetSystemInfoParameter::set_in_progress(v);
@@ -619,11 +634,12 @@ pub fn system_info_write_guarded<E>(
             break;
         }
     }
-    let commit = if failed_block.is_none() {
-        send(state(SystemInfoSetInProgress::CommitWrite)).err()
-    } else {
-        None
-    };
+    let commit =
+        if failed_block.is_none() && commit_mode == SystemInfoCommitMode::CommitThenComplete {
+            send(state(SystemInfoSetInProgress::CommitWrite)).err()
+        } else {
+            None
+        };
     let cleanup = send(state(SystemInfoSetInProgress::Complete)).err();
     if failed_block.is_none() && commit.is_none() && cleanup.is_none() {
         Ok(())
@@ -644,11 +660,11 @@ pub enum SystemInfoWriteError<E> {
         /// Begin error.
         error: E,
     },
-    /// Write, commit, or cleanup failed; state on BMC cannot be inferred.
+    /// Write, optional commit, or cleanup failed; state on BMC cannot be inferred.
     Uncertain {
         /// Index of first failed set and its error, if any.
         failed_block: Option<(usize, E)>,
-        /// Commit error, if any.
+        /// Commit error, if Commit Write was selected and failed.
         commit: Option<E>,
         /// Cleanup error, if any.
         cleanup: Option<E>,
@@ -919,6 +935,7 @@ mod tests {
                 }
             },
             &value,
+            SystemInfoCommitMode::CommitThenComplete,
         );
         assert_eq!(
             failure,
@@ -937,6 +954,7 @@ mod tests {
                 Err::<(), _>("not acknowledged")
             },
             &value,
+            SystemInfoCommitMode::CompleteOnly,
         );
         assert_eq!(
             failure,
@@ -953,6 +971,7 @@ mod tests {
                 Ok::<(), &str>(())
             },
             &value,
+            SystemInfoCommitMode::CommitThenComplete,
         );
         assert_eq!(success, Ok(()));
         assert_eq!(sent.len(), value.to_writes().len() + 3);
@@ -960,23 +979,88 @@ mod tests {
         assert_eq!(sent[sent.len() - 2], vec![0, 2]);
         assert_eq!(sent[sent.len() - 1], vec![0, 0]);
 
+        let mut sent = Vec::new();
         let failure = system_info_write_guarded(
             |write| {
-                if Message::from(write).data() == [0, 2] {
-                    Err("commit")
+                let data = Message::from(write).data().to_vec();
+                sent.push(data.clone());
+                if data == [0, 2] {
+                    Err("unsupported 0x02")
                 } else {
                     Ok(())
                 }
             },
             &value,
+            SystemInfoCommitMode::CommitThenComplete,
         );
         assert_eq!(
             failure,
             Err(SystemInfoWriteError::Uncertain {
                 failed_block: None,
-                commit: Some("commit"),
+                commit: Some("unsupported 0x02"),
                 cleanup: None
             })
         );
+        assert_eq!(sent[sent.len() - 2], vec![0, 2]);
+        assert_eq!(sent[sent.len() - 1], vec![0, 0]);
+
+        let mut sent = Vec::new();
+        let success = system_info_write_guarded(
+            |write| {
+                let data = Message::from(write).data().to_vec();
+                sent.push(data.clone());
+                if data == [0, 2] {
+                    Err("unsupported 0x02")
+                } else {
+                    Ok(())
+                }
+            },
+            &value,
+            SystemInfoCommitMode::CompleteOnly,
+        );
+        assert_eq!(success, Ok(()));
+        assert_eq!(sent.len(), value.to_writes().len() + 2);
+        assert_eq!(sent[0], vec![0, 1]);
+        assert_eq!(sent[sent.len() - 1], vec![0, 0]);
+        assert!(!sent.contains(&vec![0, 2]));
+    }
+
+    #[test]
+    fn complete_only_reports_cleanup_failure_without_retrying_blocks() {
+        let value = SystemInfoString::new(
+            SystemInfoSelector::SystemName,
+            SystemInfoEncoding::Utf8,
+            b"OpenBMC".to_vec(),
+        )
+        .unwrap();
+        let mut sent = Vec::new();
+        let result = system_info_write_guarded(
+            |write| {
+                let data = Message::from(write).data().to_vec();
+                sent.push(data.clone());
+                if data == [0, 0] {
+                    Err("complete acknowledgement lost")
+                } else {
+                    Ok(())
+                }
+            },
+            &value,
+            SystemInfoCommitMode::CompleteOnly,
+        );
+        assert_eq!(
+            result,
+            Err(SystemInfoWriteError::Uncertain {
+                failed_block: None,
+                commit: None,
+                cleanup: Some("complete acknowledgement lost")
+            })
+        );
+        assert_eq!(sent[0], vec![0, 1]);
+        assert_eq!(
+            sent[1],
+            Message::from(value.to_writes().remove(0)).data().to_vec()
+        );
+        assert_eq!(sent[2], vec![0, 0]);
+        assert_eq!(sent.len(), 3);
     }
 }
