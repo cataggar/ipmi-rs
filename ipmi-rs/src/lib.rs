@@ -38,6 +38,9 @@ pub use kontron_workflow::{
 
 pub mod hpm;
 
+#[cfg(test)]
+mod lan_command_tests;
+
 mod error;
 pub use error::IpmiError;
 

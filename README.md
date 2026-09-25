@@ -186,7 +186,15 @@ mid-call). Custom `IpmiConnection` implementations should override
 This example discovers available channels and prints channel information. For LAN channels, it also shows a small set of LAN configuration parameters (addressing and gateways).
 
 ### `ipmi-lan-config`
-This example reads LAN configuration for all LAN channels and emits JSON. You can apply a JSON configuration with `--set`, print the input schema with `--print-schema`, or emit an IPv6 example payload with `--print-v6-example`.
+This example reads LAN configuration for all LAN channels and emits JSON. You can apply a JSON configuration with `--set` **and** `--confirm-network-change`, print the input schema with `--print-schema`, or emit an IPv6 example payload with `--print-v6-example`. The example validates writes before starting a transaction and stops on the first uncertain result; `--force-write-all` is additionally needed for MAC fields that may be read-only.
+
+### LAN configuration and operational safety
+
+`ipmi-rs-core::transport` provides typed Get/Set LAN parameters (including alert destinations, IPv4, IPv6 static/dynamic addressing, DHCPv6 DUID/timing blocks, router fields, VLAN, authentication and ARP), plus `GetLanStatistics` and `ClearLanStatistics`. The latter two use Transport command `0x04` with explicit channel and clear flag; clearing statistics is a **mutation** and must not be retried after an ambiguous response. Known Get parameter values require revision `0x11` and validated lengths. For entries with a set or block selector, pass them on `GetLanConfigParameters` and use `LanConfigParameterResponse::parse_selected(parameter, set, block)` to verify the returned entry. For unsupported/OEM selectors use `LanConfigParameter::Other(n)` and raw payloads; this also retains unsupported revisions.
+
+Construct checked writes with `SetLanConfigParameters::checked(channel, typed_value)`; for unknown fields, `SetLanConfigParameters::new(channel, Other(n), raw_bytes)` is the explicit unchecked escape hatch. DUIDs use `Ipv6Duid::blocks()`/`from_blocks()`, DHCPv6 timing uses `Ipv6DhcpTiming::blocks()`/`from_blocks()`, and the two static routers have independent selectors (`ipv6_static_router_writes`). The bounded `lan_write_guarded(send, channel, writes)` helper validates **all** writes before beginning, issues set-in-progress, writes in order, commits only after all writes succeed, and attempts set-complete cleanup on every exit. It returns both the primary error and any cleanup error; it never retries writes or suppresses an unsupported commit.
+
+**Operator confirmation is essential:** changing IPv4 address/source/subnet/gateways, MAC, RMCP port, VLAN, IPv6 enablement/addresses/routers/DHCP settings, channel access or authentication can sever the management session immediately, even before commit. An application should verify the target, have alternate access/recovery ready, request explicit operator approval, and reconnect or read back from a *new* session after an uncertain result. Neither a timeout nor a nonzero completion code proves a mutation did not take effect; do not blindly resend it.
 
 ### `chassis`
 This RMCP+ example reads host chassis status by default. Provide the BMC address and port, and set
@@ -269,6 +277,7 @@ The following IPMI commands are currently supported in `ipmi-rs-core`:
 | Set / Get System Boot Options            | Chassis commands 0x08/0x09 |
 | Set LAN Configuration Parameters        | 23.1                  |
 | Get LAN Configuration Parameters        | 23.2                  |
+| Get / Clear LAN Statistics              | 23.3                  |
 | Set SOL Configuration Parameters        | 26.2                  |
 | Get SOL Configuration Parameters        | 26.3                  |
 | Activate / Deactivate Payload (SOL)     | 24.1 / 24.2           |

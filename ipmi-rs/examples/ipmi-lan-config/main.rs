@@ -25,6 +25,9 @@ pub struct Command {
     /// Attempt to write all fields, including ones that are often read-only
     #[clap(long)]
     force_write_all: bool,
+    /// Confirm that network settings may disconnect this session
+    #[clap(long)]
+    confirm_network_change: bool,
     /// Print JSON schema for the --set input and exit
     #[clap(long)]
     print_schema: bool,
@@ -50,6 +53,13 @@ fn main() -> std::io::Result<()> {
     if command.print_v6_example {
         println!("{}", render::render_ipv6_example());
         return Ok(());
+    }
+
+    if command.set.is_some() && !command.confirm_network_change {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "--set can sever management access; pass --confirm-network-change after checking the target",
+        ));
     }
 
     let mut ipmi = command.common.get_connection()?;

@@ -6,13 +6,13 @@ use crate::parse::{
 use crate::types::{ConfigInput, LanConfigInput};
 
 use ipmi_rs::{
-    connection::{Channel, CompletionErrorCode},
+    connection::Channel,
     transport::{
-        GetLanConfigParameters, LanConfigParameter, LanConfigParameterRequest,
-        SetLanConfigParameters,
+        lan_write_guarded, Ipv6HeaderFlowLabel, LanConfigParameter, LanConfigParameterRequest,
     },
-    IpmiError,
 };
+
+type Write = (LanConfigParameter, LanConfigParameterRequest);
 
 pub fn apply_config_file(
     ipmi: &mut common::IpmiConnectionEnum,
@@ -23,301 +23,175 @@ pub fn apply_config_file(
     let config: ConfigInput = serde_json::from_str(&contents)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
 
-    for entry in config.channels {
-        let channel = match Channel::new(entry.channel_number) {
-            Some(channel) => channel,
-            None => {
-                log::warn!(
-                    "Skipping invalid channel number 0x{:02X}",
-                    entry.channel_number
-                );
-                continue;
+    let planned: Vec<_> = config
+        .channels
+        .iter()
+        .map(|entry| {
+            let channel = Channel::new(entry.channel_number).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid channel 0x{:02X}", entry.channel_number),
+                )
+            })?;
+            let writes = prepare_writes(&entry.lan_config, force_write_all)
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+            for (_, request) in &writes {
+                request.try_to_bytes().map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("invalid channel {} LAN value: {error:?}", channel.value()),
+                    )
+                })?;
             }
-        };
+            Ok((channel, writes))
+        })
+        .collect::<std::io::Result<_>>()?;
 
-        apply_lan_config(ipmi, channel, &entry.lan_config, force_write_all);
-        wait_for_set_complete(ipmi, channel);
+    for (channel, writes) in planned {
+        lan_write_guarded(
+            |command| ipmi.send_recv(command),
+            channel,
+            &writes,
+        )
+        .map_err(|err| {
+            std::io::Error::other(format!(
+                "LAN channel {} write outcome may be uncertain; do not retry automatically: {err:?}",
+                channel.value()
+            ))
+        })?;
     }
-
     Ok(())
 }
 
-fn apply_lan_config(
-    ipmi: &mut common::IpmiConnectionEnum,
-    channel: Channel,
-    config: &LanConfigInput,
-    force_write_all: bool,
-) {
-    let _ = set_param(
-        ipmi,
-        channel,
-        LanConfigParameter::SetInProgress,
-        LanConfigParameterRequest::SetInProgress(0x01),
-    );
+fn required<T>(value: Option<T>, name: &str) -> Result<T, String> {
+    value.ok_or_else(|| format!("invalid {name}"))
+}
 
-    if let Some(ip_address) = config.ip_address.as_deref() {
-        if let Some(value) = parse_ipv4(ip_address) {
-            let _ = set_param(
-                ipmi,
-                channel,
-                LanConfigParameter::IpAddress,
-                LanConfigParameterRequest::IpAddress(value),
-            );
+fn prepare_writes(config: &LanConfigInput, force_write_all: bool) -> Result<Vec<Write>, String> {
+    use LanConfigParameterRequest as R;
+    let mut writes = Vec::new();
+    let mut add = |request: R| {
+        writes.push((request.parameter().expect("typed LAN request"), request));
+    };
+
+    if let Some(value) = config.ip_address.as_deref() {
+        add(R::IpAddress(required(parse_ipv4(value), "IPv4 address")?));
+    }
+    if let Some(value) = config.subnet_mask.as_deref() {
+        add(R::SubnetMask(required(parse_ipv4(value), "subnet mask")?));
+    }
+    if let Some(value) = config.gateway.as_deref() {
+        add(R::DefaultGatewayAddress(required(
+            parse_ipv4(value),
+            "gateway",
+        )?));
+    }
+    if let Some(value) = config.mac_address.as_deref() {
+        if force_write_all {
+            add(R::MacAddress(required(parse_mac(value), "MAC address")?));
         } else {
-            log::warn!("Invalid IPv4 address: {ip_address}");
+            log::warn!("Skipping MAC address write; this parameter is often read-only (use --force-write-all to override)");
         }
     }
-
-    if let Some(subnet_mask) = config.subnet_mask.as_deref() {
-        if let Some(value) = parse_ipv4(subnet_mask) {
-            let _ = set_param(
-                ipmi,
-                channel,
-                LanConfigParameter::SubnetMask,
-                LanConfigParameterRequest::SubnetMask(value),
-            );
-        } else {
-            log::warn!("Invalid subnet mask: {subnet_mask}");
-        }
+    if let Some(value) = config.ip_source.as_deref() {
+        add(R::AddressSource(required(
+            parse_ip_source(value),
+            "IP source",
+        )?));
     }
-
-    if let Some(gateway) = config.gateway.as_deref() {
-        if let Some(value) = parse_ipv4(gateway) {
-            let _ = set_param(
-                ipmi,
-                channel,
-                LanConfigParameter::DefaultGatewayAddress,
-                LanConfigParameterRequest::DefaultGatewayAddress(value),
-            );
-        } else {
-            log::warn!("Invalid gateway address: {gateway}");
-        }
+    if let Some(value) = config.ipv6_ipv4_addressing_enables.as_deref() {
+        add(R::Ipv6Ipv4AddressingEnables(required(
+            parse_ipv6_ipv4_enables(value),
+            "IPv6/IPv4 enables",
+        )?));
     }
-
-    if let Some(mac_address) = config.mac_address.as_deref() {
-        if !force_write_all {
-            log::warn!(
-                "Skipping MAC address write; this parameter is often read-only (use --force-write-all to override)"
-            );
-        } else if let Some(value) = parse_mac(mac_address) {
-            let _ = set_param(
-                ipmi,
-                channel,
-                LanConfigParameter::MacAddress,
-                LanConfigParameterRequest::MacAddress(value),
-            );
-        } else {
-            log::warn!("Invalid MAC address: {mac_address}");
-        }
-    }
-
-    if let Some(ip_source) = config.ip_source.as_deref() {
-        if let Some(value) = parse_ip_source(ip_source) {
-            let _ = set_param(
-                ipmi,
-                channel,
-                LanConfigParameter::IpAddressSource,
-                LanConfigParameterRequest::IpAddressSource(value.into()),
-            );
-        } else {
-            log::warn!("Invalid IP source: {ip_source}");
-        }
-    }
-
-    if let Some(enables) = config.ipv6_ipv4_addressing_enables.as_deref() {
-        if let Some(value) = parse_ipv6_ipv4_enables(enables) {
-            let _ = set_param(
-                ipmi,
-                channel,
-                LanConfigParameter::Ipv6Ipv4AddressingEnables,
-                LanConfigParameterRequest::Ipv6Ipv4AddressingEnables(value),
-            );
-        } else {
-            log::warn!("Invalid IPv6/IPv4 enables: {enables}");
-        }
-    }
-
     if let Some(value) = config.ipv6_header_static_traffic_class.as_deref() {
-        if let Some(byte) = parse_u8(value) {
-            let _ = set_param(
-                ipmi,
-                channel,
-                LanConfigParameter::Ipv6HeaderStaticTrafficClass,
-                LanConfigParameterRequest::Ipv6HeaderStaticTrafficClass(byte),
-            );
-        } else {
-            log::warn!("Invalid IPv6 traffic class: {value}");
-        }
+        add(R::Ipv6HeaderStaticTrafficClass(required(
+            parse_u8(value),
+            "IPv6 traffic class",
+        )?));
     }
-
     if let Some(value) = config.ipv6_header_static_hop_limit.as_deref() {
-        if let Some(byte) = parse_u8(value) {
-            let _ = set_param(
-                ipmi,
-                channel,
-                LanConfigParameter::Ipv6HeaderStaticHopLimit,
-                LanConfigParameterRequest::Ipv6HeaderStaticHopLimit(byte),
-            );
-        } else {
-            log::warn!("Invalid IPv6 hop limit: {value}");
-        }
+        add(R::Ipv6HeaderStaticHopLimit(required(
+            parse_u8(value),
+            "IPv6 hop limit",
+        )?));
     }
-
     if let Some(value) = config.ipv6_header_flow_label.as_deref() {
-        if let Some(bytes) = parse_u24(value) {
-            let _ = set_param(
-                ipmi,
-                channel,
-                LanConfigParameter::Ipv6HeaderFlowLabel,
-                LanConfigParameterRequest::Raw(bytes),
-            );
-        } else {
-            log::warn!("Invalid IPv6 flow label: {value}");
-        }
+        let bytes = required(parse_u24(value), "IPv6 flow label")?;
+        add(R::Ipv6HeaderFlowLabel(Ipv6HeaderFlowLabel(
+            u32::from_be_bytes([0, bytes[0], bytes[1], bytes[2]]),
+        )));
     }
-
-    if let Some(addresses) = config.ipv6_static_addresses.as_ref() {
+    if let Some(addresses) = &config.ipv6_static_addresses {
         for entry in addresses {
-            if let Some(address) = parse_ipv6(&entry.address) {
-                let enabled = entry.enabled.unwrap_or(true);
-                let source_type = entry.source_type.unwrap_or(0);
-                let status = entry.status.unwrap_or(0);
-                let _ = set_param(
-                    ipmi,
-                    channel,
-                    LanConfigParameter::Ipv6StaticAddresses,
-                    LanConfigParameterRequest::Ipv6StaticAddress {
-                        set_selector: entry.set_selector,
-                        enabled,
-                        source_type,
-                        address,
-                        prefix_length: entry.prefix_length,
-                        status,
-                    },
-                );
-            } else {
-                log::warn!("Invalid IPv6 address: {}", entry.address);
-            }
+            add(R::Ipv6StaticAddress {
+                set_selector: entry.set_selector,
+                enabled: entry.enabled.unwrap_or(true),
+                source_type: entry.source_type.unwrap_or(0),
+                address: required(parse_ipv6(&entry.address), "IPv6 static address")?,
+                prefix_length: entry.prefix_length,
+                status: entry.status.unwrap_or(0),
+            });
         }
     }
-
-    if let Some(default_gateway_mac) = config.default_gateway_mac.as_deref() {
-        if !force_write_all {
-            log::warn!(
-                "Skipping default gateway MAC write; this parameter is often read-only (use --force-write-all to override)"
-            );
-        } else if let Some(value) = parse_mac(default_gateway_mac) {
-            let _ = set_param(
-                ipmi,
-                channel,
-                LanConfigParameter::DefaultGatewayMacAddress,
-                LanConfigParameterRequest::DefaultGatewayMacAddress(value),
-            );
+    if let Some(value) = config.default_gateway_mac.as_deref() {
+        if force_write_all {
+            add(R::DefaultGatewayMacAddress(required(
+                parse_mac(value),
+                "default gateway MAC",
+            )?));
         } else {
-            log::warn!("Invalid default gateway MAC: {default_gateway_mac}");
+            log::warn!("Skipping default gateway MAC write; this parameter is often read-only (use --force-write-all to override)");
         }
     }
-
-    if let Some(backup_gateway) = config.backup_gateway.as_deref() {
-        if let Some(value) = parse_ipv4(backup_gateway) {
-            let _ = set_param(
-                ipmi,
-                channel,
-                LanConfigParameter::BackupGatewayAddress,
-                LanConfigParameterRequest::BackupGatewayAddress(value),
-            );
+    if let Some(value) = config.backup_gateway.as_deref() {
+        add(R::BackupGatewayAddress(required(
+            parse_ipv4(value),
+            "backup gateway",
+        )?));
+    }
+    if let Some(value) = config.backup_gateway_mac.as_deref() {
+        if force_write_all {
+            add(R::BackupGatewayMacAddress(required(
+                parse_mac(value),
+                "backup gateway MAC",
+            )?));
         } else {
-            log::warn!("Invalid backup gateway address: {backup_gateway}");
+            log::warn!("Skipping backup gateway MAC write; this parameter is often read-only (use --force-write-all to override)");
         }
     }
 
-    if let Some(backup_gateway_mac) = config.backup_gateway_mac.as_deref() {
-        if !force_write_all {
-            log::warn!(
-                "Skipping backup gateway MAC write; this parameter is often read-only (use --force-write-all to override)"
-            );
-        } else if let Some(value) = parse_mac(backup_gateway_mac) {
-            let _ = set_param(
-                ipmi,
-                channel,
-                LanConfigParameter::BackupGatewayMacAddress,
-                LanConfigParameterRequest::BackupGatewayMacAddress(value),
-            );
-        } else {
-            log::warn!("Invalid backup gateway MAC: {backup_gateway_mac}");
-        }
-    }
-
-    let _ = set_param(
-        ipmi,
-        channel,
-        LanConfigParameter::SetInProgress,
-        LanConfigParameterRequest::SetInProgress(0x00),
-    );
+    Ok(writes)
 }
 
-fn wait_for_set_complete(ipmi: &mut common::IpmiConnectionEnum, channel: Channel) {
-    let retry_delay = std::time::Duration::from_millis(250);
-    let max_attempts = 20;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    for _ in 0..max_attempts {
-        let response = match ipmi.send_recv(GetLanConfigParameters::new(
-            channel,
-            LanConfigParameter::SetInProgress,
-        )) {
-            Ok(response) => response,
-            Err(IpmiError::Failed {
-                completion_code: CompletionErrorCode::CommandSpecific(0x80),
-                ..
-            })
-            | Err(IpmiError::Command {
-                completion_code: Some(CompletionErrorCode::CommandSpecific(0x80)),
-                ..
-            }) => return,
-            Err(err) => {
-                log::warn!("Get LAN Config SetInProgress failed: {err:?}");
-                return;
-            }
+    #[test]
+    fn invalid_example_config_fails_before_any_write() {
+        let config = LanConfigInput {
+            ip_address: Some("192.0.2.4".into()),
+            ipv6_static_addresses: Some(vec![crate::types::Ipv6AddressEntryInput {
+                set_selector: 1,
+                enabled: Some(true),
+                source_type: Some(0),
+                address: "2001:db8::1".into(),
+                prefix_length: 129,
+                status: None,
+            }]),
+            ..Default::default()
         };
-
-        if let Some(state) = response.data.get(0) {
-            if (state & 0x03) == 0x00 {
-                return;
-            }
-        }
-
-        std::thread::sleep(retry_delay);
-    }
-
-    log::warn!("Set In Progress did not complete after polling");
-}
-
-fn set_param(
-    ipmi: &mut common::IpmiConnectionEnum,
-    channel: Channel,
-    param: LanConfigParameter,
-    request: LanConfigParameterRequest,
-) -> bool {
-    let response = ipmi.send_recv(SetLanConfigParameters::from_request(
-        channel, param, request,
-    ));
-
-    match response {
-        Ok(_) => true,
-        Err(IpmiError::Failed {
-            completion_code: CompletionErrorCode::CommandSpecific(0x80),
-            ..
-        })
-        | Err(IpmiError::Command {
-            completion_code: Some(CompletionErrorCode::CommandSpecific(0x80)),
-            ..
-        }) => {
-            log::warn!("LAN config parameter {param:?} not supported");
-            false
-        }
-        Err(err) => {
-            log::warn!("Set LAN config {param:?} failed: {err:?}");
-            false
-        }
+        let writes = prepare_writes(&config, false).unwrap();
+        let result = lan_write_guarded(
+            |_command| -> Result<(), ()> { panic!("no write should be sent") },
+            Channel::Current,
+            &writes,
+        );
+        assert!(matches!(
+            result,
+            Err(ipmi_rs::transport::LanWriteError::Validation(_))
+        ));
     }
 }

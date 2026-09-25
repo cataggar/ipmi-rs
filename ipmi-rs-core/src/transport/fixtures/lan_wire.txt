@@ -1,0 +1,39 @@
+# selector:set:block:revision_and_body:expected_kind
+00:00:00:11 00:SetInProgress
+03:00:00:11 C0 00 02 01:IpAddress
+07:00:00:11 40 E0 1E:IpHeader
+08:00:00:11 02 6F:PrimaryRmcpPort
+0A:00:00:11 03:BmcArpControl
+10:00:00:11 70 75 62 6C 69 63 00 00 00 00 00 00 00 00 00 00 00 00:SnmpCommunity
+11:00:00:11 03:NumberOfAlertDestinations
+12:02:00:11 02 80 05 07:AlertDestinationType
+13:02:00:11 02 00 01 C0 00 02 0A AA BB CC DD EE FF:AlertDestinationAddress
+13:02:00:11 02 10 00 20 01 0D B8:AlertDestinationAddress
+14:00:00:11 64 80:VlanId
+17:00:00:11 00 01 02 03:CipherSuites
+1A:00:00:11 01 04 1E 00 3C 00:BadPasswordThreshold
+32:00:00:11 07:Ipv6Ipv4Support
+36:00:00:11 0A BC DE:Ipv6HeaderFlowLabel
+38:01:00:11 01 80 20 01 0D B8 00 00 00 00 00 00 00 00 00 00 00 01 40 00:Ipv6StaticAddresses
+3A:02:00:11 02 00 04 00 01 AA BB:Ipv6StaticDuid
+3B:01:00:11 01 02 20 01 0D B8 00 00 00 00 00 00 00 00 00 00 00 02 40 00:Ipv6DynamicAddress
+3E:00:00:11 02:Ipv6DhcpTimingSupport
+3F:02:01:11 02 01 11 12 13 14 15 16:Ipv6DhcpTiming
+40:00:00:11 03:Ipv6RouterControl
+41:00:00:11 20 01 0D B8 00 00 00 00 00 00 00 00 00 00 00 01:Ipv6StaticRouter1Address
+43:00:00:11 40:Ipv6StaticRouter1PrefixLength
+4A:01:00:11 01 20 01 0D B8 00 00 00 00 00 00 00 00 00 00 00 01:Ipv6DynamicRouterAddress
+4C:01:00:11 01 40:Ipv6DynamicRouterPrefixLength
+4F:00:00:11 01:Ipv6NdSlaacTimingSupport
+50:02:00:11 02 00 01 02 03:Ipv6NdSlaacTiming
+FE:00:00:10 DE AD BE EF:Raw
+# malformed or unsupported known parameter responses
+bad:12:02:00:10 02 80 05 07:UnsupportedRevision
+bad:13:02:00:11 02 00 01 C0:InvalidLength
+bad:38:01:00:11 01 80 20 01 0D B8 00 00 00 00 00 00 00 00 00 00 00 01 81 00:InvalidPrefix
+bad:3A:02:00:11 02 00 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F 10:InvalidLength
+bad:3E:00:00:11 03:InvalidValue
+bad:40:00:00:11 80:InvalidValue
+cc:12:02:00:80:CommandSpecific
+cc:3F:02:01:81:CommandSpecific
+cc:41:00:00:C9:ParameterOutOfRange

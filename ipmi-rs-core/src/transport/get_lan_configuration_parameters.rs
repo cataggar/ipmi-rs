@@ -1,5 +1,12 @@
 use crate::connection::{Channel, IpmiCommand, Message, NetFn, NotEnoughData};
 
+use super::lan_types::{length, prefix};
+use super::{
+    Ipv6DynamicRouter, Ipv6LanBlock, Ipv6RouterControl, Ipv6TimingSupport,
+    LanAlertDestinationAddress, LanAlertDestinationType, LanArpControl, LanBadPasswordThreshold,
+    LanConfigError, LanIpv4Header, LanSetInProgress, LanVlanId,
+};
+
 /// Get LAN Configuration Parameters command.
 ///
 /// Reference: IPMI 2.0 Specification, Table 23-3.
@@ -66,11 +73,11 @@ impl From<GetLanConfigParameters> for Message {
 
 impl IpmiCommand for GetLanConfigParameters {
     type Output = LanConfigParameterResponse;
-    type Error = NotEnoughData;
+    type Error = LanConfigError;
 
     fn parse_success_response(data: &[u8]) -> Result<Self::Output, Self::Error> {
         if data.is_empty() {
-            return Err(NotEnoughData);
+            return Err(LanConfigError::MissingRevision);
         }
 
         Ok(LanConfigParameterResponse {
@@ -83,7 +90,7 @@ impl IpmiCommand for GetLanConfigParameters {
 /// LAN configuration parameters.
 ///
 /// Reference: IPMI 2.0 Specification, Table 23-4.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LanConfigParameter {
     SetInProgress,
     AuthTypeSupport,
@@ -92,10 +99,25 @@ pub enum LanConfigParameter {
     IpAddressSource,
     MacAddress,
     SubnetMask,
+    IpHeader,
+    PrimaryRmcpPort,
+    SecondaryRmcpPort,
+    BmcArpControl,
+    GratuitousArpInterval,
     DefaultGatewayAddress,
     DefaultGatewayMacAddress,
     BackupGatewayAddress,
     BackupGatewayMacAddress,
+    SnmpCommunity,
+    NumberOfAlertDestinations,
+    AlertDestinationType,
+    AlertDestinationAddress,
+    VlanId,
+    VlanPriority,
+    CipherSuiteCount,
+    CipherSuites,
+    CipherSuitePrivilegeLevels,
+    BadPasswordThreshold,
     Ipv6Ipv4Support,
     Ipv6Ipv4AddressingEnables,
     Ipv6HeaderStaticTrafficClass,
@@ -103,7 +125,31 @@ pub enum LanConfigParameter {
     Ipv6HeaderFlowLabel,
     Ipv6Status,
     Ipv6StaticAddresses,
+    Ipv6StaticDuidStorageLength,
+    Ipv6StaticDuid,
     Ipv6DynamicAddress,
+    Ipv6DynamicDuidStorageLength,
+    Ipv6DynamicDuid,
+    Ipv6DhcpTimingSupport,
+    Ipv6DhcpTiming,
+    Ipv6RouterControl,
+    Ipv6StaticRouter1Address,
+    Ipv6StaticRouter1Mac,
+    Ipv6StaticRouter1PrefixLength,
+    Ipv6StaticRouter1Prefix,
+    Ipv6StaticRouter2Address,
+    Ipv6StaticRouter2Mac,
+    Ipv6StaticRouter2PrefixLength,
+    Ipv6StaticRouter2Prefix,
+    Ipv6DynamicRouterCount,
+    Ipv6DynamicRouterAddress,
+    Ipv6DynamicRouterMac,
+    Ipv6DynamicRouterPrefixLength,
+    Ipv6DynamicRouterPrefix,
+    Ipv6DynamicHopLimit,
+    Ipv6NdSlaacTimingSupport,
+    Ipv6NdSlaacTiming,
+    /// Unrecognized/OEM parameter, returned as raw bytes.
     Other(u8),
 }
 
@@ -118,10 +164,25 @@ impl LanConfigParameter {
             LanConfigParameter::IpAddressSource => 4,
             LanConfigParameter::MacAddress => 5,
             LanConfigParameter::SubnetMask => 6,
+            LanConfigParameter::IpHeader => 7,
+            LanConfigParameter::PrimaryRmcpPort => 8,
+            LanConfigParameter::SecondaryRmcpPort => 9,
+            LanConfigParameter::BmcArpControl => 10,
+            LanConfigParameter::GratuitousArpInterval => 11,
             LanConfigParameter::DefaultGatewayAddress => 12,
             LanConfigParameter::DefaultGatewayMacAddress => 13,
             LanConfigParameter::BackupGatewayAddress => 14,
             LanConfigParameter::BackupGatewayMacAddress => 15,
+            LanConfigParameter::SnmpCommunity => 16,
+            LanConfigParameter::NumberOfAlertDestinations => 17,
+            LanConfigParameter::AlertDestinationType => 18,
+            LanConfigParameter::AlertDestinationAddress => 19,
+            LanConfigParameter::VlanId => 20,
+            LanConfigParameter::VlanPriority => 21,
+            LanConfigParameter::CipherSuiteCount => 22,
+            LanConfigParameter::CipherSuites => 23,
+            LanConfigParameter::CipherSuitePrivilegeLevels => 24,
+            LanConfigParameter::BadPasswordThreshold => 26,
             LanConfigParameter::Ipv6Ipv4Support => 50,
             LanConfigParameter::Ipv6Ipv4AddressingEnables => 51,
             LanConfigParameter::Ipv6HeaderStaticTrafficClass => 52,
@@ -129,26 +190,98 @@ impl LanConfigParameter {
             LanConfigParameter::Ipv6HeaderFlowLabel => 54,
             LanConfigParameter::Ipv6Status => 55,
             LanConfigParameter::Ipv6StaticAddresses => 56,
+            LanConfigParameter::Ipv6StaticDuidStorageLength => 57,
+            LanConfigParameter::Ipv6StaticDuid => 58,
             LanConfigParameter::Ipv6DynamicAddress => 59,
+            LanConfigParameter::Ipv6DynamicDuidStorageLength => 60,
+            LanConfigParameter::Ipv6DynamicDuid => 61,
+            LanConfigParameter::Ipv6DhcpTimingSupport => 62,
+            LanConfigParameter::Ipv6DhcpTiming => 63,
+            LanConfigParameter::Ipv6RouterControl => 64,
+            LanConfigParameter::Ipv6StaticRouter1Address => 65,
+            LanConfigParameter::Ipv6StaticRouter1Mac => 66,
+            LanConfigParameter::Ipv6StaticRouter1PrefixLength => 67,
+            LanConfigParameter::Ipv6StaticRouter1Prefix => 68,
+            LanConfigParameter::Ipv6StaticRouter2Address => 69,
+            LanConfigParameter::Ipv6StaticRouter2Mac => 70,
+            LanConfigParameter::Ipv6StaticRouter2PrefixLength => 71,
+            LanConfigParameter::Ipv6StaticRouter2Prefix => 72,
+            LanConfigParameter::Ipv6DynamicRouterCount => 73,
+            LanConfigParameter::Ipv6DynamicRouterAddress => 74,
+            LanConfigParameter::Ipv6DynamicRouterMac => 75,
+            LanConfigParameter::Ipv6DynamicRouterPrefixLength => 76,
+            LanConfigParameter::Ipv6DynamicRouterPrefix => 77,
+            LanConfigParameter::Ipv6DynamicHopLimit => 78,
+            LanConfigParameter::Ipv6NdSlaacTimingSupport => 79,
+            LanConfigParameter::Ipv6NdSlaacTiming => 80,
             LanConfigParameter::Other(value) => *value,
         }
     }
 
     /// Parse known LAN configuration parameter data.
-    pub fn parse(&self, data: &[u8]) -> Result<LanConfigParameterData, NotEnoughData> {
+    pub fn parse(&self, data: &[u8]) -> Result<LanConfigParameterData, LanConfigError> {
         use LanConfigParameterData::*;
 
-        if data.is_empty() {
-            return Ok(None);
+        if matches!(self, LanConfigParameter::Other(_)) {
+            return Ok(Raw(data.to_vec()));
         }
 
+        let expected = match self {
+            Self::AuthTypeEnables => 5,
+            Self::IpAddress
+            | Self::SubnetMask
+            | Self::DefaultGatewayAddress
+            | Self::BackupGatewayAddress
+            | Self::AlertDestinationType => 4,
+            Self::MacAddress
+            | Self::DefaultGatewayMacAddress
+            | Self::BackupGatewayMacAddress
+            | Self::BadPasswordThreshold => 6,
+            Self::IpHeader | Self::Ipv6HeaderFlowLabel | Self::Ipv6Status => 3,
+            Self::PrimaryRmcpPort | Self::SecondaryRmcpPort | Self::VlanId => 2,
+            Self::SnmpCommunity => 18,
+            Self::AlertDestinationAddress => 0,
+            Self::CipherSuites => 0,
+            Self::CipherSuitePrivilegeLevels => 9,
+            Self::Ipv6StaticAddresses | Self::Ipv6DynamicAddress => 20,
+            Self::Ipv6StaticRouter1Address
+            | Self::Ipv6StaticRouter1Prefix
+            | Self::Ipv6StaticRouter2Address
+            | Self::Ipv6StaticRouter2Prefix => 16,
+            Self::Ipv6StaticRouter1Mac | Self::Ipv6StaticRouter2Mac => 6,
+            Self::Ipv6DynamicRouterAddress | Self::Ipv6DynamicRouterPrefix => 17,
+            Self::Ipv6DynamicRouterMac => 7,
+            Self::Ipv6DynamicRouterPrefixLength => 2,
+            Self::Ipv6StaticDuid
+            | Self::Ipv6DynamicDuid
+            | Self::Ipv6DhcpTiming
+            | Self::Ipv6NdSlaacTiming => 0,
+            _ => 1,
+        };
+        if expected != 0 {
+            length(data, expected)?;
+        }
         let value = match self {
+            Self::SetInProgress => SetInProgress(LanSetInProgress::parse(data[0])?),
+            Self::AuthTypeSupport => AuthTypeSupport(data[0]),
+            Self::AuthTypeEnables => AuthTypeEnables(data.try_into().expect("checked length")),
             LanConfigParameter::IpAddress => IpAddress(Ipv4Address::from_slice(data)?),
             LanConfigParameter::IpAddressSource => {
+                if data[0] & 0xf0 != 0 {
+                    return Err(LanConfigError::InvalidValue(data[0]));
+                }
                 IpAddressSource(self::IpAddressSource::from(data[0]))
             }
             LanConfigParameter::MacAddress => MacAddress(self::MacAddress::from_slice(data)?),
             LanConfigParameter::SubnetMask => SubnetMask(Ipv4Address::from_slice(data)?),
+            Self::IpHeader => IpHeader(LanIpv4Header(data.try_into().expect("checked length"))),
+            Self::PrimaryRmcpPort => PrimaryRmcpPort(u16::from_be_bytes([data[0], data[1]])),
+            Self::SecondaryRmcpPort => SecondaryRmcpPort(u16::from_be_bytes([data[0], data[1]])),
+            Self::BmcArpControl => BmcArpControl(LanArpControl {
+                arp_responses: data[0] & 2 != 0,
+                gratuitous_arp: data[0] & 1 != 0,
+            }),
+            Self::GratuitousArpInterval => GratuitousArpInterval(data[0]),
             LanConfigParameter::DefaultGatewayAddress => {
                 DefaultGatewayAddress(Ipv4Address::from_slice(data)?)
             }
@@ -161,6 +294,32 @@ impl LanConfigParameter {
             LanConfigParameter::BackupGatewayMacAddress => {
                 BackupGatewayMacAddress(self::MacAddress::from_slice(data)?)
             }
+            Self::SnmpCommunity => SnmpCommunity(data.try_into().expect("checked length")),
+            Self::NumberOfAlertDestinations => NumberOfAlertDestinations(data[0] & 0x0f),
+            Self::AlertDestinationType => {
+                AlertDestinationType(LanAlertDestinationType::parse(data)?)
+            }
+            Self::AlertDestinationAddress => {
+                AlertDestinationAddress(LanAlertDestinationAddress::parse(data)?)
+            }
+            Self::VlanId => VlanId(LanVlanId::parse(data)?),
+            Self::VlanPriority => VlanPriority(data[0] & 7),
+            Self::CipherSuiteCount => CipherSuiteCount(data[0]),
+            Self::CipherSuites => {
+                if data.is_empty() || data.len() > 17 {
+                    return Err(LanConfigError::InvalidLength {
+                        expected: 17,
+                        actual: data.len(),
+                    });
+                }
+                CipherSuites(data.to_vec())
+            }
+            Self::CipherSuitePrivilegeLevels => {
+                CipherSuitePrivilegeLevels(data.try_into().expect("checked length"))
+            }
+            Self::BadPasswordThreshold => {
+                BadPasswordThreshold(LanBadPasswordThreshold::parse(data)?)
+            }
             LanConfigParameter::Ipv6Ipv4Support => {
                 Ipv6Ipv4Support(self::Ipv6Ipv4Support::from(data[0]))
             }
@@ -172,7 +331,11 @@ impl LanConfigParameter {
             }
             LanConfigParameter::Ipv6HeaderStaticHopLimit => Ipv6HeaderStaticHopLimit(data[0]),
             LanConfigParameter::Ipv6HeaderFlowLabel => {
-                Ipv6HeaderFlowLabel(self::Ipv6HeaderFlowLabel::from_slice(data)?)
+                let raw = self::Ipv6HeaderFlowLabel::from_slice(data)?;
+                if data[0] & 0xf0 != 0 {
+                    return Err(LanConfigError::InvalidValue(data[0]));
+                }
+                Ipv6HeaderFlowLabel(raw)
             }
             LanConfigParameter::Ipv6Status => Ipv6Status(self::Ipv6Status::from_slice(data)?),
             LanConfigParameter::Ipv6StaticAddresses => {
@@ -181,6 +344,66 @@ impl LanConfigParameter {
             LanConfigParameter::Ipv6DynamicAddress => {
                 Ipv6DynamicAddress(self::Ipv6DynamicAddress::from_slice(data)?)
             }
+            Self::Ipv6StaticDuidStorageLength => Ipv6StaticDuidStorageLength(data[0]),
+            Self::Ipv6DynamicDuidStorageLength => Ipv6DynamicDuidStorageLength(data[0]),
+            Self::Ipv6DhcpTimingSupport => Ipv6DhcpTimingSupport(data[0].try_into()?),
+            Self::Ipv6NdSlaacTimingSupport => Ipv6NdSlaacTimingSupport(data[0].try_into()?),
+            Self::Ipv6StaticDuid => Ipv6StaticDuid(Ipv6LanBlock::parse(data)?),
+            Self::Ipv6DynamicDuid => Ipv6DynamicDuid(Ipv6LanBlock::parse(data)?),
+            Self::Ipv6DhcpTiming => Ipv6DhcpTiming(Ipv6LanBlock::parse(data)?),
+            Self::Ipv6NdSlaacTiming => Ipv6NdSlaacTiming(Ipv6LanBlock::parse(data)?),
+            Self::Ipv6RouterControl => {
+                if data[0] & !3 != 0 {
+                    return Err(LanConfigError::InvalidValue(data[0]));
+                }
+                Ipv6RouterControl(self::Ipv6RouterControl {
+                    static_routers: data[0] & 1 != 0,
+                    dynamic_routers: data[0] & 2 != 0,
+                })
+            }
+            Self::Ipv6StaticRouter1Address => {
+                Ipv6StaticRouter1Address(Ipv6Address::from_slice(data)?)
+            }
+            Self::Ipv6StaticRouter2Address => {
+                Ipv6StaticRouter2Address(Ipv6Address::from_slice(data)?)
+            }
+            Self::Ipv6StaticRouter1Mac => Ipv6StaticRouter1Mac(self::MacAddress::from_slice(data)?),
+            Self::Ipv6StaticRouter2Mac => Ipv6StaticRouter2Mac(self::MacAddress::from_slice(data)?),
+            Self::Ipv6StaticRouter1PrefixLength => {
+                prefix(data[0])?;
+                Ipv6StaticRouter1PrefixLength(data[0])
+            }
+            Self::Ipv6StaticRouter2PrefixLength => {
+                prefix(data[0])?;
+                Ipv6StaticRouter2PrefixLength(data[0])
+            }
+            Self::Ipv6StaticRouter1Prefix => {
+                Ipv6StaticRouter1Prefix(Ipv6Address::from_slice(data)?)
+            }
+            Self::Ipv6StaticRouter2Prefix => {
+                Ipv6StaticRouter2Prefix(Ipv6Address::from_slice(data)?)
+            }
+            Self::Ipv6DynamicRouterCount => Ipv6DynamicRouterCount(data[0]),
+            Self::Ipv6DynamicRouterAddress => Ipv6DynamicRouterAddress(Ipv6DynamicRouter {
+                set_selector: data[0],
+                value: Ipv6Address::from_slice(&data[1..])?,
+            }),
+            Self::Ipv6DynamicRouterMac => Ipv6DynamicRouterMac(Ipv6DynamicRouter {
+                set_selector: data[0],
+                value: self::MacAddress::from_slice(&data[1..])?,
+            }),
+            Self::Ipv6DynamicRouterPrefixLength => {
+                prefix(data[1])?;
+                Ipv6DynamicRouterPrefixLength(Ipv6DynamicRouter {
+                    set_selector: data[0],
+                    value: data[1],
+                })
+            }
+            Self::Ipv6DynamicRouterPrefix => Ipv6DynamicRouterPrefix(Ipv6DynamicRouter {
+                set_selector: data[0],
+                value: Ipv6Address::from_slice(&data[1..])?,
+            }),
+            Self::Ipv6DynamicHopLimit => Ipv6DynamicHopLimit(data[0]),
             _ => Raw(data.to_vec()),
         };
 
@@ -200,8 +423,48 @@ impl LanConfigParameterResponse {
     pub fn parse(
         &self,
         parameter: LanConfigParameter,
-    ) -> Result<LanConfigParameterData, NotEnoughData> {
+    ) -> Result<LanConfigParameterData, LanConfigError> {
+        if !matches!(parameter, LanConfigParameter::Other(_)) && self.parameter_revision != 0x11 {
+            return Err(LanConfigError::UnsupportedRevision(self.parameter_revision));
+        }
         parameter.parse(&self.data)
+    }
+
+    /// Decode an entry and check its returned set/block selectors against the request.
+    /// Unlike [`Self::parse`], this prevents silently accepting a different entry.
+    pub fn parse_selected(
+        &self,
+        parameter: LanConfigParameter,
+        set_selector: u8,
+        block_selector: u8,
+    ) -> Result<LanConfigParameterData, LanConfigError> {
+        use LanConfigParameterData as D;
+        let value = self.parse(parameter)?;
+        let selected = match &value {
+            D::AlertDestinationType(v) => Some((v.set_selector, None)),
+            D::AlertDestinationAddress(LanAlertDestinationAddress::Ipv4 {
+                set_selector, ..
+            }) => Some((*set_selector, None)),
+            D::AlertDestinationAddress(LanAlertDestinationAddress::Other(v)) => Some((v[0], None)),
+            D::Ipv6StaticAddresses(v) => Some((v.set_selector, None)),
+            D::Ipv6DynamicAddress(v) => Some((v.set_selector, None)),
+            D::Ipv6StaticDuid(v)
+            | D::Ipv6DynamicDuid(v)
+            | D::Ipv6DhcpTiming(v)
+            | D::Ipv6NdSlaacTiming(v) => Some((v.set_selector, Some(v.block_selector))),
+            D::Ipv6DynamicRouterAddress(v) | D::Ipv6DynamicRouterPrefix(v) => {
+                Some((v.set_selector, None))
+            }
+            D::Ipv6DynamicRouterMac(v) => Some((v.set_selector, None)),
+            D::Ipv6DynamicRouterPrefixLength(v) => Some((v.set_selector, None)),
+            _ => None,
+        };
+        if let Some((set, block)) = selected {
+            if set != set_selector || block.is_some_and(|b| b != block_selector) {
+                return Err(LanConfigError::SelectorMismatch);
+            }
+        }
+        Ok(value)
     }
 }
 
@@ -209,14 +472,32 @@ impl LanConfigParameterResponse {
 #[derive(Clone, Debug, PartialEq)]
 pub enum LanConfigParameterData {
     None,
+    SetInProgress(LanSetInProgress),
+    AuthTypeSupport(u8),
+    AuthTypeEnables([u8; 5]),
     IpAddress(Ipv4Address),
     IpAddressSource(IpAddressSource),
     MacAddress(MacAddress),
     SubnetMask(Ipv4Address),
+    IpHeader(LanIpv4Header),
+    PrimaryRmcpPort(u16),
+    SecondaryRmcpPort(u16),
+    BmcArpControl(LanArpControl),
+    GratuitousArpInterval(u8),
     DefaultGatewayAddress(Ipv4Address),
     DefaultGatewayMacAddress(MacAddress),
     BackupGatewayAddress(Ipv4Address),
     BackupGatewayMacAddress(MacAddress),
+    SnmpCommunity([u8; 18]),
+    NumberOfAlertDestinations(u8),
+    AlertDestinationType(LanAlertDestinationType),
+    AlertDestinationAddress(LanAlertDestinationAddress),
+    VlanId(LanVlanId),
+    VlanPriority(u8),
+    CipherSuiteCount(u8),
+    CipherSuites(Vec<u8>),
+    CipherSuitePrivilegeLevels([u8; 9]),
+    BadPasswordThreshold(LanBadPasswordThreshold),
     Ipv6Ipv4Support(Ipv6Ipv4Support),
     Ipv6Ipv4AddressingEnables(Ipv6Ipv4Enables),
     Ipv6HeaderStaticTrafficClass(u8),
@@ -224,7 +505,30 @@ pub enum LanConfigParameterData {
     Ipv6HeaderFlowLabel(Ipv6HeaderFlowLabel),
     Ipv6Status(Ipv6Status),
     Ipv6StaticAddresses(Ipv6StaticAddress),
+    Ipv6StaticDuidStorageLength(u8),
+    Ipv6StaticDuid(Ipv6LanBlock),
     Ipv6DynamicAddress(Ipv6DynamicAddress),
+    Ipv6DynamicDuidStorageLength(u8),
+    Ipv6DynamicDuid(Ipv6LanBlock),
+    Ipv6DhcpTimingSupport(Ipv6TimingSupport),
+    Ipv6DhcpTiming(Ipv6LanBlock),
+    Ipv6RouterControl(Ipv6RouterControl),
+    Ipv6StaticRouter1Address(Ipv6Address),
+    Ipv6StaticRouter1Mac(MacAddress),
+    Ipv6StaticRouter1PrefixLength(u8),
+    Ipv6StaticRouter1Prefix(Ipv6Address),
+    Ipv6StaticRouter2Address(Ipv6Address),
+    Ipv6StaticRouter2Mac(MacAddress),
+    Ipv6StaticRouter2PrefixLength(u8),
+    Ipv6StaticRouter2Prefix(Ipv6Address),
+    Ipv6DynamicRouterCount(u8),
+    Ipv6DynamicRouterAddress(Ipv6DynamicRouter<Ipv6Address>),
+    Ipv6DynamicRouterMac(Ipv6DynamicRouter<MacAddress>),
+    Ipv6DynamicRouterPrefixLength(Ipv6DynamicRouter<u8>),
+    Ipv6DynamicRouterPrefix(Ipv6DynamicRouter<Ipv6Address>),
+    Ipv6DynamicHopLimit(u8),
+    Ipv6NdSlaacTimingSupport(Ipv6TimingSupport),
+    Ipv6NdSlaacTiming(Ipv6LanBlock),
     Raw(Vec<u8>),
 }
 
@@ -459,10 +763,8 @@ pub struct Ipv6StaticAddress {
 }
 
 impl Ipv6StaticAddress {
-    fn from_slice(data: &[u8]) -> Result<Self, NotEnoughData> {
-        if data.len() < 20 {
-            return Err(NotEnoughData);
-        }
+    fn from_slice(data: &[u8]) -> Result<Self, LanConfigError> {
+        length(data, 20)?;
 
         let set_selector = data[0];
         let source_raw = data[1];
@@ -471,6 +773,7 @@ impl Ipv6StaticAddress {
 
         let address = Ipv6Address::from_slice(&data[2..18])?;
         let prefix_length = data[18];
+        prefix(prefix_length)?;
         let status = data[19];
 
         Ok(Ipv6StaticAddress {
@@ -495,15 +798,14 @@ pub struct Ipv6DynamicAddress {
 }
 
 impl Ipv6DynamicAddress {
-    fn from_slice(data: &[u8]) -> Result<Self, NotEnoughData> {
-        if data.len() < 20 {
-            return Err(NotEnoughData);
-        }
+    fn from_slice(data: &[u8]) -> Result<Self, LanConfigError> {
+        length(data, 20)?;
 
         let set_selector = data[0];
         let source_type = data[1] & 0x0F;
         let address = Ipv6Address::from_slice(&data[2..18])?;
         let prefix_length = data[18];
+        prefix(prefix_length)?;
         let status = data[19];
 
         Ok(Ipv6DynamicAddress {
