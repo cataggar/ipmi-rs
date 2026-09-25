@@ -1,0 +1,23 @@
+# Source: cataggar/ipmitool@33f3a0a, tests/transcripts/sel_quanta.tr
+# Get SEL Entry values include the two-byte next-record ID before the 16-byte record.
+# *_location rows are expected zero-based CPU, channel, DIMM indices.
+# The negative replies below exercise boundaries absent from the source transcript.
+device_id: 20 81 02 03 02 bf 4c 1c 00 01 00 00 00 00 00
+device_id_non_quanta: 20 81 02 03 02 bf 2a 00 00 01 00 00 00 00 00
+device_id_short: 20 81 02 03 02 bf 4c 1c 00 01
+platform_request: 4c 1c 00 02
+platform_grantley: 01 00
+platform_purley: 02 00
+platform_unknown: 03 00
+platform_zero: 00
+platform_empty:
+sel_cpu0_a0: 01 00 00 0a 02 4d 3e 2f 6a 20 00 04 0c 40 6f 00 11 00
+sel_cpu0_a0_location: 00 00 00
+sel_cpu1_b3: 02 00 01 0a 02 4d 3e 2f 6a 20 00 04 0c 41 6f 00 11 4b
+sel_cpu1_b3_location: 01 01 03
+sel_cpu3_h7: 03 00 02 0a 02 4d 3e 2f 6a 20 00 04 0c 42 6f 00 11 ff
+sel_cpu3_h7_location: 03 07 07
+sel_cpu2_c2: 04 00 03 0a 02 4d 3e 2f 6a 20 00 04 0c 43 6f 00 11 92
+sel_cpu2_c2_location: 02 02 02
+sel_temperature: 05 00 04 0a 02 4d 3e 2f 6a 20 00 04 01 44 6f 00 11 92
+sel_other_event: ff ff 05 0a 02 4d 3e 2f 6a 20 00 04 0c 45 03 00 11 92

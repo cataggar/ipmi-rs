@@ -584,6 +584,14 @@ proves whether an activation/reset/cycle occurred.
 See the [ipmitool entry-point coverage matrix](docs/group-extensions.md)
 for every supported family, unsupported operations, and fixture coverage.
 
+On a Quanta BMC, `ipmi.send_oem(quanta::GetPlatformId)` returns a typed
+Grantley/Purley platform after checking IANA 7244. For a `SelEntryInfo`
+returned by `GetSelEntry` on that same BMC,
+`quanta::MemoryLocation::from_sel_entry(platform, &entry_info)` returns
+structured CPU/channel/DIMM indices for Purley memory events. A
+Grantley, non-memory or other event returns `None`. Do not use a platform
+from one BMC to decode another BMC's SEL; there is no live hardware validation.
+
 ## BMC reset and boot overrides
 
 `ipmi_rs::app::{WarmReset, ColdReset}` reset the **management controller**, not the host.

@@ -2,8 +2,8 @@ use std::{cell::Cell, collections::VecDeque, num::NonZeroU8, rc::Rc};
 
 use ipmi_rs::{
     connection::{
-        Address, Channel, ChannelNumber, IpmiConnection, LogicalUnit, Message, NetFn, Request,
-        RequestTargetAddress, Response,
+        Address, Channel, ChannelNumber, IpmiCommand, IpmiConnection, LogicalUnit, Message, NetFn,
+        Request, RequestTargetAddress, Response,
     },
     oem::{
         dell::{
@@ -12,10 +12,11 @@ use ipmi_rs::{
             PowerCapStatus, PowerCapValue, SdHealth, WriteIntent,
         },
         kontron::{BootDevice, GetManufacturingDate, SetNextBoot},
-        quanta::{GetPlatformId, Platform, PlatformError},
+        quanta::{GetPlatformId, MemoryLocation, Platform, PlatformError},
         sun::{GetVersion, VersionError},
         OemCommand, OemError,
     },
+    storage::sel::{Entry, GetSelEntry},
     Ipmi, IpmiError,
 };
 
@@ -121,6 +122,18 @@ fn device_id_request() -> Sent {
     sent(0x06, 0x01, &[], LogicalUnit::Zero)
 }
 
+fn quanta_fixture(name: &str) -> Vec<u8> {
+    include_str!("fixtures/quanta_sel.txt")
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(key, _)| *key == name)
+        .unwrap_or_else(|| panic!("missing Quanta fixture: {name}"))
+        .1
+        .split_whitespace()
+        .map(|byte| u8::from_str_radix(byte, 16).unwrap())
+        .collect()
+}
+
 #[test]
 fn dell_cap_flags_match_delloem_wire_request() {
     let mut mock = Mock::default();
@@ -211,26 +224,165 @@ fn kontron_lun_three_reads_manufacturing_date_and_writes_cp6012_boot_selection()
 
 #[test]
 fn quanta_platform_id_uses_magic_and_rejects_unknown_platforms() {
+    let device_id = quanta_fixture("device_id");
+    assert_eq!(
+        ipmi_rs::app::DeviceId::from_data(&device_id)
+            .unwrap()
+            .manufacturer_id,
+        7244
+    );
+
+    for (response, expected) in [
+        ("platform_grantley", Platform::Grantley),
+        ("platform_purley", Platform::Purley),
+    ] {
+        let mut mock = Mock::default();
+        mock.reply(0x06, 0x01, 0, &device_id);
+        mock.reply(0x36, 0x65, 0, &quanta_fixture(response));
+        let mut ipmi = Ipmi::new(mock);
+        assert!(matches!(ipmi.send_oem(GetPlatformId), Ok(platform) if platform == expected));
+        assert_eq!(
+            ipmi.release().sent,
+            [
+                device_id_request(),
+                sent(
+                    0x36,
+                    0x65,
+                    &quanta_fixture("platform_request"),
+                    LogicalUnit::Zero
+                ),
+            ]
+        );
+    }
+}
+
+#[test]
+fn quanta_rejects_malformed_platform_replies_and_completion_codes() {
+    for (fixture, error) in [
+        ("platform_zero", PlatformError::Unsupported(0)),
+        ("platform_unknown", PlatformError::Unsupported(3)),
+        ("platform_empty", PlatformError::TooShort),
+    ] {
+        let mut mock = Mock::default();
+        mock.reply(0x06, 0x01, 0, &quanta_fixture("device_id"));
+        mock.reply(0x36, 0x65, 0, &quanta_fixture(fixture));
+        let mut ipmi = Ipmi::new(mock);
+        assert!(matches!(
+            ipmi.send_oem(GetPlatformId),
+            Err(OemError::Command(IpmiError::Command { error: actual, .. })) if actual == error
+        ));
+        assert_eq!(ipmi.release().sent.len(), 2);
+    }
+
     let mut mock = Mock::default();
-    mock.identity(7244, 77);
-    mock.reply(0x36, 0x65, 0, &[2, 0]);
+    mock.reply(0x06, 0x01, 0, &quanta_fixture("device_id"));
+    mock.reply(0x36, 0x65, 0xC1, &quanta_fixture("platform_purley"));
     let mut ipmi = Ipmi::new(mock);
-    assert!(matches!(ipmi.send_oem(GetPlatformId), Ok(Platform::Purley)));
-    assert_eq!(
-        ipmi.release().sent,
-        [
-            device_id_request(),
-            sent(0x36, 0x65, &[0x4C, 0x1C, 0, 2], LogicalUnit::Zero),
-        ]
-    );
-    assert_eq!(
-        GetPlatformId::parse_success_response(&[0]),
-        Err(PlatformError::Unsupported(0))
-    );
-    assert_eq!(
-        GetPlatformId::parse_success_response(&[]),
-        Err(PlatformError::TooShort)
-    );
+    assert!(matches!(
+        ipmi.send_oem(GetPlatformId),
+        Err(OemError::Command(IpmiError::Failed { .. }))
+    ));
+    assert_eq!(ipmi.release().sent.len(), 2);
+}
+
+#[test]
+fn quanta_identity_mismatch_or_malformed_identity_never_sends_oem_request() {
+    let mut mock = Mock::default();
+    mock.reply(0x06, 0x01, 0, &quanta_fixture("device_id_non_quanta"));
+    mock.reply(0x36, 0x65, 0, &quanta_fixture("platform_purley"));
+    let mut ipmi = Ipmi::new(mock);
+    assert!(matches!(
+        ipmi.send_oem(GetPlatformId),
+        Err(OemError::UnsupportedDevice {
+            manufacturer_id: 42,
+            expected_manufacturer_id: 7244,
+            ..
+        })
+    ));
+    assert_eq!(ipmi.release().sent, [device_id_request()]);
+
+    let mut mock = Mock::default();
+    mock.reply(0x06, 0x01, 0, &quanta_fixture("device_id_short"));
+    let mut ipmi = Ipmi::new(mock);
+    assert!(matches!(
+        ipmi.send_oem(GetPlatformId),
+        Err(OemError::Identity(IpmiError::Command { .. }))
+    ));
+    assert_eq!(ipmi.release().sent, [device_id_request()]);
+
+    let mut mock = Mock::default();
+    mock.reply(0x06, 0x01, 0xC1, &quanta_fixture("device_id"));
+    let mut ipmi = Ipmi::new(mock);
+    assert!(matches!(
+        ipmi.send_oem(GetPlatformId),
+        Err(OemError::Identity(IpmiError::Failed { .. }))
+    ));
+    assert_eq!(ipmi.release().sent, [device_id_request()]);
+}
+
+#[test]
+fn quanta_purley_memory_location_decodes_sel_fixture_without_cli_text() {
+    for fixture in ["sel_cpu0_a0", "sel_cpu1_b3", "sel_cpu3_h7", "sel_cpu2_c2"] {
+        let location = quanta_fixture(&format!("{fixture}_location"));
+        let expected = MemoryLocation {
+            cpu: location[0],
+            channel: location[1],
+            dimm: location[2],
+        };
+        let info = GetSelEntry::parse_success_response(&quanta_fixture(fixture)).unwrap();
+        assert_eq!(
+            MemoryLocation::from_sel_entry(Platform::Purley, &info),
+            Some(expected)
+        );
+        assert_eq!(
+            MemoryLocation::from_sel_entry(Platform::Grantley, &info),
+            None
+        );
+        if fixture == "sel_cpu3_h7" {
+            assert_eq!(info.raw[13..], [0, 0x11, 0xFF]);
+        }
+    }
+
+    for fixture in ["sel_temperature", "sel_other_event"] {
+        let info = GetSelEntry::parse_success_response(&quanta_fixture(fixture)).unwrap();
+        assert_eq!(
+            MemoryLocation::from_sel_entry(Platform::Purley, &info),
+            None
+        );
+    }
+    assert!(GetSelEntry::parse_success_response(&[0, 0, 1]).is_err());
+}
+
+#[test]
+fn existing_sel_system_variant_supports_exhaustive_match_and_construction() {
+    let info = GetSelEntry::parse_success_response(&quanta_fixture("sel_cpu3_h7")).unwrap();
+    let original = info.entry.clone();
+    let Entry::System {
+        record_id,
+        timestamp,
+        generator_id,
+        event_message_format,
+        sensor_type,
+        sensor_number,
+        event_direction,
+        event_type,
+        event_data,
+    } = info.entry
+    else {
+        panic!("expected standard SEL entry");
+    };
+    let reconstructed = Entry::System {
+        record_id,
+        timestamp,
+        generator_id,
+        event_message_format,
+        sensor_type,
+        sensor_number,
+        event_direction,
+        event_type,
+        event_data,
+    };
+    assert_eq!(reconstructed, original);
 }
 
 #[test]
