@@ -201,13 +201,13 @@ fn short_capability_pages_decode_by_original_request_selector() {
 }
 
 #[test]
-fn reserved_netfn_identity_checks_actual_response_pair() {
+fn picmg_netfn_identity_checks_actual_response_pair() {
     let mut ipmi = Ipmi::new(Scripted::new([Ok((0, vec![0xdc, 1, 0, 1, 0, 0, 0, 0]))]));
     ipmi.inner_mut().response_netfn = Some(NetFn::Reserved(0x30));
     assert!(matches!(
         ipmi.send_recv(GetCapabilities(CapabilitySelector::Platform)),
         Err(IpmiError::UnexpectedResponse {
-            netfn_sent: NetFn::Reserved(0x2c),
+            netfn_sent: NetFn::Picmg,
             netfn_recvd: NetFn::Reserved(0x31),
             ..
         })
