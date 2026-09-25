@@ -176,6 +176,27 @@ fn missing_response_is_bounded_and_uncertain() {
 }
 
 #[test]
+fn poller_deadline_bounds_ami_transaction_and_restores_state() {
+    let (mut usb, state) = mock();
+    state.lock().unwrap().replies = vec![complete(0x8000, 256); 32];
+    usb.timeout = Duration::from_secs(2);
+    let token = CancellationToken::default();
+    let start = Instant::now();
+    assert!(matches!(
+        usb.send_recv_deadline(
+            &mut req(),
+            start + Duration::from_millis(25),
+            &token
+        ),
+        Err(AmiUsbError::OutcomeUnknown(error))
+        if matches!(*error, AmiUsbError::Timeout)
+    ));
+    assert!(start.elapsed() < Duration::from_millis(300));
+    assert!(usb.operation_deadline.is_none());
+    assert!(usb.operation_cancellation.is_none());
+}
+
+#[test]
 fn cancellation_after_dispatch_poisoned_until_reopened() {
     let (mut usb, state) = mock();
     usb.send(&mut req()).unwrap();

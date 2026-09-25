@@ -159,9 +159,13 @@ There are **two distinct receive paths**:
   **periodic polling**, not an asynchronous interrupt. It reuses the bounded,
   fallible `sel_entries` traversal; supply `max_entries` in `1..=65534`.
   `SelPollBatch` has new entries in BMC order, removed/missing IDs,
-  `wrapped` (ID decrease across scans), and `continuity_lost` for removals,
-  deletion timestamps, or overflow. It deduplicates by record ID **and raw
-  contents**, not by arithmetic increments, so IDs may skip or wrap. If an
+  `wrapped` (new ID decrease across scans), `overflow` (current BMC state),
+  and `continuity_lost` for removals, deletion timestamps, or **any currently
+  set overflow bit**, including overflow present at startup. Check
+  `poller.overflow()` immediately after creating a baseline; a quiet scan
+  while still overflowing returns a gap rather than an empty wait. The poller
+  deduplicates by record ID and **raw contents**, not by arithmetic increments,
+  so IDs may skip or wrap. If an
   identical record ID/content is reused between scans without detectable SEL
   metadata changes, continuity cannot be proven; poll more often or use the
   local asynchronous receiver. A failed/unstable scan never advances the
@@ -170,9 +174,13 @@ There are **two distinct receive paths**:
 Both receive APIs accept an absolute monotonic `Instant` and the cloneable
 `rmcp::CancellationToken` (cancellation is sticky; reset only after an operation
 has returned). The local receiver checks cancellation every 50 ms. SEL polling
-checks between blocking commands and while sleeping; configure the underlying
-connection's own per-command timeout as well, since a blocking transaction
-cannot be preempted by a transport-independent iterator.
+checks **before and after every transport command**, including Get SEL Info,
+reservations, reads, and internal rescans. Built-in RMCP, OpenIPMI file, serial
+and AMI USB connections clamp each command to the remaining deadline and
+observe the poller's token during I/O (kernel ioctls cannot be preempted
+mid-call). Custom `IpmiConnection` implementations should override
+`send_recv_deadline` for the same guarantee; the default delegates to
+`send_recv`, so configure a bounded per-command timeout on custom transports.
 
 ### `ipmi-channels`
 This example discovers available channels and prints channel information. For LAN channels, it also shows a small set of LAN configuration parameters (addressing and gateways).

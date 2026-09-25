@@ -101,6 +101,15 @@ impl RmcpWithState<Active> {
     }
 }
 
+impl Active {
+    pub(super) fn socket_mut(&mut self) -> &mut super::socket::RmcpIpmiSocket {
+        match self {
+            Active::V1_5(state) => state.socket_mut(),
+            Active::V2_0(state) => &mut state.socket,
+        }
+    }
+}
+
 impl<T> RmcpWithState<T> {
     fn state(&self) -> &T {
         &self.0

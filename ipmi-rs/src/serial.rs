@@ -129,6 +129,8 @@ pub struct SerialConnection {
     mode: SerialMode,
     timeout: Duration,
     cancellation: CancellationToken,
+    operation_deadline: Option<Instant>,
+    operation_cancellation: Option<CancellationToken>,
     sequence: u8,
     pending: Option<Pending>,
     uncertain: bool,
@@ -177,6 +179,8 @@ impl SerialConnection {
             mode,
             timeout,
             cancellation: CancellationToken::default(),
+            operation_deadline: None,
+            operation_cancellation: None,
             sequence: 0,
             pending: None,
             uncertain: false,
@@ -188,6 +192,14 @@ impl SerialConnection {
         self.cancellation.clone()
     }
 
+    fn cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+            || self
+                .operation_cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+    }
+
     fn poison_send(&mut self, error: io::Error) -> SerialSendError {
         self.pending = None;
         self.uncertain = true;
@@ -195,7 +207,7 @@ impl SerialConnection {
     }
 
     fn check(&self, deadline: Instant) -> Result<(), SerialRecvError> {
-        if self.cancellation.is_cancelled() {
+        if self.cancelled() {
             Err(SerialRecvError::Cancelled)
         } else if Instant::now() >= deadline {
             Err(SerialRecvError::Timeout)
@@ -408,7 +420,7 @@ impl IpmiConnection for SerialConnection {
         if self.pending.is_some() {
             return Err(SerialSendError::RequestPending);
         }
-        if self.cancellation.is_cancelled() {
+        if self.cancelled() {
             return Err(SerialSendError::Cancelled);
         }
         if request.netfn_raw() & 1 != 0 || request.netfn_raw() > 0x3e {
@@ -436,6 +448,9 @@ impl IpmiConnection for SerialConnection {
             return Err(SerialSendError::RequestTooLong);
         }
         let deadline = Instant::now() + self.timeout;
+        let deadline = self
+            .operation_deadline
+            .map_or(deadline, |limit| limit.min(deadline));
         self.sequence = (self.sequence + 1) & 0x3f;
         let seq = self.sequence;
         let lun = request.target().lun().value();
@@ -489,8 +504,8 @@ impl IpmiConnection for SerialConnection {
         });
         let mut offset = 0;
         while offset < wire.len() {
-            if self.cancellation.is_cancelled() || Instant::now() >= deadline {
-                let kind = if self.cancellation.is_cancelled() {
+            if self.cancelled() || Instant::now() >= deadline {
+                let kind = if self.cancelled() {
                     io::ErrorKind::Interrupted
                 } else {
                     io::ErrorKind::TimedOut
@@ -557,6 +572,26 @@ impl IpmiConnection for SerialConnection {
     fn send_recv(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         self.send(request)?;
         self.recv().map_err(SerialError::OutcomeUnknown)
+    }
+
+    fn send_recv_deadline(
+        &mut self,
+        request: &mut Request,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Response, Self::Error> {
+        if cancellation.is_cancelled() {
+            return Err(SerialSendError::Cancelled.into());
+        }
+        if Instant::now() >= deadline {
+            return Err(SerialError::Receive(SerialRecvError::Timeout));
+        }
+        let old_deadline = self.operation_deadline.replace(deadline);
+        let old_cancellation = self.operation_cancellation.replace(cancellation.clone());
+        let result = self.send_recv(request);
+        self.operation_deadline = old_deadline;
+        self.operation_cancellation = old_cancellation;
+        result
     }
 }
 

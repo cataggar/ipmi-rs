@@ -175,6 +175,8 @@ mod linux {
         device: Box<dyn ScsiDevice>,
         timeout: Duration,
         cancellation: CancellationToken,
+        operation_deadline: Option<Instant>,
+        operation_cancellation: Option<CancellationToken>,
         pending: Option<Pending>,
         uncertain: bool,
         sequence: i64,
@@ -232,6 +234,8 @@ mod linux {
                 device,
                 timeout,
                 cancellation: CancellationToken::default(),
+                operation_deadline: None,
+                operation_cancellation: None,
                 pending: None,
                 uncertain: false,
                 sequence: 0,
@@ -246,8 +250,16 @@ mod linux {
             self.cancellation.clone()
         }
 
+        fn cancelled(&self) -> bool {
+            self.cancellation.is_cancelled()
+                || self
+                    .operation_cancellation
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
+        }
+
         fn remaining(&self, deadline: Instant) -> Result<Duration, AmiUsbError> {
-            if self.cancellation.is_cancelled() {
+            if self.cancelled() {
                 return Err(AmiUsbError::Cancelled);
             }
             deadline
@@ -317,7 +329,7 @@ mod linux {
             if self.pending.is_some() {
                 return Err(AmiUsbError::RequestPending);
             }
-            if self.cancellation.is_cancelled() {
+            if self.cancelled() {
                 return Err(AmiUsbError::Cancelled);
             }
             if request.netfn_raw() & 1 != 0
@@ -338,6 +350,9 @@ mod linux {
                 return Err(AmiUsbError::RequestTooLong);
             }
             let deadline = Instant::now() + self.timeout;
+            let deadline = self
+                .operation_deadline
+                .map_or(deadline, |limit| limit.min(deadline));
             let mut payload = vec![
                 (request.netfn_raw() << 2) | request.target().lun().value(),
                 request.cmd(),
@@ -390,6 +405,26 @@ mod linux {
         fn send_recv(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
             self.send(request)?;
             self.recv()
+        }
+
+        fn send_recv_deadline(
+            &mut self,
+            request: &mut Request,
+            deadline: Instant,
+            cancellation: &CancellationToken,
+        ) -> Result<Response, Self::Error> {
+            if cancellation.is_cancelled() {
+                return Err(AmiUsbError::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(AmiUsbError::Timeout);
+            }
+            let old_deadline = self.operation_deadline.replace(deadline);
+            let old_cancellation = self.operation_cancellation.replace(cancellation.clone());
+            let result = self.send_recv(request);
+            self.operation_deadline = old_deadline;
+            self.operation_cancellation = old_cancellation;
+            result
         }
     }
 

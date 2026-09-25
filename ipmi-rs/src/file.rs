@@ -470,7 +470,7 @@ fn enable_event_msg_buffer<CON: IpmiConnection<Error = io::Error>>(
         ipmi.send_recv(SetBmcGlobalEnables(
             enables | BmcGlobalEnables::EVENT_MESSAGE_BUFFER,
         ))
-            .map_err(OpenIpmiEventSetupError::EnableBuffer)?;
+        .map_err(OpenIpmiEventSetupError::EnableBuffer)?;
     }
     Ok(())
 }
@@ -674,6 +674,42 @@ impl IpmiConnection for File {
         self.send(request)?;
 
         self.recv()
+    }
+
+    fn send_recv_deadline(
+        &mut self,
+        request: &mut Request,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> io::Result<Response> {
+        let original_timeout = self.recv_timeout;
+        let result = (|| {
+            if cancellation.is_cancelled() {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            self.send(request)?;
+            loop {
+                if cancellation.is_cancelled() {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|duration| !duration.is_zero())
+                    .ok_or(io::ErrorKind::TimedOut)?;
+                self.recv_timeout = remaining
+                    .min(original_timeout)
+                    .min(Duration::from_millis(50));
+                match self.recv() {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    response => return response,
+                }
+            }
+        })();
+        self.recv_timeout = original_timeout;
+        result
     }
 }
 

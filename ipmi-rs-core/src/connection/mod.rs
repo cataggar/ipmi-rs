@@ -2,7 +2,14 @@
 //! IPMI-connection related data.
 
 mod completion_code;
-use std::num::NonZeroU8;
+use std::{
+    num::NonZeroU8,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 pub use completion_code::CompletionErrorCode;
 
@@ -160,6 +167,27 @@ impl From<LogicalUnit> for u8 {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NotEnoughData;
 
+/// Shared sticky cancellation signal for bounded transactions.
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    /// Cancel current and future operations until reset.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    /// True when cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Re-arm after the cancelled operation has returned.
+    pub fn reset(&self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// A trait describing operations that can be performed on an IPMI connection.
 pub trait IpmiConnection {
     /// The type of error the can occur when sending a [`Request`].
@@ -177,6 +205,21 @@ pub trait IpmiConnection {
 
     /// Send `request` to and receive a response from the remote end of this connection.
     fn send_recv(&mut self, request: &mut Request) -> Result<Response, Self::Error>;
+
+    /// Perform a read transaction within a caller's absolute deadline.
+    ///
+    /// Transport implementations should clamp their own transaction timeout
+    /// and check `cancellation` during blocking I/O. The default preserves
+    /// compatibility for other connections, but cannot interrupt their I/O:
+    /// callers must configure an appropriately short per-command timeout.
+    fn send_recv_deadline(
+        &mut self,
+        request: &mut Request,
+        _deadline: Instant,
+        _cancellation: &CancellationToken,
+    ) -> Result<Response, Self::Error> {
+        self.send_recv(request)
+    }
 }
 
 impl<T: IpmiConnection + ?Sized> IpmiConnection for &mut T {
@@ -192,6 +235,14 @@ impl<T: IpmiConnection + ?Sized> IpmiConnection for &mut T {
     }
     fn send_recv(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
         (**self).send_recv(request)
+    }
+    fn send_recv_deadline(
+        &mut self,
+        request: &mut Request,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Response, Self::Error> {
+        (**self).send_recv_deadline(request, deadline, cancellation)
     }
 }
 

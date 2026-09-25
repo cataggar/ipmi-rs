@@ -1,15 +1,12 @@
 use std::{
     io::ErrorKind,
     net::UdpSocket,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
     time::{Duration, Instant},
 };
 use zeroize::Zeroizing;
 
 use super::{RmcpHeader, RmcpIpmiReceiveError, RmcpType};
+pub use crate::connection::CancellationToken;
 
 type RecvError = RmcpIpmiReceiveError;
 
@@ -26,30 +23,12 @@ pub(crate) fn count_unrelated(unrelated: &mut usize) -> Result<(), RecvError> {
     }
 }
 
-/// Shared, sticky cancellation signal. Create a new token for a new operation.
-#[derive(Debug, Clone, Default)]
-pub struct CancellationToken(Arc<AtomicBool>);
-
-impl CancellationToken {
-    pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-
-    pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
-    }
-
-    /// Re-arm after the cancelled operation has returned.
-    pub fn reset(&self) {
-        self.0.store(false, Ordering::SeqCst);
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct TransportPolicy {
     timeout: Duration,
     pub cancellation: CancellationToken,
     pub require_rmcp_plus: bool,
+    operation_cancellation: Option<CancellationToken>,
 }
 
 impl TransportPolicy {
@@ -58,12 +37,21 @@ impl TransportPolicy {
             timeout,
             cancellation: CancellationToken::default(),
             require_rmcp_plus: false,
+            operation_cancellation: None,
         }
     }
 
     pub fn deadline(&self) -> Instant {
         let now = Instant::now();
         now.checked_add(self.timeout).unwrap_or(now)
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
+            || self
+                .operation_cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
     }
 }
 
@@ -74,7 +62,7 @@ pub fn recv_datagram(
     policy: &TransportPolicy,
 ) -> Result<usize, RecvError> {
     loop {
-        if policy.cancellation.is_cancelled() {
+        if policy.is_cancelled() {
             return Err(RecvError::Cancelled);
         }
         let remaining = deadline
@@ -108,6 +96,25 @@ pub struct RmcpIpmiSocket {
 }
 
 impl RmcpIpmiSocket {
+    pub(crate) fn begin_bounded(
+        &mut self,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> (Option<Instant>, Option<CancellationToken>) {
+        let bounded = deadline.min(self.policy.deadline());
+        let bounded = self
+            .activation_deadline
+            .map_or(bounded, |previous| previous.min(bounded));
+        let old_deadline = self.activation_deadline.replace(bounded);
+        let old_cancellation = self.policy.operation_cancellation.replace(cancellation);
+        (old_deadline, old_cancellation)
+    }
+
+    pub(crate) fn end_bounded(&mut self, previous: (Option<Instant>, Option<CancellationToken>)) {
+        self.activation_deadline = previous.0;
+        self.policy.operation_cancellation = previous.1;
+    }
+
     pub fn new(
         socket: UdpSocket,
         policy: TransportPolicy,
@@ -191,7 +198,7 @@ impl RmcpIpmiSocket {
         let header = RmcpHeader::new_ipmi();
 
         let data = Zeroizing::new(header.write(data)?);
-        if self.policy.cancellation.is_cancelled() {
+        if self.policy.is_cancelled() {
             return Err(std::io::Error::new(ErrorKind::Interrupted, "RMCP send cancelled").into());
         }
         let remaining = deadline

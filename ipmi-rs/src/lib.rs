@@ -42,7 +42,7 @@ use ipmi_rs_core::{
     connection::{CompletionErrorCode, IpmiCommand, NotEnoughData, Request, RequestTargetAddress},
     storage::sdr::{self, Record as SdrRecord},
 };
-use std::{collections::HashSet, num::NonZeroU16};
+use std::{collections::HashSet, num::NonZeroU16, time::Instant};
 
 pub struct Ipmi<CON> {
     inner: CON,
@@ -128,6 +128,31 @@ where
     where
         CMD: IpmiCommand,
     {
+        self.send_recv_with(request, |connection, wire| connection.send_recv(wire))
+    }
+
+    pub(crate) fn send_recv_bounded<CMD>(
+        &mut self,
+        request: CMD,
+        deadline: Instant,
+        cancellation: &rmcp::CancellationToken,
+    ) -> Result<CMD::Output, IpmiError<CON::Error, CMD::Error>>
+    where
+        CMD: IpmiCommand,
+    {
+        self.send_recv_with(request, |connection, wire| {
+            connection.send_recv_deadline(wire, deadline, cancellation)
+        })
+    }
+
+    fn send_recv_with<CMD>(
+        &mut self,
+        request: CMD,
+        transact: impl FnOnce(&mut CON, &mut Request) -> Result<connection::Response, CON::Error>,
+    ) -> Result<CMD::Output, IpmiError<CON::Error, CMD::Error>>
+    where
+        CMD: IpmiCommand,
+    {
         let target_lun = request.target_lun();
         let target_address = match request.target() {
             Some((a, c)) => RequestTargetAddress::BmcOrIpmb(a, c, target_lun),
@@ -138,7 +163,7 @@ where
         let (message_netfn, message_cmd) = (message.netfn(), message.cmd());
         let mut request = Request::new(message, target_address);
 
-        let response = self.inner.send_recv(&mut request)?;
+        let response = transact(&mut self.inner, &mut request)?;
 
         if response.netfn_raw() != message_netfn.response_value() || response.cmd() != message_cmd {
             return Err(IpmiError::UnexpectedResponse {

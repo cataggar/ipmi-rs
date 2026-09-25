@@ -134,3 +134,42 @@ fn local_receiver_checks_budget_and_reports_ioctl_errors() {
         Err(OpenIpmiEventError::Io(_))
     ));
 }
+
+#[test]
+fn file_transaction_rejects_expired_or_cancelled_before_dispatch() {
+    let mut file = File {
+        inner: std::fs::File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap(),
+        recv_timeout: Duration::from_secs(2),
+        seq: 0,
+        my_addr: Address(0x20),
+    };
+    let mut request = Request::new(
+        Message::new_request(NetFn::Storage, 0x40, vec![]),
+        RequestTargetAddress::Bmc(crate::connection::LogicalUnit::Zero),
+    );
+    let token = CancellationToken::default();
+    token.cancel();
+    assert_eq!(
+        file.send_recv_deadline(
+            &mut request,
+            Instant::now() + Duration::from_secs(1),
+            &token
+        )
+        .unwrap_err()
+        .kind(),
+        io::ErrorKind::Interrupted
+    );
+    token.reset();
+    assert_eq!(
+        file.send_recv_deadline(
+            &mut request,
+            Instant::now() - Duration::from_secs(1),
+            &token
+        )
+        .unwrap_err()
+        .kind(),
+        io::ErrorKind::TimedOut
+    );
+    assert_eq!(file.seq, 0);
+    assert_eq!(file.recv_timeout, Duration::from_secs(2));
+}

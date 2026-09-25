@@ -124,6 +124,22 @@ fn typed_command_works_in_both_modes() {
 }
 
 #[test]
+fn poller_deadline_clamps_serial_transaction_and_restores_state() {
+    let (mut serial, state) = mock(SerialMode::Basic);
+    serial.timeout = Duration::from_secs(2);
+    let token = CancellationToken::default();
+    let start = Instant::now();
+    assert!(matches!(
+        serial.send_recv_deadline(&mut request(), start + Duration::from_millis(20), &token),
+        Err(SerialError::OutcomeUnknown(SerialRecvError::Timeout))
+    ));
+    assert!(start.elapsed() < Duration::from_millis(300));
+    assert!(!state.lock().unwrap().written.is_empty());
+    assert!(serial.operation_deadline.is_none());
+    assert!(serial.operation_cancellation.is_none());
+}
+
+#[test]
 fn basic_bad_checksum_escape_and_unbounded_frames_are_rejected() {
     let (mut serial, state) = mock(SerialMode::Basic);
     serial.send(&mut request()).unwrap();

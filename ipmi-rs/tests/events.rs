@@ -20,6 +20,8 @@ struct Step {
     cmd: u8,
     request: Vec<u8>,
     reply: Result<(u8, Vec<u8>), FixtureError>,
+    delay: Duration,
+    cancel_after_response: Option<CancellationToken>,
 }
 
 impl Step {
@@ -29,6 +31,8 @@ impl Step {
             cmd,
             request: request.to_vec(),
             reply: Ok((0, body.to_vec())),
+            delay: Duration::ZERO,
+            cancel_after_response: None,
         }
     }
 
@@ -38,6 +42,8 @@ impl Step {
             cmd,
             request: request.to_vec(),
             reply: Ok((cc, vec![])),
+            delay: Duration::ZERO,
+            cancel_after_response: None,
         }
     }
 
@@ -47,6 +53,8 @@ impl Step {
             cmd,
             request: request.to_vec(),
             reply: Err(FixtureError),
+            delay: Duration::ZERO,
+            cancel_after_response: None,
         }
     }
 }
@@ -69,10 +77,37 @@ impl IpmiConnection for Fixture {
         assert_eq!(request.netfn(), step.netfn);
         assert_eq!(request.cmd(), step.cmd);
         assert_eq!(request.data(), step.request);
+        std::thread::sleep(step.delay);
+        if let Some(token) = step.cancel_after_response {
+            token.cancel();
+        }
         let (cc, body) = step.reply?;
         let mut data = vec![cc];
         data.extend(body);
         Ok(Response::new(Message::new_response(step.netfn, step.cmd, data), 0).unwrap())
+    }
+
+    fn send_recv_deadline(
+        &mut self,
+        request: &mut Request,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Response, Self::Error> {
+        assert!(!cancellation.is_cancelled(), "request after cancellation");
+        assert!(Instant::now() < deadline, "request after deadline");
+        if let Some(step) = self.0.front_mut() {
+            if !step.delay.is_zero() {
+                std::thread::sleep(
+                    step.delay
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+                if Instant::now() >= deadline {
+                    return Err(FixtureError);
+                }
+                step.delay = Duration::ZERO;
+            }
+        }
+        self.send_recv(request)
     }
 }
 
@@ -116,6 +151,25 @@ fn scan(records: &[(u16, u8)], deletion_time: u32, overflow: bool) -> Vec<Step> 
         next_request = next;
     }
     steps.push(Step::ok(NetFn::Storage, 0x40, &[], &info));
+    steps
+}
+
+fn missing_tail_rescan(records: &[(u16, u8)], first_rescan: Step) -> Vec<Step> {
+    let mut steps = scan(records, 0, false);
+    steps.truncate(records.len()); // Get Info and all records except the missing tail.
+    steps.push(Step::rejected(
+        NetFn::Storage,
+        0x43,
+        &get(records.last().unwrap().0),
+        0xcb,
+    ));
+    steps.push(Step::ok(
+        NetFn::Storage,
+        0x40,
+        &[],
+        &info(records.len(), 0, false),
+    ));
+    steps.push(first_rescan);
     steps
 }
 
@@ -177,6 +231,94 @@ fn missed_poll_wraparound_and_reused_ids_are_visible() {
     assert!(second.continuity_lost);
     drop(poller);
     assert!(ipmi.release().0.is_empty());
+}
+
+#[test]
+fn deleting_newest_id_does_not_masquerade_as_wraparound() {
+    let mut steps = scan(&[(10, 1), (20, 1)], 0, false);
+    steps.extend(scan(&[(10, 1)], 10, false));
+    let mut ipmi = Ipmi::new(Fixture(steps.into()));
+    let token = CancellationToken::default();
+    let mut poller = ipmi.sel_poller(3, limit(), &token).unwrap();
+    let batch = poller.poll_once(limit(), &token).unwrap();
+    assert_eq!(
+        batch
+            .missing_ids
+            .iter()
+            .map(|id| id.value())
+            .collect::<Vec<_>>(),
+        [20]
+    );
+    assert!(!batch.wrapped);
+    assert!(batch.continuity_lost);
+    drop(poller);
+    assert!(ipmi.release().0.is_empty());
+}
+
+#[test]
+fn preexisting_overflow_is_exposed_on_baseline_and_quiet_scans() {
+    let mut steps = scan(&[(10, 1)], 0, true);
+    steps.extend(scan(&[(10, 1)], 0, true));
+    steps.extend(scan(&[(10, 1)], 0, true));
+    let mut ipmi = Ipmi::new(Fixture(steps.into()));
+    let token = CancellationToken::default();
+    let mut poller = ipmi.sel_poller(2, limit(), &token).unwrap();
+    assert!(poller.overflow());
+    let batch = poller.poll_once(limit(), &token).unwrap();
+    assert!(batch.entries.is_empty());
+    assert!(batch.overflow && batch.continuity_lost);
+    let repeat = poller
+        .wait_next(Duration::from_secs(1), limit(), &token)
+        .unwrap();
+    assert!(repeat.entries.is_empty());
+    assert!(repeat.overflow && repeat.continuity_lost);
+    drop(poller);
+    assert!(ipmi.release().0.is_empty());
+}
+
+#[test]
+fn cancellation_inside_missing_id_rescan_stops_before_next_request() {
+    let records: Vec<_> = (1..=48).map(|id| (id, 1)).collect();
+    let token = CancellationToken::default();
+    let mut steps = scan(&records, 0, false);
+    let mut first_rescan = scan(&records, 0, false).remove(1);
+    first_rescan.cancel_after_response = Some(token.clone());
+    steps.extend(missing_tail_rescan(&records, first_rescan));
+    steps.extend(scan(&records, 0, false));
+
+    let mut ipmi = Ipmi::new(Fixture(steps.into()));
+    let mut poller = ipmi.sel_poller(48, limit(), &token).unwrap();
+    assert!(matches!(
+        poller.poll_once(limit(), &token),
+        Err(EventPollError::Cancelled)
+    ));
+    token.reset();
+    let batch = poller.poll_once(limit(), &token).unwrap();
+    assert!(batch.entries.is_empty());
+    assert!(batch.missing_ids.is_empty());
+    drop(poller);
+    assert!(ipmi.release().0.is_empty());
+}
+
+#[test]
+fn a_slow_rescan_request_uses_remaining_deadline_not_connection_timeout() {
+    let records: Vec<_> = (1..=48).map(|id| (id, 1)).collect();
+    let token = CancellationToken::default();
+    let mut steps = scan(&records, 0, false);
+    let mut first_rescan = scan(&records, 0, false).remove(1);
+    first_rescan.delay = Duration::from_millis(500);
+    steps.extend(missing_tail_rescan(&records, first_rescan));
+    let mut ipmi = Ipmi::new(Fixture(steps.into()));
+    let mut poller = ipmi.sel_poller(48, limit(), &token).unwrap();
+    let started = Instant::now();
+    assert!(matches!(
+        poller.poll_once(started + Duration::from_millis(30), &token),
+        Err(EventPollError::DeadlineExpired)
+    ));
+    assert!(started.elapsed() < Duration::from_millis(300));
+    drop(poller);
+    let fixture = ipmi.release();
+    assert_eq!(fixture.0.front().unwrap().request, get(0));
 }
 
 #[test]

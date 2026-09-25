@@ -462,6 +462,28 @@ impl IpmiConnection for Rmcp {
         let active = self.active_state.as_mut().ok_or(RmcpIpmiError::NotActive)?;
         active.send_recv(request)
     }
+
+    fn send_recv_deadline(
+        &mut self,
+        request: &mut crate::connection::Request,
+        deadline: std::time::Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<crate::connection::Response, Self::Error> {
+        if cancellation.is_cancelled() {
+            return Err(RmcpIpmiError::Send(RmcpIpmiSendError::Cancelled));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(RmcpIpmiError::Send(RmcpIpmiSendError::DeadlineExpired));
+        }
+        let active = self.active_state.as_mut().ok_or(RmcpIpmiError::NotActive)?;
+        let previous = active
+            .state_mut()
+            .socket_mut()
+            .begin_bounded(deadline, cancellation.clone());
+        let result = active.send_recv(request);
+        active.state_mut().socket_mut().end_bounded(previous);
+        result
+    }
 }
 
 #[cfg(test)]
