@@ -160,6 +160,9 @@ pub enum Entry {
         event_direction: EventDirection,
         event_type: u8,
         event_data: EventData,
+        /// Original event data bytes, including values such as 0xFF that the
+        /// generic event-data parser treats as unspecified.
+        raw_event_data: [u8; 3],
     },
     OemTimestamped {
         record_id: RecordId,
@@ -239,7 +242,8 @@ impl Entry {
                     EventDirection::Assert
                 };
                 let event_type = data[12] & 0x7F;
-                let event_data = EventData::parse(&[data[13], data[14], data[15]]);
+                let raw_event_data = [data[13], data[14], data[15]];
+                let event_data = EventData::parse(&raw_event_data);
                 Ok(Self::System {
                     record_id,
                     timestamp: Timestamp::from(timestamp),
@@ -250,6 +254,7 @@ impl Entry {
                     event_direction,
                     event_type,
                     event_data,
+                    raw_event_data,
                 })
             }
             SelRecordType::TimestampedOem(v) => Ok(Self::OemTimestamped {

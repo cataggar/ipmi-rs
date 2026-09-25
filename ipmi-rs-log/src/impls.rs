@@ -78,6 +78,7 @@ impl Loggable for Entry {
                 event_direction,
                 event_type,
                 event_data,
+                ..
             } => {
                 let format = match event_message_format {
                     EventMessageRevision::V2_0 => "2.0".into(),
