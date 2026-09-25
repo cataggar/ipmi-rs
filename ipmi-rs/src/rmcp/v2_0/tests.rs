@@ -1550,6 +1550,48 @@ fn network_activation_rejects_wrong_open_session_payload() {
     server.join().unwrap();
 }
 
+#[test]
+fn handshake_payload_is_guarded_before_cancellation_and_deadline_checks() {
+    let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+    peer.set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let policy = TransportPolicy::new(Duration::from_secs(1));
+    policy.cancellation.cancel();
+    let mut socket = RmcpIpmiSocket::new(fresh_client(&peer), policy, None);
+    assert!(matches!(
+        State::send_handshake(
+            &mut socket,
+            PayloadType::RakpMessage3,
+            b"password-derived-mac".to_vec()
+        ),
+        Err(WriteError::Cancelled)
+    ));
+
+    let mut socket = RmcpIpmiSocket::new(
+        fresh_client(&peer),
+        TransportPolicy::new(Duration::from_secs(1)),
+        Some(std::time::Instant::now() - Duration::from_millis(1)),
+    );
+    assert!(matches!(
+        State::send_handshake(
+            &mut socket,
+            PayloadType::RakpMessage3,
+            b"password-derived-mac".to_vec()
+        ),
+        Err(WriteError::DeadlineExpired)
+    ));
+    assert!(peer.recv(&mut [0u8; 1024]).is_err());
+
+    let mut message = Message {
+        ty: PayloadType::RakpMessage3,
+        session_id: 0,
+        session_sequence_number: 0,
+        payload: b"password-derived-mac".to_vec(),
+    };
+    message.zeroize();
+    assert!(message.payload.is_empty());
+}
+
 fn sol_fixture(timeout: Duration) -> (super::super::Rmcp, UdpSocket, CryptoState) {
     let (state, peer, crypto) = pair(timeout);
     peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
