@@ -2,13 +2,28 @@ use crate::app::auth::AuthType;
 
 use super::{auth, ReadError, WriteError};
 
-#[derive(Debug, Clone, PartialEq)]
-
+#[derive(Clone, PartialEq)]
 pub struct Message {
     pub auth_type: AuthType,
     pub session_sequence_number: u32,
     pub session_id: u32,
     pub payload: Vec<u8>,
+}
+
+impl core::fmt::Debug for Message {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut debug = f.debug_struct("Message");
+        debug
+            .field("auth_type", &self.auth_type)
+            .field("session_sequence_number", &self.session_sequence_number)
+            .field("session_id", &self.session_id);
+        if super::super::is_password_ipmb(&self.payload) {
+            debug.field("payload", &"[REDACTED]");
+        } else {
+            debug.field("payload", &self.payload);
+        }
+        debug.finish()
+    }
 }
 
 impl Message {

@@ -39,6 +39,38 @@ pub(crate) use asf::*;
 mod internal;
 use internal::{Active, RmcpWithState, Unbound};
 
+fn is_password_ipmb(payload: &[u8]) -> bool {
+    payload.len() >= 6 && matches!(payload[1] >> 2, 0x06 | 0x07) && payload[5] == 0x47
+}
+
+#[cfg(test)]
+mod password_debug_tests {
+    use super::*;
+
+    #[test]
+    fn rmcp_packet_debug_redacts_password_ipmb_payloads() {
+        for netfn in [0x06, 0x07] {
+            let mut ipmb = vec![0x20, netfn << 2, 0, 0x81, 0, 0x47, 2, 2];
+            ipmb.extend_from_slice(b"visible-only-on-wire");
+            let rmcp = v2_0::Message {
+                ty: v2_0::PayloadType::IpmiMessage,
+                session_id: 3,
+                session_sequence_number: 4,
+                payload: ipmb.clone(),
+            };
+            assert!(!format!("{rmcp:?}").contains("118, 105, 115"));
+            assert!(format!("{rmcp:?}").contains("REDACTED"));
+            let legacy = v1_5::Message {
+                auth_type: crate::app::auth::AuthType::None,
+                session_id: 3,
+                session_sequence_number: 4,
+                payload: ipmb,
+            };
+            assert!(format!("{legacy:?}").contains("REDACTED"));
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum RmcpIpmiReceiveError {
     Io(std::io::Error),

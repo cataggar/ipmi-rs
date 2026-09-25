@@ -114,12 +114,22 @@ where
             });
         }
 
+        // A malformed or hostile password response might echo the secret.
+        // Keep its completion code, but never attach response bytes to a
+        // Debug-printable error for this command.
+        let error_data = || {
+            if response.netfn() == connection::NetFn::App && response.cmd() == 0x47 {
+                Vec::new()
+            } else {
+                response.data().to_vec()
+            }
+        };
         let map_error = |completion_code, error| IpmiError::Command {
             error,
             netfn: response.netfn(),
             cmd: response.cmd(),
             completion_code,
-            data: response.data().to_vec(),
+            data: error_data(),
         };
 
         if let Ok(completion_code) = CompletionErrorCode::try_from(response.cc()) {
@@ -129,13 +139,13 @@ where
                     netfn: response.netfn(),
                     cmd: response.cmd(),
                     completion_code: Some(completion_code),
-                    data: response.data().to_vec(),
+                    data: error_data(),
                 })
                 .unwrap_or_else(|| IpmiError::Failed {
                     netfn: response.netfn(),
                     cmd: response.cmd(),
                     completion_code,
-                    data: response.data().to_vec(),
+                    data: error_data(),
                 });
 
             return Err(error);

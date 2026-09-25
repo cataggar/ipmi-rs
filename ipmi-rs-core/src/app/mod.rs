@@ -11,7 +11,16 @@ pub use get_channel_info::{
 
 mod get_channel_access;
 pub use get_channel_access::{
-    ChannelAccess, ChannelAccessMode, ChannelAccessType, ChannelPrivilegeLevel, GetChannelAccess,
+    ChannelAccess, ChannelAccessMode, ChannelAccessSettings, ChannelAccessType,
+    ChannelPrivilegeLevel, GetChannelAccess, SetChannelAccess, SetChannelAccessError,
+    SetChannelAccessMode,
+};
+
+pub mod user;
+pub use user::{
+    GetUserAccess, GetUserName, GetUserSummary, PasswordLength, SetUserAccess, SetUserName,
+    SetUserPassword, SetUserPrivilege, UserAccess, UserEnableStatus, UserId, UserList, UserName,
+    UserPassword, UserPrivilege, UserRequestError, UserResponseError, UserSummary, UserTextError,
 };
 
 pub mod auth;
