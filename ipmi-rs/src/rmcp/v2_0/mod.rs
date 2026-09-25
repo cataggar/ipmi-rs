@@ -1,4 +1,5 @@
 use std::num::NonZeroU32;
+use zeroize::Zeroize;
 
 use crate::app::auth::PrivilegeLevel;
 
@@ -366,6 +367,7 @@ impl State {
         privilege_level: Option<PrivilegeLevel>,
         username: &Username,
         password: &[u8],
+        kg: Option<&[u8]>,
         suite: CipherSuite,
         provider: CryptoProvider,
     ) -> Result<Self, ActivationError> {
@@ -390,16 +392,18 @@ impl State {
             if deadline <= std::time::Instant::now() {
                 return Err(WriteError::DeadlineExpired);
             }
-            let message = Message {
+            let mut message = Message {
                 ty,
                 session_id: 0,
                 session_sequence_number: 0,
                 payload,
             };
 
-            socket.send(deadline, |buffer| {
+            let result = socket.send(deadline, |buffer| {
                 CryptoState::write_unencrypted(&message, buffer)
-            })
+            });
+            message.payload.zeroize();
+            result
         }
 
         fn recv(data: &mut [u8]) -> Result<Message, UnwrapSessionError> {
@@ -494,7 +498,7 @@ impl State {
             ));
         }
 
-        let mut crypto_state = CryptoState::new_with_provider(None, password, provider);
+        let mut crypto_state = CryptoState::new_with_provider(kg, password, provider);
         let message_3_value = crypto_state
             .calculate_rakp3_data(&response, &rm1, &rm2)
             .map_err(ActivationError::CryptoBackend)?

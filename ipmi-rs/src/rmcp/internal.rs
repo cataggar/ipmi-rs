@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    app::auth::{CipherSuite, GetChannelAuthenticationCapabilities, PrivilegeLevel},
+    app::auth::{CipherSuite, GetChannelAuthenticationCapabilities, GetChannelCipherSuites},
     connection::{
         Address, Channel, IpmbTarget, IpmiConnection, LogicalUnit, Request, RequestTargetAddress,
         Response,
@@ -19,9 +19,9 @@ use super::{
     checksum::Checksum,
     socket::{count_unrelated, recv_datagram, TransportPolicy},
     v1_5::State as V1_5State,
-    v2_0::{CryptoProvider, State as V2_0State},
-    ASFMessage, ASFMessageType, ActivationError, RmcpHeader, RmcpIpmiError, RmcpIpmiReceiveError,
-    RmcpIpmiSendError, RmcpType,
+    v2_0::State as V2_0State,
+    ASFMessage, ASFMessageType, ActivationError, CipherSuiteListError, CipherSuitePolicy,
+    RmcpHeader, RmcpIpmiError, RmcpIpmiReceiveError, RmcpIpmiSendError, RmcpType, SessionConfig,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -175,11 +175,17 @@ impl RmcpWithState<Inactive> {
     pub fn activate(
         self,
         rmcp_plus: bool,
-        required_suite: Option<CipherSuite>,
-        provider: CryptoProvider,
-        username: Option<&str>,
-        password: Option<&[u8]>,
+        suite_policy: Option<CipherSuitePolicy>,
+        config: SessionConfig<'_>,
     ) -> Result<RmcpWithState<Active>, ActivationError> {
+        let SessionConfig {
+            username,
+            password,
+            kg,
+            privilege: privilege_level,
+            provider,
+            ..
+        } = config;
         let message_tag = 0xC8;
 
         let ping_header = RmcpHeader::new_asf(0xFF);
@@ -246,8 +252,6 @@ impl RmcpWithState<Inactive> {
 
         log::debug!("Obtaining channel authentication capabilities");
 
-        let privilege_level = PrivilegeLevel::Administrator;
-
         let authentication_caps = match ipmi.send_recv(GetChannelAuthenticationCapabilities::new(
             Channel::Current,
             privilege_level,
@@ -259,6 +263,34 @@ impl RmcpWithState<Inactive> {
         log::debug!("Authentication capabilities: {:?}", authentication_caps);
 
         if authentication_caps.ipmi2_connections_supported && rmcp_plus {
+            let suite = match suite_policy {
+                Some(CipherSuitePolicy::Exact(suite)) => suite,
+                Some(CipherSuitePolicy::BestAvailable) => {
+                    let mut records = Vec::new();
+                    for index in 0..64 {
+                        let block = ipmi
+                            .send_recv(
+                                GetChannelCipherSuites::new(Channel::Current, index)
+                                    .expect("index is within the protocol limit"),
+                            )
+                            .map_err(ActivationError::GetChannelCipherSuites)?;
+                        let last_page = block.len() < 16;
+                        records.extend_from_slice(&block);
+                        if last_page {
+                            break;
+                        }
+                        if index == 63 {
+                            return Err(ActivationError::InvalidCipherSuiteList(
+                                CipherSuiteListError::IncompleteList,
+                            ));
+                        }
+                    }
+                    super::cipher_policy::select_best(&records)
+                        .map_err(ActivationError::InvalidCipherSuiteList)?
+                        .ok_or(ActivationError::NoSupportedCipherSuite)?
+                }
+                None => CipherSuite::Id3,
+            };
             let username = username.unwrap_or("");
             if username.len() > 16 {
                 return Err(ActivationError::InvalidUsername);
@@ -273,12 +305,13 @@ impl RmcpWithState<Inactive> {
                 Some(privilege_level),
                 &username,
                 password.unwrap_or(&[]),
-                required_suite.unwrap_or(CipherSuite::Id3),
+                kg,
+                suite,
                 provider,
             )?;
 
             Ok(RmcpWithState(Active::V2_0(res)))
-        } else if required_suite.is_some() {
+        } else if suite_policy.is_some() {
             Err(ActivationError::RequiredRmcpPlusNotSupported)
         } else if authentication_caps.ipmi15_connections_supported {
             if rmcp_plus && ipmi.inner_mut().require_rmcp_plus() {

@@ -1501,6 +1501,7 @@ fn complete_rakp_sha1_aes_activation_and_request_over_udp() {
         Some(PrivilegeLevel::Administrator),
         &username,
         b"local test password",
+        None,
         CipherSuite::Id3,
         CryptoProvider::RustCrypto,
     )
@@ -1538,6 +1539,7 @@ fn network_activation_rejects_wrong_open_session_payload() {
             Some(PrivilegeLevel::Administrator),
             &Username::new("root").unwrap(),
             b"password",
+            None,
             CipherSuite::Id3,
             CryptoProvider::RustCrypto,
         ),

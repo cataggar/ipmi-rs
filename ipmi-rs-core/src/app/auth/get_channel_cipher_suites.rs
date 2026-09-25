@@ -14,7 +14,7 @@ impl From<GetChannelCipherSuites> for Message {
         Message::new_request(
             NetFn::App,
             0x54,
-            vec![value.channel.value(), 0x00, value.list_index],
+            vec![value.channel.value(), 0x00, 0x80 | value.list_index],
         )
     }
 }
@@ -22,7 +22,7 @@ impl From<GetChannelCipherSuites> for Message {
 impl GetChannelCipherSuites {
     /// Create a new `GetChannelCipherSuites`.
     ///
-    /// Returns `None` if `list_index > 0x3F``
+    /// Returns `None` if `list_index > 0x3F`.
     pub fn new(channel: Channel, list_index: u8) -> Option<Self> {
         if list_index > 0x3F {
             None
@@ -137,16 +137,17 @@ impl IpmiCommand for GetChannelCipherSuites {
     type Error = TooMuchData;
 
     fn parse_success_response(data: &[u8]) -> Result<Self::Output, Self::Error> {
-        if data.len() > 16 {
+        // The first byte identifies the channel; up to 16 record bytes follow.
+        if data.is_empty() || data.len() > 17 {
             return Err(TooMuchData);
         }
 
         let mut record_data = [0u8; 16];
-        record_data[..data.len()].copy_from_slice(data);
+        record_data[..data.len() - 1].copy_from_slice(&data[1..]);
 
         Ok(ChannelCipherSuites {
             record_data,
-            data_length: data.len(),
+            data_length: data.len() - 1,
         })
     }
 }
@@ -247,7 +248,35 @@ cipher_suite! {
 
 #[cfg(test)]
 mod tests {
-    use super::CipherSuite;
+    use super::{ChannelCipherSuites, CipherSuite, GetChannelCipherSuites};
+    use crate::connection::{Channel, IpmiCommand, Message};
+
+    #[test]
+    fn channel_cipher_suites_wire_pages_and_response_header() {
+        let request: Message = GetChannelCipherSuites::new(Channel::Current, 2)
+            .unwrap()
+            .into();
+        assert_eq!(request.data(), [0x0e, 0, 0x82]);
+
+        let response = <GetChannelCipherSuites as IpmiCommand>::parse_success_response(&[
+            0x01, 0xc0, 17, 3, 4, 1,
+        ])
+        .unwrap();
+        assert_eq!(&*response, &[0xc0, 17, 3, 4, 1]);
+        assert_eq!(
+            ChannelCipherSuites::parse_full_data(&response).collect::<Vec<_>>(),
+            vec![CipherSuite::Id17]
+        );
+        assert_eq!(
+            <GetChannelCipherSuites as IpmiCommand>::parse_success_response(&[0; 17])
+                .unwrap()
+                .len(),
+            16
+        );
+        assert!(GetChannelCipherSuites::new(Channel::Current, 64).is_none());
+        assert!(<GetChannelCipherSuites as IpmiCommand>::parse_success_response(&[]).is_err());
+        assert!(<GetChannelCipherSuites as IpmiCommand>::parse_success_response(&[0; 18]).is_err());
+    }
 
     #[test]
     fn cipher_suite_accessors() {

@@ -14,7 +14,9 @@ mod activate_session;
 pub use activate_session::{ActivateSession, BeginSessionInfo};
 
 mod get_channel_cipher_suites;
-pub use get_channel_cipher_suites::{ChannelCipherSuites, CipherSuite, GetChannelCipherSuites};
+pub use get_channel_cipher_suites::{
+    ChannelCipherSuites, CipherSuite, GetChannelCipherSuites, TooMuchData,
+};
 
 mod algorithms;
 pub use algorithms::*;
