@@ -98,6 +98,13 @@ impl<C: OemCommand> IpmiCommand for Checked<C> {
 }
 
 impl<CON: IpmiConnection> Ipmi<CON> {
+    pub(crate) fn oem_device_id(
+        &mut self,
+        target: Option<(Address, Channel)>,
+    ) -> Result<DeviceId, IpmiError<CON::Error, NotEnoughData>> {
+        self.send_recv(TargetDeviceId(target))
+    }
+
     /// Verify the selected destination before sending a typed OEM command.
     ///
     /// A mutation is never automatically retried. A transport error after
@@ -110,9 +117,7 @@ impl<CON: IpmiConnection> Ipmi<CON> {
     ) -> Result<C::Output, OemError<CON::Error, C::Error>> {
         let target = command.target();
         let lun = command.lun();
-        let device = self
-            .send_recv(TargetDeviceId(target))
-            .map_err(OemError::Identity)?;
+        let device = self.oem_device_id(target).map_err(OemError::Identity)?;
         if device.manufacturer_id != C::MANUFACTURER_ID
             || C::PRODUCT_ID.is_some_and(|product| device.product_id != product)
             || !command.supports(&device)
