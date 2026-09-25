@@ -213,7 +213,7 @@ impl<'a, CON: IpmiConnection> SelPoller<'a, CON> {
                 .map(|index| index + 1)
                 .unwrap_or(0);
             current[first_after_last..].iter().any(|e| {
-                !old.contains_key(&e.entry.record_id())
+                old.get(&e.entry.record_id()).copied() != Some(&e.raw)
                     && e.entry.record_id().value() < last_id.value()
             })
         });

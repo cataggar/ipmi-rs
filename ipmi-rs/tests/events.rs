@@ -256,6 +256,27 @@ fn deleting_newest_id_does_not_masquerade_as_wraparound() {
 }
 
 #[test]
+fn changed_record_reusing_old_id_after_tail_reports_wraparound() {
+    let mut steps = scan(&[(1, 1), (0xfffe, 1)], 0, false);
+    steps.extend(scan(&[(0xfffe, 1), (1, 2)], 10, false));
+    steps.extend(scan(&[(0xfffe, 1), (1, 2)], 10, false));
+    let mut ipmi = Ipmi::new(Fixture(steps.into()));
+    let token = CancellationToken::default();
+    let mut poller = ipmi.sel_poller(3, limit(), &token).unwrap();
+    let changed = poller.poll_once(limit(), &token).unwrap();
+    assert_eq!(changed.entries.len(), 1);
+    assert_eq!(changed.entries[0].entry.record_id().value(), 1);
+    assert!(changed.missing_ids.is_empty());
+    assert!(changed.wrapped);
+    assert!(changed.continuity_lost);
+    let repeat = poller.poll_once(limit(), &token).unwrap();
+    assert!(repeat.entries.is_empty());
+    assert!(!repeat.wrapped);
+    drop(poller);
+    assert!(ipmi.release().0.is_empty());
+}
+
+#[test]
 fn preexisting_overflow_is_exposed_on_baseline_and_quiet_scans() {
     let mut steps = scan(&[(10, 1)], 0, true);
     steps.extend(scan(&[(10, 1)], 0, true));
