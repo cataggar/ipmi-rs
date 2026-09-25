@@ -7,7 +7,9 @@
 use std::{collections::HashSet, marker::PhantomData, time::Duration};
 
 use ipmi_rs_core::{
-    connection::{Address, Channel, IpmiConnection, LogicalUnit, Message, NetFn},
+    connection::{
+        Address, Channel, CompletionErrorCode, IpmiConnection, LogicalUnit, Message, NetFn,
+    },
     storage::sdr::{
         record::{GenericDeviceLocator, RecordContents, SensorId},
         GetDeviceSdr, RecordId, RecordParseError,
@@ -73,6 +75,7 @@ pub enum ProtocolError {
     InvalidValue,
     InvalidSequence,
     ExceededLimit,
+    InvalidVersion,
 }
 
 /// Checked Sun workflow failure. After a dispatched mutation times out or
@@ -135,6 +138,10 @@ impl OemCommand for Packet {
             return Err(ProtocolError::ExceededLimit);
         }
         Ok(data.to_vec())
+    }
+
+    fn handle_completion_code(_: CompletionErrorCode, data: &[u8]) -> Option<Self::Error> {
+        is_cli_version_rejection(data).then_some(ProtocolError::InvalidVersion)
     }
 
     fn target(&self) -> Option<(Address, Channel)> {
@@ -507,8 +514,19 @@ impl<CON: IpmiConnection> Ipmi<CON> {
         let dest = Destination::default();
         let mut version = 2;
         let mut open = vec![version, 0, 0, 0, 0, 0, 0, 0, 0];
-        let mut reply = self.sun_packet(dest, 0x19, open.clone())?;
-        if reply.len() >= 9 && reply[1] != 0 && reply[8..].starts_with(b"Invalid version\0") {
+        let mut reply = match self.sun_packet(dest, 0x19, open.clone()) {
+            Ok(reply) => reply,
+            Err(SunError::Oem(OemError::Command(IpmiError::Command {
+                error: ProtocolError::InvalidVersion,
+                ..
+            }))) => {
+                version = 1;
+                open[0] = version;
+                self.sun_packet(dest, 0x19, open.clone())?
+            }
+            Err(error) => return Err(error),
+        };
+        if version == 2 && reply.len() >= 9 && reply[1] != 0 && is_cli_version_rejection(&reply) {
             version = 1;
             open[0] = version;
             reply = self.sun_packet(dest, 0x19, open)?;
@@ -561,6 +579,12 @@ impl<CON: IpmiConnection> Ipmi<CON> {
         }
         Ok(output)
     }
+}
+
+fn is_cli_version_rejection(data: &[u8]) -> bool {
+    const INVALID: &[u8] = b"Invalid version\0";
+    data.get(8..).is_some_and(|text| text.starts_with(INVALID))
+        || data.get(9..).is_some_and(|text| text.starts_with(INVALID))
 }
 
 fn cli_response(
@@ -894,6 +918,16 @@ mod tests {
         assert_eq!(sent[1].data.len(), 65);
         assert_eq!(&sent[1].data[..5], &[0, b'L', b'E', b'D', 0]);
         assert_eq!(sent[3].data[0], 1);
+
+        let mut mock = Mock::default();
+        mock.identity(42);
+        mock.reply(0x2e, 0x19, 0xc1, b"\x02\x01\0\0\0\0\0\0Invalid version\0");
+        mock.sun(0x19, &[1, 0, 0, 0, 1, 2, 3, 4, 0]);
+        mock.sun(0x19, &[1, 0, 0, 0, 1, 2, 3, 4, 0]);
+        mock.sun(0x19, &[1, 1, 0, 0, 1, 2, 3, 4, 0]);
+        let mut ipmi = Ipmi::new(mock);
+        assert_eq!(ipmi.sun_cli(WriteIntent::Approved, "ls", 8).unwrap(), b"");
+        assert_eq!(count(&ipmi.release().sent, 0x19), 4);
         assert_eq!(sent[5].data, ping);
 
         let mut mock = Mock::default();
