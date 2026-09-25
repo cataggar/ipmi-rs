@@ -58,8 +58,8 @@ Typed writes include Kontron CP6012 nextboot, checked board/product FRU updates,
 approved Sun LED/key/CLI operations, and the explicitly requested Dell writes
 in `Ipmi::dell()`.
 Sun setval additionally requires the host-local device-file transport.
-None retries after a timeout. Dell's iDRAC
-generation is read from App selector `DD` / block 2 before writes; the
+None automatically retries an uncertain write or resets the device. Dell's
+iDRAC generation is read from App selector `DD` / block 2 before writes; the
 individual operation probes status/capability before sending. Unknown models,
 locked LCDs, unlicensed/unsupported responses, absent drives and read-only
 power caps fail closed. See [Dell-specific recovery](#dell-generation-guards-and-recovery).
@@ -84,6 +84,10 @@ unsupported `C1/CB` and vFlash embedded unlicensed `33` are surfaced, not
 turned into zero-valued results. A generic connection cannot independently
 prove that it is Open/WMI: callers must assert `LocalVflash::Open/Wmi` only
 for genuinely local connections; ipmitool refuses vFlash over LAN/LAN+.
+
+The power budget's current cap preserves the returned `Watts` or `BtuPerHour`
+wire value without conversion; min/max bounds remain watts. Unknown units
+are rejected, and guarded cap writes deliberately accept watts only.
 
 Only the ipmitool C source and the local R630 *SDR* sample provide model
 information. **No Dell OEM command capture, tested iDRAC firmware version,

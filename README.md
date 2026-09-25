@@ -432,6 +432,11 @@ power-cap enable/limit/clear. Writes recheck iDRAC type and relevant readable
 capabilities. A timeout or partial multi-block LCD write **must not** be
 automatically replayed. Changing the active NIC can disconnect this connection;
 verify the management path and have a rollback plan before any write.
+`PowerBudget::cap` is a `PowerCapValue::Watts(u16)` or
+`PowerCapValue::BtuPerHour(u16)` matching the **unconverted wire value**;
+`min_watts` and `max_watts` are always in watts. Unknown cap units are
+rejected. `set_power_budget` takes watts and writes unit 0, rather than
+silently interpreting a saved BTU/hr cap as watts.
 
 ## BMC reset and boot overrides
 

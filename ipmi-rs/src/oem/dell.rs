@@ -991,11 +991,22 @@ impl Decode for PowerExtrema {
     }
 }
 
-/// Supported power budget and its currently configured cap in watts.
+/// The exact cap value and unit returned in App system info selector EA.
+///
+/// Dell ipmitool sends a BTU/hr cap as its raw number with unit 1; it does
+/// not convert that number to watts before transmission. Do not treat the
+/// numeric values of these variants as interchangeable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerCapValue {
+    Watts(u16),
+    BtuPerHour(u16),
+}
+
+/// Supported power budget. Bounds are in watts; the current cap has its own
+/// wire unit and is retained exactly, with no lossy conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PowerBudget {
-    pub watts: u16,
-    pub unit: u8,
+    pub cap: PowerCapValue,
     pub min_watts: u16,
     pub max_watts: u16,
     pub supplies: u16,
@@ -1006,9 +1017,13 @@ pub struct PowerBudget {
 impl Decode for PowerBudget {
     fn decode(data: &[u8]) -> Result<Self, DecodeError> {
         len(data, 16)?;
+        let cap = match data[3] {
+            0 => PowerCapValue::Watts(u16_at(data, 1)),
+            1 => PowerCapValue::BtuPerHour(u16_at(data, 1)),
+            other => return Err(DecodeError::InvalidValue(other)),
+        };
         let result = Self {
-            watts: u16_at(data, 1),
-            unit: data[3],
+            cap,
             max_watts: u16_at(data, 4),
             min_watts: u16_at(data, 6),
             supplies: u16_at(data, 8),

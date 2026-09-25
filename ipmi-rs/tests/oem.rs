@@ -9,7 +9,7 @@ use ipmi_rs::{
         dell::{
             ActiveNic, ClearPower, Controller, DecodeError, DellError, DriveBdf, DriveLed,
             Failover, GetPowerCapStatus, Kvm, LcdLock, LcdMode, LegacyNic, LocalVflash, NicMode,
-            PowerCapStatus, SdHealth, WriteIntent,
+            PowerCapStatus, PowerCapValue, SdHealth, WriteIntent,
         },
         kontron::{BootDevice, GetManufacturingDate, SetNextBoot},
         quanta::{GetPlatformId, Platform, PlatformError},
@@ -866,7 +866,9 @@ fn dell_power_reads_route_storage_sensor_app_and_oem() {
     assert_eq!(dell.minimum_power().unwrap().watts.minute, 12);
     assert_eq!(dell.power_sensor(0x98).unwrap().upper_critical, 55);
     assert!(dell.power_cap_status().unwrap().can_set);
-    assert_eq!(dell.power_budget().unwrap().min_watts, 80);
+    let budget = dell.power_budget().unwrap();
+    assert_eq!(budget.cap, PowerCapValue::Watts(90));
+    assert_eq!(budget.min_watts, 80);
     assert_pairs(
         &ipmi.release().sent,
         &[
@@ -880,6 +882,64 @@ fn dell_power_reads_route_storage_sensor_app_and_oem() {
             (6, 0x59, &[0, 0xED, 0, 0]),
             (4, 0x2D, &[0x98]),
             (4, 0x27, &[0x98]),
+            (0x30, 0xBA, &[1, 0xFF]),
+            (6, 0x59, &[0, 0xEA, 0, 0]),
+        ],
+    );
+}
+
+#[test]
+fn dell_power_budget_preserves_btu_per_hour_wire_value_and_watt_bounds() {
+    // ipmi_delloem.c:3604-3607 writes the numeric BTU/hr cap unchanged
+    // with unit=1; EA replies preserve that cap while min/max remain watts.
+    let btu_budget = [0x11, 0x55, 0x01, 1, 100, 0, 80, 0, 2, 0, 110, 0, 3, 0, 0, 0];
+    let mut mock = Mock::default();
+    mock.dell_controller(0x10);
+    mock.dell_reply(6, 0x59, 0, &btu_budget);
+    mock.dell_controller(0x10);
+    mock.dell_reply(0x30, 0xBA, 0, &[3]);
+    mock.dell_reply(6, 0x59, 0, &btu_budget);
+    mock.dell_reply(6, 0x58, 0, &[]);
+    let mut ipmi = Ipmi::new(mock);
+    let mut dell = ipmi.dell().unwrap();
+    let budget = dell.power_budget().unwrap();
+    assert_eq!(budget.cap, PowerCapValue::BtuPerHour(341));
+    assert_eq!((budget.min_watts, budget.max_watts), (80, 100));
+    dell.set_power_budget(WriteIntent, 95).unwrap();
+    assert_pairs(
+        &ipmi.release().sent,
+        &[
+            (6, 0x59, VALIDATOR),
+            (6, 0x59, &[0, 0xEA, 0, 0]),
+            (6, 0x59, VALIDATOR),
+            (0x30, 0xBA, &[1, 0xFF]),
+            (6, 0x59, &[0, 0xEA, 0, 0]),
+            (6, 0x58, &[0xEA, 95, 0, 0, 100, 0, 80, 0, 2, 110, 0, 3, 0]),
+        ],
+    );
+}
+
+#[test]
+fn dell_power_budget_rejects_unknown_unit_before_any_write() {
+    let unknown_budget = [0x11, 0x55, 0x01, 3, 100, 0, 80, 0, 2, 0, 110, 0, 3, 0, 0, 0];
+    let mut mock = Mock::default();
+    mock.dell_controller(0x10);
+    mock.dell_controller(0x10);
+    mock.dell_reply(0x30, 0xBA, 0, &[3]);
+    mock.dell_reply(6, 0x59, 0, &unknown_budget);
+    let mut ipmi = Ipmi::new(mock);
+    assert!(matches!(
+        ipmi.dell().unwrap().set_power_budget(WriteIntent, 95),
+        Err(DellError::Dispatch(OemError::Command(IpmiError::Command {
+            error: DecodeError::InvalidValue(3),
+            ..
+        })))
+    ));
+    assert_pairs(
+        &ipmi.release().sent,
+        &[
+            (6, 0x59, VALIDATOR),
+            (6, 0x59, VALIDATOR),
             (0x30, 0xBA, &[1, 0xFF]),
             (6, 0x59, &[0, 0xEA, 0, 0]),
         ],

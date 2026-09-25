@@ -141,6 +141,7 @@ CP6012 nextboot, product). It returns an unsupported-device error rather than
 trying a vendor packet on a different BMC. The [OEM coverage matrix](../docs/oem-coverage.md)
 tracks unimplemented families, supported hardware, required routes and
 verification limits. Ordinary raw `Message`/`Request` use remains possible.
+
 The `ipmi-rs` crate's `Ipmi::dell()` additionally checks the 10G–13G iDRAC
 type and per-operation readable capabilities before explicit LCD, NIC, SES
 drive, and power writes. The core `dell::GetPowerCapStatus` remains a simple
