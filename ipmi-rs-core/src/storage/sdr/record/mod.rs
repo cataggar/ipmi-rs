@@ -611,7 +611,7 @@ impl TryFrom<u8> for Direction {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum ParseError {
     NotEnoughData,
     IncorrectRecordLength,
@@ -963,6 +963,22 @@ mod tests {
             let o = SensorOwner::from(x);
             let value: u8 = o.into();
             assert_eq!(x, value);
+        }
+    }
+
+    #[test]
+    fn known_record_types_do_not_panic_on_malformed_body_lengths() {
+        for ty in [0x01, 0x02, 0x03, 0x10, 0x11, 0x12] {
+            for length in 0..=u8::MAX {
+                for fill in [0, 0x40, 0xff] {
+                    let mut record = vec![0, 1, 0x51, ty, length];
+                    record.resize(5 + usize::from(length), fill);
+                    assert!(
+                        std::panic::catch_unwind(|| Record::parse(&record)).is_ok(),
+                        "record type {ty:#x}, length {length}, fill {fill:#x}"
+                    );
+                }
+            }
         }
     }
 }

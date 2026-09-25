@@ -21,11 +21,50 @@ This example will:
 2. (If supported) get SEL allocation information
 3. (If present) get the first SEL record
 4. Get the Device ID
-5. Get SDR info
-6. Get SDR repository info
-7. (If supported) get SDR allocation information
-8. Load all of the SDRs from the repository
-9. Attempt to read the value of all of the sensors from the SDR repository
+5. Get Device SDR info when supported
+6. Get SDR repository info and allocation information when supported
+7. Load SDR records from the advertised repository or Device SDR source
+8. Attempt to read the value of the sensors described by those records
+
+### SDR retrieval
+
+`Ipmi::sdrs_fallible()` uses Get Device ID to select the SDR repository
+(Storage netfn, command `0x23`) or, for a device-only controller, Device SDRs
+(Sensor/Event netfn, command `0x21`). When both are advertised it prefers the
+repository. Choose one explicitly with `ipmi.sdrs_from(SdrSource::Device)` or
+`ipmi.sdrs_from(SdrSource::Repository)`; this also avoids Get Device ID when
+capability flags are unreliable. Both iterators yield
+`Result<storage::sdr::Record, SdrError<_>>`:
+
+```rust,ignore
+use ipmi_rs::{Ipmi, SdrSource};
+
+let records = ipmi.sdrs_fallible().collect::<Result<Vec<_>, _>>()?;
+// To select Device SDRs explicitly instead:
+let device_records = ipmi.sdrs_from(SdrSource::Device)
+    .collect::<Result<Vec<_>, _>>()?;
+```
+
+An empty advertised source or a next-record ID of `0xffff` ends normally.
+Errors (including metadata, transport, parsing, inconsistent/short chunks,
+and reservation failures) are returned once, not silently mistaken for end of
+records. The iterator reserves a repository only when its Reserve operation is
+advertised, or Device SDRs only when their population is dynamic; otherwise it
+uses reservation ID zero without issuing `0x22`. It reads up to 32 record bytes
+per request, reduces the chunk size on transfer-size completion errors, and
+restarts a record from its header after a cancelled supported reservation (up
+to three renewals). For non-first records with a mismatched header ID, it
+returns the requested ID, which was used for subsequent reads. Unrecoverable
+errors are not skipped. The older `ipmi.sdrs()` still returns plain records
+from the **repository** and logs then stops on errors; prefer the fallible API
+for complete inventories.
+
+For individual commands, `storage::sdr::GetSdr` now names the repository
+operation. `GetDeviceSdr::new(...)` retains its constructor and full-record
+return type but now correctly sends the **Device** SDR command. Migrate
+callers relying on its former (incorrect) Storage wire encoding to `GetSdr`.
+Full-record `0xff` requests can exceed transport limits; use the high-level
+iterator for bounded reads.
 
 ### `sel`
 

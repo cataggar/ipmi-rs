@@ -10,7 +10,7 @@ use ipmi_rs::{
         V2_0WriteError,
     },
     storage::{sdr, sel::SelEntryInfo},
-    File, Ipmi, IpmiError, SdrIter,
+    FallibleSdrIter, File, Ipmi, IpmiError, SdrIter,
 };
 
 #[allow(unused)]
@@ -24,6 +24,23 @@ pub enum IpmiConnectionEnum {
 enum SdrIterInner<'a> {
     Rmcp(SdrIter<'a, Rmcp>),
     File(SdrIter<'a, File>),
+}
+
+enum FallibleSdrIterInner<'a> {
+    Rmcp(FallibleSdrIter<'a, Rmcp>),
+    File(FallibleSdrIter<'a, File>),
+}
+
+impl Iterator for FallibleSdrIterInner<'_> {
+    type Item = std::io::Result<sdr::Record>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let next = match self {
+            Self::Rmcp(iter) => iter.next().map(|r| r.map_err(|e| format!("{e:?}"))),
+            Self::File(iter) => iter.next().map(|r| r.map_err(|e| format!("{e:?}"))),
+        };
+        next.map(|result| result.map_err(std::io::Error::other))
+    }
 }
 
 impl Iterator for SdrIterInner<'_> {
@@ -88,6 +105,13 @@ impl IpmiConnectionEnum {
                 file.sel_entries(max_entries)
                     .map(|result| result.map_err(|e| error(format!("{e:?}")))),
             ),
+        }
+    }
+
+    pub fn sdrs_fallible(&mut self) -> impl Iterator<Item = std::io::Result<sdr::Record>> + '_ {
+        match self {
+            IpmiConnectionEnum::Rmcp(rmcp) => FallibleSdrIterInner::Rmcp(rmcp.sdrs_fallible()),
+            IpmiConnectionEnum::File(file) => FallibleSdrIterInner::File(file.sdrs_fallible()),
         }
     }
 }

@@ -60,18 +60,37 @@ fn main() -> std::io::Result<()> {
         log::warn!("Could not get Device SDR info");
     }
 
-    log::info!("Getting SDR repository info");
-    let sdr_info = ipmi.send_recv(GetSdrRepositoryInfo).unwrap();
-    Logger::log(log_output, &sdr_info);
+    let record_count = if device_id.sdr_repository_support {
+        log::info!("Getting SDR repository info");
+        let sdr_info = ipmi
+            .send_recv(GetSdrRepositoryInfo)
+            .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        Logger::log(log_output, &sdr_info);
 
-    if sdr_info.supported_ops.contains(&SdrOperation::GetAllocInfo) {
-        let sdr_alloc_info = ipmi.send_recv(SdrGetAllocInfo).unwrap();
-        Logger::log(log_output, &sdr_alloc_info);
+        if sdr_info.supported_ops.contains(&SdrOperation::GetAllocInfo) {
+            let sdr_alloc_info = ipmi
+                .send_recv(SdrGetAllocInfo)
+                .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+            Logger::log(log_output, &sdr_alloc_info);
+        }
+        u64::from(sdr_info.record_count)
+    } else if device_id.provides_device_sdrs {
+        log::info!("Using Device SDRs");
+        u64::from(
+            ipmi.send_recv(GetDeviceSdrInfo::new(SdrCount))
+                .map_err(|e| std::io::Error::other(format!("{e:?}")))?
+                .operation_value
+                .0,
+        )
+    } else {
+        return Err(std::io::Error::other(
+            "Controller supports neither an SDR repository nor Device SDRs",
+        ));
     };
 
     let template = "[{bar:.green/white}] {prefix} ({pos}/{len})";
 
-    let progress_bar = ProgressBar::new(sdr_info.record_count as u64)
+    let progress_bar = ProgressBar::new(record_count)
         .with_style(
             ProgressStyle::with_template(&template)
                 .unwrap()
@@ -80,14 +99,15 @@ fn main() -> std::io::Result<()> {
         .with_prefix("Loading SDR Records");
 
     let sensors = ipmi
-        .sdrs()
+        .sdrs_fallible()
         .map(|v| {
             progress_bar.inc(1);
             v
         })
-        .collect::<Vec<_>>();
+        .collect::<std::io::Result<Vec<_>>>();
 
     progress_bar.finish();
+    let sensors = sensors?;
 
     for sensor in &sensors {
         match &sensor.contents {
