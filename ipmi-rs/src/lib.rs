@@ -115,9 +115,7 @@ where
 
         let response = self.inner.send_recv(&mut request)?;
 
-        if response.netfn().request_value() != message_netfn.request_value()
-            || response.cmd() != message_cmd
-        {
+        if response.netfn_raw() != message_netfn.response_value() || response.cmd() != message_cmd {
             return Err(IpmiError::UnexpectedResponse {
                 netfn_sent: message_netfn,
                 netfn_recvd: response.netfn(),

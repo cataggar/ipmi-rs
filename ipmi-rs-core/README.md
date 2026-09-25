@@ -135,4 +135,56 @@ trying a vendor packet on a different BMC. The [OEM coverage matrix](../docs/oem
 tracks unimplemented families, supported hardware, required routes and
 verification limits. Ordinary raw `Message`/`Request` use remains possible.
 
+## DCMI and Intel Node Manager
+
+`dcmi` implements DCMI 1.0/1.1/1.5 group-extension commands: capabilities
+(platform, mandatory/optional attributes and access), power reading/limit
+and activation, thermal policy, temperature and sensor-ID paging, asset tag
+and management-controller identifier, and configuration parameters 1–5.
+Call `GetCapabilities(CapabilitySelector::Platform)` first; its
+`CapabilityPage::decode(selector)` interprets only the selector you requested,
+preserving reserved bits and up to 32 trailing OEM bytes. Nonstandard
+conformance/revisions and malformed payloads are errors, not guesses.
+Temperature readings are signed °C, power limits/readings are watts,
+correction times are milliseconds, and sample/exception/configuration
+intervals explicitly name their units. Enhanced power sampling codes remain
+raw because the controller advertises available codes.
+
+For the 16-byte chunked DCMI strings, `read_string` and `write_string`
+enforce a **64-byte total** and a bounded number of requests. Similarly,
+`read_temperatures` and `read_sensor_records` stop on missing progress or
+inconsistent instance counts (at most 255 instances). These are callback
+helpers: use `|request| ipmi.send_recv(request)` or send individual typed
+requests. `write_string` reports how many previous chunks were acknowledged;
+the failed chunk may have applied. An asset tag and controller ID are byte
+strings; choose text encoding explicitly and supply a terminating zero byte
+for controller-ID strings if the target expects a C string. The read helper
+uses the reference's one-byte initial query for controller IDs and a
+zero-byte length query for asset tags. A controller ID write may disrupt
+the RMCP+ session, so treat missing acknowledgement as uncertain.
+
+`node_manager::NodeManager` **never probes automatically**. Obtain a handle
+via `NodeManager::from_device_id(&id)` only for Intel manufacturer ID
+`0x000157`, or explicitly override that detection with `NodeManager::opt_in()`
+when a non-Intel BMC proxies to Intel NM. Then call `discover()` and
+`capabilities(domain, trigger)` before configuring policy limits. The module
+provides NM version/capabilities, policy get/upsert/remove/control, power
+range, alert destination, and up to three alert thresholds. `PolicySettings`
+can be checked with `validate_against(&capabilities)` before sending; only
+the controller knows its current policy ranges. NM policy trigger values are
+watts, °C or tenths of seconds depending on trigger; correction intervals
+are milliseconds and statistics periods seconds. Unknown OEM trigger and
+correction codes are preserved on reads and rejected on standard writes.
+
+**Not covered:** DCMI OOB UDP ping, selector 5's NM-enhanced DCMI sampling
+metadata, and user-facing CLI; NM statistics, reset-statistics, policy
+limiting, and suspend periods. These are not sent implicitly. Reads normally
+require Operator access; provisioning limits,
+thermal policies, asset/configuration data, alerts and NM policies normally
+requires Administrator access and controller support. Check the actual
+controller's advertised privileges. Mutations return `Acknowledged` only
+after a successful completion code; a lost reply is an **unknown outcome**.
+Do not automatically retry limits/policies/alerts or string chunks, and do
+not assume a subsequent read conclusively proves that no mutation occurred.
+
 [`ipmi-rs`]: https://crates.io/crates/ipmi-rs
