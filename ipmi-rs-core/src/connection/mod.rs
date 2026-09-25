@@ -10,7 +10,7 @@ mod netfn;
 pub use netfn::NetFn;
 
 mod request;
-pub use request::{Request, RequestTargetAddress};
+pub use request::{IpmbTarget, Request, RequestTargetAddress};
 
 mod response;
 pub use response::Response;

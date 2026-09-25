@@ -86,6 +86,50 @@ impl core::fmt::Debug for State {
 }
 
 impl State {
+    fn send_payload(
+        &mut self,
+        payload: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<(), RmcpIpmiSendError> {
+        if self.socket.cancellation_token().is_cancelled() {
+            return Err(RmcpIpmiSendError::Cancelled);
+        }
+        if deadline <= Instant::now() {
+            return Err(RmcpIpmiSendError::DeadlineExpired);
+        }
+        if self.session_id.is_some() && self.session_sequence == u32::MAX {
+            return Err(RmcpIpmiSendError::SessionSequenceExhausted);
+        }
+        if self.session_id.is_some() {
+            self.session_sequence += 1;
+        }
+        let message = Message {
+            auth_type: self.auth_type,
+            session_sequence_number: self.session_sequence,
+            session_id: self.session_id.map_or(0, std::num::NonZero::get),
+            payload,
+        };
+        enum Send {
+            Ipmi(WriteError),
+            Io(std::io::Error),
+        }
+        impl From<std::io::Error> for Send {
+            fn from(value: std::io::Error) -> Self {
+                Self::Io(value)
+            }
+        }
+        self.socket
+            .send(deadline, |buffer| {
+                message
+                    .write_data(self.password.as_ref(), buffer)
+                    .map_err(Send::Ipmi)
+            })
+            .map_err(|error| match error {
+                Send::Ipmi(ipmi) => RmcpIpmiSendError::V1_5(ipmi),
+                Send::Io(io) => RmcpIpmiSendError::V1_5(WriteError::Io(io)),
+            })
+    }
+
     pub fn new(
         socket: UdpSocket,
         policy: TransportPolicy,
@@ -199,63 +243,65 @@ impl IpmiConnection for State {
             return Err(RmcpIpmiSendError::DeadlineExpired);
         }
 
-        let request_sequence = &mut self.session_sequence;
-        if self.session_id.is_some() && *request_sequence == u32::MAX {
+        if self.session_id.is_some() && self.session_sequence == u32::MAX {
             return Err(RmcpIpmiSendError::SessionSequenceExhausted);
         }
         let final_data = self.ipmb_state.begin(request, deadline)?;
-
-        // Only increment the request sequence once a session has been established
-        // successfully.
-        if self.session_id.is_some() {
-            *request_sequence += 1;
-        }
-
-        let message = Message {
-            auth_type: self.auth_type,
-            session_sequence_number: self.session_sequence,
-            session_id: self.session_id.map_or(0, std::num::NonZero::get),
-            payload: final_data,
-        };
-
-        enum Send {
-            Ipmi(WriteError),
-            Io(std::io::Error),
-        }
-
-        impl From<std::io::Error> for Send {
-            fn from(value: std::io::Error) -> Self {
-                Self::Io(value)
-            }
-        }
-
-        let sent = self.socket.send(deadline, |buffer| {
-            message
-                .write_data(self.password.as_ref(), buffer)
-                .map_err(Send::Ipmi)
-        });
+        let sent = self.send_payload(final_data, deadline);
         if sent.is_err() {
             self.ipmb_state.retire_pending();
         }
-        match sent {
-            Ok(()) => Ok(()),
-            Err(Send::Ipmi(ipmi)) => Err(RmcpIpmiSendError::V1_5(ipmi)),
-            Err(Send::Io(io)) => Err(RmcpIpmiSendError::V1_5(WriteError::Io(io))),
-        }
+        sent
     }
 
     fn recv(&mut self) -> Result<Response, RmcpIpmiReceiveError> {
         let deadline = self
             .ipmb_state
             .pending
+            .as_ref()
             .ok_or(RmcpIpmiReceiveError::NoPendingRequest)?
             .deadline;
+        let mut seen = Vec::new();
         let result = (|| {
             let mut unrelated = 0;
             let mut first_mismatch = None;
+            let mut polls = 0;
+            let mut next_probe = None;
             loop {
-                let data = match self.socket.recv_until_with_budget(deadline, &mut unrelated) {
+                let needs_poll = self.ipmb_state.needs_poll();
+                let send_poll = if needs_poll && polls > 0 && !self.ipmb_state.queue_available() {
+                    let ready = next_probe.get_or_insert_with(|| {
+                        Instant::now()
+                            .checked_add(std::time::Duration::from_millis(50))
+                            .unwrap_or(deadline)
+                    });
+                    Instant::now() >= *ready
+                } else {
+                    needs_poll
+                };
+                if send_poll {
+                    next_probe = None;
+                    let poll = match self.ipmb_state.poll_message() {
+                        Ok(poll) => poll,
+                        Err(RmcpIpmiSendError::IpmbSequenceExhausted) => {
+                            self.ipmb_state.stop_polling();
+                            continue;
+                        }
+                        Err(error) => return Err(RmcpIpmiReceiveError::BridgePollSend(error)),
+                    };
+                    self.send_payload(poll, deadline)
+                        .map_err(RmcpIpmiReceiveError::BridgePollSend)?;
+                    polls += 1;
+                } else if !needs_poll {
+                    next_probe = None;
+                }
+                let receive_deadline = next_probe.unwrap_or(deadline).min(deadline);
+                let data = match self
+                    .socket
+                    .recv_until_with_budget(receive_deadline, &mut unrelated)
+                {
                     Ok(data) => data,
+                    Err(RmcpIpmiReceiveError::Timeout) if receive_deadline < deadline => continue,
                     Err(RmcpIpmiReceiveError::Timeout) => {
                         return Err(first_mismatch.unwrap_or(RmcpIpmiReceiveError::Timeout));
                     }
@@ -278,7 +324,8 @@ impl IpmiConnection for State {
                         && (message.session_sequence_number == 0
                             || self
                                 .last_inbound_sequence
-                                .is_some_and(|last| message.session_sequence_number <= last))
+                                .is_some_and(|last| message.session_sequence_number <= last)
+                            || seen.contains(&message.session_sequence_number))
                     {
                         super::internal::record_unrelated(
                             RmcpIpmiReceiveError::InvalidSessionSequence,
@@ -298,20 +345,29 @@ impl IpmiConnection for State {
                     }
                     Ok(response) => {
                         if self.activated {
-                            self.last_inbound_sequence = Some(message.session_sequence_number);
+                            if seen.len() >= 64 + super::socket::MAX_UNRELATED {
+                                return Err(RmcpIpmiReceiveError::TooManyUnrelatedPackets);
+                            }
+                            seen.push(message.session_sequence_number);
                         }
-                        return Ok(response);
+                        if let Some(response) = response {
+                            return Ok(response);
+                        }
                     }
                     Err(error) => return Err(error),
                 }
             }
         })();
+        if let Some(highest) = seen.into_iter().max() {
+            self.last_inbound_sequence = Some(highest);
+        }
         self.ipmb_state.retire_pending();
         result
     }
 
     fn send_recv(&mut self, request: &mut Request) -> Result<Response, Self::Error> {
-        self.send(request)?;
+        self.send(request)
+            .map_err(RmcpIpmiSendError::into_operation_error)?;
         let response = self.recv().map_err(RmcpIpmiError::OutcomeUnknown)?;
         Ok(response)
     }

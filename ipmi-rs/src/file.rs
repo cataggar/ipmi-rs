@@ -173,15 +173,21 @@ impl IpmiAddr {
     }
 }
 
-impl From<RequestTargetAddress> for IpmiAddr {
-    fn from(value: RequestTargetAddress) -> Self {
+impl TryFrom<RequestTargetAddress> for IpmiAddr {
+    type Error = io::Error;
+
+    fn try_from(value: RequestTargetAddress) -> io::Result<Self> {
         match value {
             RequestTargetAddress::Bmc(lun) => {
-                IpmiAddr::SysIface(IpmiSysIfaceAddr::bmc(lun.value()))
+                Ok(IpmiAddr::SysIface(IpmiSysIfaceAddr::bmc(lun.value())))
             }
-            RequestTargetAddress::BmcOrIpmb(addr, channel, lun) => IpmiAddr::Ipmb(
+            RequestTargetAddress::BmcOrIpmb(addr, channel, lun) => Ok(IpmiAddr::Ipmb(
                 IpmiIpmbAddr::new(channel.value() as i16, addr.0, lun.value()),
-            ),
+            )),
+            RequestTargetAddress::Bridged { .. } => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "explicit RMCP bridge routes are not supported by the device-file interface",
+            )),
         }
     }
 }
@@ -302,7 +308,7 @@ impl IpmiConnection for File {
             }
             x => x,
         }
-        .into();
+        .try_into()?;
 
         self.seq += 1;
 
@@ -435,5 +441,24 @@ impl IpmiConnection for File {
         self.send(request)?;
 
         self.recv()
+    }
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+    use crate::connection::{Channel, IpmbTarget, LogicalUnit};
+
+    #[test]
+    fn explicit_rmcp_route_is_not_silently_truncated_to_one_hop() {
+        let hop = |addr| IpmbTarget::new(Address(addr), Channel::Primary, LogicalUnit::Zero);
+        let route = RequestTargetAddress::Bridged {
+            target: hop(0x52),
+            transit: Some(hop(0x30)),
+        };
+        assert!(matches!(
+            IpmiAddr::try_from(route),
+            Err(error) if error.kind() == io::ErrorKind::Unsupported
+        ));
     }
 }

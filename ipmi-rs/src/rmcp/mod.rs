@@ -81,6 +81,9 @@ pub enum RmcpIpmiReceiveError {
     EmptyMessage,
     IpmbChecksumFailed,
     IpmbResponseMismatch,
+    BridgeCompletion { hop: u8, code: u8 },
+    BridgeQueueCompletion { command: u8, code: u8 },
+    BridgePollSend(RmcpIpmiSendError),
     NoPendingRequest,
     SessionIdMismatch,
     InvalidSessionSequence,
@@ -99,6 +102,8 @@ pub enum RmcpIpmiSendError {
     V2_0(V2_0WriteError),
     RequestPending,
     UnsupportedTarget,
+    InvalidBridgeTarget,
+    BridgePayloadTooLarge(usize),
     InvalidNetfn(u8),
     IpmbSequenceExhausted,
     SessionSequenceExhausted,
@@ -116,6 +121,17 @@ impl From<V1_5WriteError> for RmcpIpmiSendError {
 impl From<V2_0WriteError> for RmcpIpmiSendError {
     fn from(value: V2_0WriteError) -> Self {
         Self::V2_0(value)
+    }
+}
+
+impl RmcpIpmiSendError {
+    fn into_operation_error(self) -> RmcpIpmiError {
+        match self {
+            Self::V1_5(V1_5WriteError::Io(_)) | Self::V2_0(V2_0WriteError::Io(_)) => {
+                RmcpIpmiError::SendOutcomeUnknown(self)
+            }
+            _ => RmcpIpmiError::Send(self),
+        }
     }
 }
 
@@ -142,6 +158,8 @@ pub enum RmcpIpmiError {
     NotActive,
     Receive(RmcpIpmiReceiveError),
     Send(RmcpIpmiSendError),
+    /// The send may have reached the BMC; do not automatically retry a mutation.
+    SendOutcomeUnknown(RmcpIpmiSendError),
     /// A request may have executed; it must not be automatically retried.
     OutcomeUnknown(RmcpIpmiReceiveError),
 }
@@ -341,7 +359,10 @@ impl IpmiConnection for Rmcp {
 
     fn recv(&mut self) -> Result<crate::connection::Response, Self::RecvError> {
         let active = self.active_state.as_mut().ok_or(RmcpIpmiError::NotActive)?;
-        active.recv().map_err(RmcpIpmiError::Receive)
+        active.recv().map_err(|error| match error {
+            RmcpIpmiReceiveError::NoPendingRequest => RmcpIpmiError::Receive(error),
+            _ => RmcpIpmiError::OutcomeUnknown(error),
+        })
     }
 
     fn send_recv(

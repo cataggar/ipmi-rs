@@ -1,6 +1,9 @@
 use super::*;
 use crate::{
-    connection::{LogicalUnit, Message as IpmiMessage, NetFn, Request, RequestTargetAddress},
+    connection::{
+        Address, Channel, IpmbTarget, LogicalUnit, Message as IpmiMessage, NetFn, Request,
+        RequestTargetAddress,
+    },
     rmcp::{checksum::Checksum, socket::TransportPolicy, RmcpHeader, RmcpIpmiSendError},
 };
 use crypto::sha1::Sha1Hmac;
@@ -95,6 +98,429 @@ fn response(sequence: u8) -> Vec<u8> {
     data[2] = Checksum::from_iter(data[..2].iter().copied());
     data.push(Checksum::from_iter(data[3..].iter().copied()));
     data
+}
+
+fn bridge_request(transit: Option<IpmbTarget>) -> Request {
+    Request::new(
+        IpmiMessage::new_request(NetFn::Chassis, 2, vec![1]),
+        RequestTargetAddress::Bridged {
+            target: IpmbTarget::new(Address(0x52), Channel::Primary, LogicalUnit::One),
+            transit,
+        },
+    )
+}
+
+fn bridge_reply(
+    requestor: u8,
+    responder: u8,
+    sequence: u8,
+    netfn: u8,
+    lun: u8,
+    cmd: u8,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut payload = vec![
+        requestor,
+        netfn << 2,
+        0,
+        responder,
+        sequence << 2 | lun,
+        cmd,
+    ];
+    payload[2] = Checksum::from_iter(payload[..2].iter().copied());
+    payload.extend_from_slice(data);
+    payload.push(Checksum::from_iter(payload[3..].iter().copied()));
+    payload
+}
+
+#[test]
+fn encrypted_dual_hop_nested_send_message_reply() {
+    let (mut state, peer, mut crypto) = pair(Duration::from_millis(200));
+    let mut req = bridge_request(Some(IpmbTarget::new(
+        Address(0x30),
+        Channel::Primary,
+        LogicalUnit::Two,
+    )));
+    state.send(&mut req).unwrap();
+    let outbound = read_secure(&peer, &mut crypto);
+    assert_eq!(outbound.ty, PayloadType::IpmiMessage);
+    assert_eq!(
+        (
+            outbound.payload[5],
+            outbound.payload[7],
+            outbound.payload[12]
+        ),
+        (0x34, 0x30, 0x34)
+    );
+    assert_eq!(outbound.payload[17], 0x20);
+    let final_reply = bridge_reply(0x20, 0x52, 2, 1, 1, 2, &[0, 0xbe]);
+    let transit = bridge_reply(
+        0x81,
+        0x30,
+        1,
+        7,
+        2,
+        0x34,
+        &[&[0][..], &final_reply].concat(),
+    );
+    let outer = bridge_reply(0x81, 0x20, 0, 7, 0, 0x34, &[&[0][..], &transit].concat());
+    send_answer(
+        &peer,
+        &mut crypto,
+        Message {
+            ty: PayloadType::IpmiMessage,
+            session_id: state.console_session_id.get(),
+            session_sequence_number: 1,
+            payload: outer,
+        },
+    );
+    assert_eq!(state.recv().unwrap().data(), &[0xbe]);
+}
+
+#[test]
+fn suite17_bridged_reply_is_authenticated() {
+    fn run(provider: CryptoProvider) {
+        let (mut state, peer, mut crypto) = pair_suite17(Duration::from_millis(200), provider);
+        let mut req = bridge_request(None);
+        state.send(&mut req).unwrap();
+        let outgoing = read_secure(&peer, &mut crypto);
+        assert_eq!(outgoing.payload[5], 0x34);
+        let target = bridge_reply(0x81, 0x52, 1, 1, 1, 2, &[0, 0xa5]);
+        let outer = bridge_reply(0x81, 0x20, 0, 7, 0, 0x34, &[&[0][..], &target].concat());
+        send_answer(
+            &peer,
+            &mut crypto,
+            Message {
+                ty: PayloadType::IpmiMessage,
+                session_id: state.console_session_id.get(),
+                session_sequence_number: 1,
+                payload: outer,
+            },
+        );
+        assert_eq!(state.recv().unwrap().data(), &[0xa5]);
+    }
+    run(CryptoProvider::RustCrypto);
+    #[cfg(feature = "symcrypt-backend")]
+    run(CryptoProvider::SymCrypt);
+}
+
+#[test]
+fn encrypted_reordered_hops_keep_session_replay_monotonic() {
+    let (mut state, peer, mut crypto) = pair(Duration::from_millis(150));
+    let mut req = bridge_request(Some(IpmbTarget::new(
+        Address(0x30),
+        Channel::Primary,
+        LogicalUnit::Two,
+    )));
+    state.send(&mut req).unwrap();
+    read_secure(&peer, &mut crypto);
+    let packets = [
+        (3, bridge_reply(0x20, 0x52, 2, 1, 1, 2, &[0, 0x55])),
+        (2, bridge_reply(0x81, 0x30, 1, 7, 2, 0x34, &[0])),
+        (1, bridge_reply(0x81, 0x20, 0, 7, 0, 0x34, &[0])),
+    ];
+    for (session_sequence_number, payload) in packets {
+        send_answer(
+            &peer,
+            &mut crypto,
+            Message {
+                ty: PayloadType::IpmiMessage,
+                session_id: state.console_session_id.get(),
+                session_sequence_number,
+                payload,
+            },
+        );
+    }
+    assert_eq!(state.recv().unwrap().data(), &[0x55]);
+    assert_eq!(state.last_inbound_sequence, Some(3));
+}
+
+#[test]
+fn encrypted_single_hop_get_message_filters_identity_replay_and_duplicate() {
+    let (mut state, peer, mut crypto) = pair(Duration::from_millis(240));
+    let mut req = bridge_request(None);
+    state.send(&mut req).unwrap();
+    let outbound = read_secure(&peer, &mut crypto);
+    assert_eq!(outbound.payload[7], 0x52);
+    let ack = bridge_reply(0x81, 0x20, 0, 7, 0, 0x34, &[0]);
+    for (id, seq) in [
+        (state.session_id.get(), 1),
+        (state.console_session_id.get(), 2),
+    ] {
+        send_answer(
+            &peer,
+            &mut crypto,
+            Message {
+                ty: PayloadType::IpmiMessage,
+                session_id: id,
+                session_sequence_number: seq,
+                payload: ack.clone(),
+            },
+        );
+    }
+    let console_id = state.console_session_id.get();
+    let handle = std::thread::spawn(move || {
+        let flags = read_secure(&peer, &mut crypto);
+        assert_eq!((flags.payload[5], flags.payload[4] >> 2), (0x31, 2));
+        send_answer(
+            &peer,
+            &mut crypto,
+            Message {
+                ty: PayloadType::IpmiMessage,
+                session_id: console_id,
+                session_sequence_number: 3,
+                payload: bridge_reply(0x81, 0x20, 2, 7, 0, 0x31, &[0, 1]),
+            },
+        );
+        let get = read_secure(&peer, &mut crypto);
+        assert_eq!((get.payload[5], get.payload[4] >> 2), (0x33, 3));
+        let mut body = vec![0, 0];
+        body.extend(bridge_reply(0x81, 0x52, 1, 1, 1, 2, &[0, 0xaa])[1..].iter());
+        let answer = bridge_reply(0x81, 0x20, 3, 7, 0, 0x33, &body);
+        for seq in [3, 4] {
+            send_answer(
+                &peer,
+                &mut crypto,
+                Message {
+                    ty: PayloadType::IpmiMessage,
+                    session_id: console_id,
+                    session_sequence_number: seq,
+                    payload: answer.clone(),
+                },
+            );
+        }
+    });
+    assert_eq!(state.recv().unwrap().data(), &[0xaa]);
+    handle.join().unwrap();
+    assert_eq!(state.last_inbound_sequence, Some(4));
+}
+
+fn reject_bridge_get_message(peer: &UdpSocket, crypto: &mut CryptoState, console_id: u32) {
+    let flags = read_secure(peer, crypto);
+    assert_eq!((flags.payload[5], flags.payload[4] >> 2), (0x31, 2));
+    send_answer(
+        peer,
+        crypto,
+        Message {
+            ty: PayloadType::IpmiMessage,
+            session_id: console_id,
+            session_sequence_number: 2,
+            payload: bridge_reply(0x81, 0x20, 2, 7, 0, 0x31, &[0, 1]),
+        },
+    );
+    let get = read_secure(peer, crypto);
+    assert_eq!((get.payload[5], get.payload[4] >> 2), (0x33, 3));
+    send_answer(
+        peer,
+        crypto,
+        Message {
+            ty: PayloadType::IpmiMessage,
+            session_id: console_id,
+            session_sequence_number: 3,
+            payload: bridge_reply(0x81, 0x20, 3, 7, 0, 0x33, &[0xc1]),
+        },
+    );
+}
+
+#[test]
+fn encrypted_rejected_get_message_accepts_pushed_target_reply() {
+    let (mut state, peer, mut crypto) = pair(Duration::from_millis(250));
+    peer.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let mut req = bridge_request(None);
+    state.send(&mut req).unwrap();
+    read_secure(&peer, &mut crypto);
+    send_answer(
+        &peer,
+        &mut crypto,
+        Message {
+            ty: PayloadType::IpmiMessage,
+            session_id: state.console_session_id.get(),
+            session_sequence_number: 1,
+            payload: bridge_reply(0x81, 0x20, 0, 7, 0, 0x34, &[0]),
+        },
+    );
+    let console_id = state.console_session_id.get();
+    let server = std::thread::spawn(move || {
+        reject_bridge_get_message(&peer, &mut crypto, console_id);
+        std::thread::sleep(Duration::from_millis(25));
+        send_answer(
+            &peer,
+            &mut crypto,
+            Message {
+                ty: PayloadType::IpmiMessage,
+                session_id: console_id,
+                session_sequence_number: 4,
+                payload: bridge_reply(0x81, 0x52, 1, 1, 1, 2, &[0, 0x77]),
+            },
+        );
+        assert!(peer.recv(&mut [0; 4096]).is_err());
+    });
+    assert_eq!(state.recv().unwrap().data(), &[0x77]);
+    server.join().unwrap();
+}
+
+#[test]
+fn encrypted_busy_get_message_rechecks_queue_then_receives_target() {
+    let (mut state, peer, mut crypto) = pair(Duration::from_millis(350));
+    peer.set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
+    let mut req = bridge_request(None);
+    state.send(&mut req).unwrap();
+    assert_eq!(read_secure(&peer, &mut crypto).payload[5], 0x34);
+    let console_id = state.console_session_id.get();
+    send_answer(
+        &peer,
+        &mut crypto,
+        Message {
+            ty: PayloadType::IpmiMessage,
+            session_id: console_id,
+            session_sequence_number: 1,
+            payload: bridge_reply(0x81, 0x20, 0, 7, 0, 0x34, &[0]),
+        },
+    );
+    let server = std::thread::spawn(move || {
+        for (sequence, command, body) in [
+            (2, 0x31, vec![0, 1]),
+            (3, 0x33, vec![0xc0]),
+            (4, 0x31, vec![0, 1]),
+        ] {
+            let poll = read_secure(&peer, &mut crypto);
+            assert_eq!((poll.payload[5], poll.payload[4] >> 2), (command, sequence));
+            send_answer(
+                &peer,
+                &mut crypto,
+                Message {
+                    ty: PayloadType::IpmiMessage,
+                    session_id: console_id,
+                    session_sequence_number: u32::from(sequence),
+                    payload: bridge_reply(0x81, 0x20, sequence, 7, 0, command, &body),
+                },
+            );
+        }
+        let get = read_secure(&peer, &mut crypto);
+        assert_eq!((get.payload[5], get.payload[4] >> 2), (0x33, 5));
+        let target = bridge_reply(0x81, 0x52, 1, 1, 1, 2, &[0, 0x77]);
+        let mut body = vec![0, 0];
+        body.extend_from_slice(&target[1..]);
+        send_answer(
+            &peer,
+            &mut crypto,
+            Message {
+                ty: PayloadType::IpmiMessage,
+                session_id: console_id,
+                session_sequence_number: 5,
+                payload: bridge_reply(0x81, 0x20, 5, 7, 0, 0x33, &body),
+            },
+        );
+    });
+    let start = std::time::Instant::now();
+    assert_eq!(state.recv().unwrap().data(), &[0x77]);
+    assert!(start.elapsed() < Duration::from_millis(350));
+    assert_eq!(state.last_inbound_sequence, Some(5));
+    server.join().unwrap();
+}
+
+#[test]
+fn encrypted_short_queue_backoff_accepts_pushed_reply_before_deadline() {
+    let (mut state, peer, mut crypto) = pair(Duration::from_millis(40));
+    peer.set_read_timeout(Some(Duration::from_millis(100)))
+        .unwrap();
+    let mut req = bridge_request(None);
+    state.send(&mut req).unwrap();
+    assert_eq!(read_secure(&peer, &mut crypto).payload[5], 0x34);
+    let console_id = state.console_session_id.get();
+    send_answer(
+        &peer,
+        &mut crypto,
+        Message {
+            ty: PayloadType::IpmiMessage,
+            session_id: console_id,
+            session_sequence_number: 1,
+            payload: bridge_reply(0x81, 0x20, 0, 7, 0, 0x34, &[0]),
+        },
+    );
+    let server = std::thread::spawn(move || {
+        for (seq, command, body) in [(2, 0x31, vec![0, 1]), (3, 0x33, vec![0xc0])] {
+            let poll = read_secure(&peer, &mut crypto);
+            assert_eq!((poll.payload[5], poll.payload[4] >> 2), (command, seq));
+            send_answer(
+                &peer,
+                &mut crypto,
+                Message {
+                    ty: PayloadType::IpmiMessage,
+                    session_id: console_id,
+                    session_sequence_number: u32::from(seq),
+                    payload: bridge_reply(0x81, 0x20, seq, 7, 0, command, &body),
+                },
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        send_answer(
+            &peer,
+            &mut crypto,
+            Message {
+                ty: PayloadType::IpmiMessage,
+                session_id: console_id,
+                session_sequence_number: 4,
+                payload: bridge_reply(0x81, 0x52, 1, 1, 1, 2, &[0, 0x59]),
+            },
+        );
+        assert!(peer.recv(&mut [0; 4096]).is_err()); // no additional queue/bridged request
+    });
+    assert_eq!(state.recv().unwrap().data(), &[0x59]);
+    assert_eq!(state.last_inbound_sequence, Some(4));
+    server.join().unwrap();
+}
+
+#[test]
+fn encrypted_unsupported_queue_timeout_rejects_late_pushed_reply() {
+    let (mut state, peer, mut crypto) = pair(Duration::from_millis(130));
+    peer.set_read_timeout(Some(Duration::from_millis(60)))
+        .unwrap();
+    let mut req = bridge_request(None);
+    state.send(&mut req).unwrap();
+    read_secure(&peer, &mut crypto);
+    let console_id = state.console_session_id.get();
+    send_answer(
+        &peer,
+        &mut crypto,
+        Message {
+            ty: PayloadType::IpmiMessage,
+            session_id: console_id,
+            session_sequence_number: 1,
+            payload: bridge_reply(0x81, 0x20, 0, 7, 0, 0x34, &[0]),
+        },
+    );
+    let server = std::thread::spawn(move || {
+        reject_bridge_get_message(&peer, &mut crypto, console_id);
+        assert!(peer.recv(&mut [0; 4096]).is_err());
+        (peer, crypto)
+    });
+    let start = std::time::Instant::now();
+    assert!(matches!(state.recv(), Err(RmcpIpmiReceiveError::Timeout)));
+    assert!(start.elapsed() < Duration::from_millis(300));
+    let (peer, mut crypto) = server.join().unwrap();
+    state.send(&mut req).unwrap();
+    read_secure(&peer, &mut crypto);
+    for (session_sequence_number, payload) in [
+        (4, bridge_reply(0x81, 0x52, 1, 1, 1, 2, &[0, 0xff])),
+        (5, bridge_reply(0x81, 0x20, 4, 7, 0, 0x34, &[0])),
+        (6, bridge_reply(0x81, 0x52, 5, 1, 1, 2, &[0, 0x55])),
+    ] {
+        send_answer(
+            &peer,
+            &mut crypto,
+            Message {
+                ty: PayloadType::IpmiMessage,
+                session_id: console_id,
+                session_sequence_number,
+                payload,
+            },
+        );
+    }
+    assert_eq!(state.recv().unwrap().data(), &[0x55]);
+    assert!(peer.recv(&mut [0; 4096]).is_err());
 }
 
 fn send_answer(peer: &UdpSocket, crypto: &mut CryptoState, message: Message) {

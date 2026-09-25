@@ -25,7 +25,7 @@ use self::crypto::CryptoUnwrapError;
 
 use super::{
     internal::IpmbState, socket::RmcpIpmiSocket, v1_5, RmcpIpmiError, RmcpIpmiReceiveError,
-    UnwrapSessionError,
+    RmcpIpmiSendError, UnwrapSessionError,
 };
 
 #[derive(Debug)]
@@ -588,9 +588,7 @@ impl State {
                 super::RmcpIpmiSendError::DeadlineExpired,
             ));
         }
-        let session_sequence_number = self.session_sequence_number.get();
-
-        if session_sequence_number == u32::MAX {
+        if self.session_sequence_number.get() == u32::MAX {
             return Err(RmcpIpmiError::Send(
                 super::RmcpIpmiSendError::SessionSequenceExhausted,
             ));
@@ -600,31 +598,48 @@ impl State {
             .ipmb_state
             .begin(request, deadline)
             .map_err(RmcpIpmiError::Send)?;
-        self.session_sequence_number = NonZeroU32::new(session_sequence_number + 1)
-            .expect("checked session sequence exhaustion");
-
-        let message = Message {
-            ty: PayloadType::IpmiMessage,
-            session_id: self.session_id.get(),
-            session_sequence_number,
-            payload,
-        };
-
-        let sent = self.socket.send(deadline, |buffer| {
-            self.state.write_message(&message, buffer)
-        });
+        let sent = self.send_payload(payload, deadline);
         if sent.is_err() {
             self.ipmb_state.retire_pending();
         }
-        sent.map_err(|e| RmcpIpmiError::Send(e.into()))?;
+        sent.map_err(super::RmcpIpmiSendError::into_operation_error)
+    }
 
-        Ok(())
+    fn send_payload(
+        &mut self,
+        payload: Vec<u8>,
+        deadline: std::time::Instant,
+    ) -> Result<(), super::RmcpIpmiSendError> {
+        use super::RmcpIpmiSendError;
+        if self.socket.cancellation_token().is_cancelled() {
+            return Err(RmcpIpmiSendError::Cancelled);
+        }
+        if deadline <= std::time::Instant::now() {
+            return Err(RmcpIpmiSendError::DeadlineExpired);
+        }
+        let seq = self.session_sequence_number.get();
+        if seq == u32::MAX {
+            return Err(RmcpIpmiSendError::SessionSequenceExhausted);
+        }
+        self.session_sequence_number = NonZeroU32::new(seq + 1).expect("checked");
+        let message = Message {
+            ty: PayloadType::IpmiMessage,
+            session_id: self.session_id.get(),
+            session_sequence_number: seq,
+            payload,
+        };
+        self.socket
+            .send(deadline, |buffer| {
+                self.state.write_message(&message, buffer)
+            })
+            .map_err(Into::into)
     }
 
     fn receive_one(
         &mut self,
         deadline: std::time::Instant,
         unrelated: &mut usize,
+        seen: &mut Vec<u32>,
     ) -> Result<Option<crate::connection::Response>, RmcpIpmiReceiveError> {
         let data = self.socket.recv_until_with_budget(deadline, unrelated)?;
         let message = self
@@ -638,8 +653,12 @@ impl State {
             || self
                 .last_inbound_sequence
                 .is_some_and(|last| message.session_sequence_number <= last)
+            || seen.contains(&message.session_sequence_number)
         {
             return Err(RmcpIpmiReceiveError::InvalidSessionSequence);
+        }
+        if seen.len() >= 64 + super::socket::MAX_UNRELATED {
+            return Err(RmcpIpmiReceiveError::TooManyUnrelatedPackets);
         }
         match message.ty {
             PayloadType::IpmiMessage => {
@@ -647,14 +666,14 @@ impl State {
                     return Err(RmcpIpmiReceiveError::UnexpectedPayloadType);
                 }
                 let response = self.ipmb_state.receive(&message.payload)?;
-                self.last_inbound_sequence = Some(message.session_sequence_number);
-                Ok(Some(response))
+                seen.push(message.session_sequence_number);
+                Ok(response)
             }
             PayloadType::Sol => {
                 if self.sol.is_none() {
                     return Err(RmcpIpmiReceiveError::UnexpectedPayloadType);
                 }
-                self.last_inbound_sequence = Some(message.session_sequence_number);
+                seen.push(message.session_sequence_number);
                 let frame =
                     SolFrame::decode(&message.payload).map_err(RmcpIpmiReceiveError::Sol)?;
                 let flow = self.sol.as_mut().expect("SOL state checked");
@@ -689,17 +708,52 @@ impl State {
         let deadline = self
             .ipmb_state
             .pending
+            .as_ref()
             .ok_or(RmcpIpmiReceiveError::NoPendingRequest)?
             .deadline;
+        let mut seen = Vec::new();
         let result = (|| {
             let mut unrelated = 0;
             let mut first_mismatch = None;
+            let mut polls = 0;
+            let mut next_probe = None;
             loop {
-                match self.receive_one(deadline, &mut unrelated) {
+                let needs_poll = self.ipmb_state.needs_poll();
+                let send_poll = if needs_poll && polls > 0 && !self.ipmb_state.queue_available() {
+                    let ready = next_probe.get_or_insert_with(|| {
+                        std::time::Instant::now()
+                            .checked_add(std::time::Duration::from_millis(50))
+                            .unwrap_or(deadline)
+                    });
+                    std::time::Instant::now() >= *ready
+                } else {
+                    needs_poll
+                };
+                if send_poll {
+                    next_probe = None;
+                    let poll = match self.ipmb_state.poll_message() {
+                        Ok(poll) => poll,
+                        Err(RmcpIpmiSendError::IpmbSequenceExhausted) => {
+                            self.ipmb_state.stop_polling();
+                            continue;
+                        }
+                        Err(error) => return Err(RmcpIpmiReceiveError::BridgePollSend(error)),
+                    };
+                    self.send_payload(poll, deadline)
+                        .map_err(RmcpIpmiReceiveError::BridgePollSend)?;
+                    polls += 1;
+                } else if !needs_poll {
+                    next_probe = None;
+                }
+                let receive_deadline = next_probe.unwrap_or(deadline).min(deadline);
+                match self.receive_one(receive_deadline, &mut unrelated, &mut seen) {
                     Ok(Some(response)) => return Ok(response),
                     Ok(None) => {
-                        super::socket::count_unrelated(&mut unrelated)?;
+                        if !self.ipmb_state.needs_poll() {
+                            super::socket::count_unrelated(&mut unrelated)?;
+                        }
                     }
+                    Err(RmcpIpmiReceiveError::Timeout) if receive_deadline < deadline => continue,
                     Err(RmcpIpmiReceiveError::Timeout) => {
                         return Err(first_mismatch.unwrap_or(RmcpIpmiReceiveError::Timeout));
                     }
@@ -719,8 +773,16 @@ impl State {
                 }
             }
         })();
+        self.commit_session_sequences(&mut seen);
         self.ipmb_state.retire_pending();
         result
+    }
+
+    fn commit_session_sequences(&mut self, seen: &mut Vec<u32>) {
+        if let Some(highest) = seen.iter().copied().max() {
+            self.last_inbound_sequence = Some(highest);
+        }
+        seen.clear();
     }
 
     pub(super) fn sol_open(&mut self) {
@@ -785,8 +847,11 @@ impl State {
         wait_ack: bool,
     ) -> Result<(), RmcpIpmiReceiveError> {
         let mut unrelated = 0;
+        let mut seen = Vec::new();
         loop {
-            if self.receive_one(deadline, &mut unrelated)?.is_some() {
+            let result = self.receive_one(deadline, &mut unrelated, &mut seen);
+            self.commit_session_sequences(&mut seen);
+            if result?.is_some() {
                 return Err(RmcpIpmiReceiveError::UnexpectedPayloadType);
             }
             let flow = self.sol_flow();
