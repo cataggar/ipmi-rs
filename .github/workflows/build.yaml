@@ -2,7 +2,7 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, k]
 
 jobs:
   check-format:
@@ -52,6 +52,14 @@ jobs:
       - name: Check a package with specific feature combination.
         run: CARGO_BUILD_WARNINGS=deny cargo check --locked ${{ matrix.command }}
 
+  check-windows-rmcp:
+    runs-on: windows-latest
+    name: Check Windows RMCP
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check ipmi-rs without Unix transport
+        run: cargo check --locked -p ipmi-rs --no-default-features
+
   test:
     runs-on: ubuntu-latest
     name: Test
@@ -98,6 +106,6 @@ jobs:
 
   ci-success:
     runs-on: ubuntu-latest
-    needs: [check-format, check, test, clippy]
+    needs: [check-format, check, check-windows-rmcp, test, clippy]
     steps:
       - run: true
