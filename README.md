@@ -974,12 +974,30 @@ encrypted/authenticated traffic. Internally copied secrets and handshake
 authentication buffers are cleared, and debug output redacts both keys.
 Callers remain responsible for protecting and clearing their own input buffers.
 
-### Optional SymCrypt RMCP+ backend
+### Selectable RMCP+ crypto backends
 
-The default build uses RustCrypto and does not need a native library. To
-select SymCrypt for **all** RMCP+ HMAC and AES-128-CBC operations (including
-RAKP authentication, SIK/K1/K2 and packet integrity), enable
-`symcrypt-backend` and request it explicitly:
+The default build enables `rustcrypto-backend` and does not need a native
+library. When disabling default features, choose the RMCP+ backend explicitly
+at build time:
+
+| Backend features | Implicit RMCP+ provider |
+| :--------------- | :---------------------- |
+| `rustcrypto-backend` only | RustCrypto |
+| `symcrypt-backend` only | SymCrypt |
+| Both | RustCrypto (select SymCrypt explicitly if desired) |
+| Neither | RMCP+ unavailable; IPMI 1.5 remains available |
+
+For example, a SymCrypt-only consumer can use the existing APIs
+`activate(true, ...)`, `activate_with_cipher_suite`, and
+`SessionConfig::new`; they select SymCrypt for **all** RMCP+ HMAC and
+AES-128-CBC operations (including RAKP authentication, SIK/K1/K2 and
+packet integrity):
+
+```sh
+cargo check -p ipmi-rs --no-default-features --features symcrypt-backend
+```
+
+Applications using both backends can request SymCrypt explicitly:
 
 ```rust,no_run
 use ipmi_rs::rmcp::{CipherSuite, CryptoProvider, Rmcp};
@@ -995,12 +1013,23 @@ let _result = connection.activate_with_provider(
 // Handle `_result: Result<(), ActivationError>` as appropriate for your application.
 ```
 
-Suites 3 (legacy SHA-1 interoperability) and 17 (SHA-256) are both supported.
-If the feature is absent, a SymCrypt request returns
+Suites 3 (legacy SHA-1 interoperability) and 17 (SHA-256) are supported
+by either backend. A request for a provider whose feature is absent returns
 `ActivationError::CryptoBackend(CryptoBackendError::Unavailable)` **before
 network I/O**. A rejected cipher suite or altered algorithms never select
-another provider, a weaker suite, or IPMI 1.5. `activate()` retains its
-existing suite-3/default-backend behavior and IPMI 1.5 compatibility.
+another provider, a weaker suite, or IPMI 1.5. With neither backend,
+RMCP+ activation fails before network I/O; `activate(false, ...)` still
+permits IPMI 1.5. The default build retains suite 3 and RustCrypto for
+`activate(true, ...)`, including its existing IPMI 1.5 compatibility.
+
+Test-only BMC fixtures use RustCrypto as an independent protocol oracle,
+so `cargo test` includes those crates as dev-dependencies. A SymCrypt-only
+consumer's **normal** dependency graph does not include `aes`, `cbc`,
+`hmac`, `sha1`, or `sha2`:
+
+```sh
+cargo tree -p ipmi-rs --no-default-features -F symcrypt-backend --edges normal
+```
 
 The pinned `symcrypt` Rust wrapper **0.5.1** requires native
 [Microsoft SymCrypt](https://github.com/microsoft/SymCrypt/releases)
@@ -1013,7 +1042,7 @@ to the runtime loader. For an unpacked release with `lib/` at `<release>`:
 ```sh
 export RUSTFLAGS="-L native=<release>/lib"
 export LD_LIBRARY_PATH="<release>/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-cargo test -p ipmi-rs --features symcrypt-backend
+cargo test -p ipmi-rs --no-default-features --features symcrypt-backend
 ```
 
 Alternatively install the library in a system linker path and refresh the
@@ -1022,10 +1051,10 @@ loader cache. On Windows, put `symcrypt.lib` in the directory named by
 discoverable at runtime (for example beside the executable or in `PATH`).
 The wrapper dynamically links SymCrypt: simply enabling the feature does not
 bundle the native library. CI installs the SHA-256-verified official v103.4.2
-AMD64 release for `--all-features` jobs. The 0.5.1 wrapper does **not** wipe
-its AES expanded-key allocation on drop; our owned passwords and derived
-key buffers are wiped, but this wrapper limitation remains. Selecting a
-provider does **not** by itself make a deployment FIPS-compliant.
+AMD64 release for SymCrypt-enabled Linux and Windows jobs. The 0.5.1 wrapper
+does **not** wipe its AES expanded-key allocation on drop; our owned passwords
+and derived key buffers are wiped, but this wrapper limitation remains.
+Selecting a provider does **not** by itself make a deployment FIPS-compliant.
 
 | Authentication algorithm | Supported      |
 | :----------------------- | :------------- |

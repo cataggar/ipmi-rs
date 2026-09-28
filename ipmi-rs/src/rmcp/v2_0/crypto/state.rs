@@ -44,7 +44,7 @@ impl Default for CryptoState {
 
 impl CryptoState {
     pub fn new(kg: Option<&[u8]>, password: &[u8]) -> Self {
-        Self::new_with_provider(kg, password, CryptoProvider::RustCrypto)
+        Self::new_with_provider(kg, password, CryptoProvider::default())
     }
 
     pub fn new_with_provider(kg: Option<&[u8]>, password: &[u8], provider: CryptoProvider) -> Self {
@@ -190,6 +190,9 @@ impl CryptoState {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(feature = "rustcrypto-backend", feature = "symcrypt-backend")
+))]
 #[path = "state_tests.rs"]
 mod tests;

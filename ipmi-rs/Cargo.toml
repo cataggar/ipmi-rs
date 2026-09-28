@@ -22,13 +22,13 @@ nix = { version = "0.30", default-features = false, features = [ "ioctl", "poll"
 serialport = { version = "4.7", default-features = false, optional = true }
 
 # For RMCP+
-hmac = "0.12.1"
-sha1 = "0.10.6"
-sha2 = "0.10.9"
+hmac = { version = "0.12.1", optional = true }
+sha1 = { version = "0.10.6", optional = true }
+sha2 = { version = "0.10.9", optional = true }
 subtle = "2.6"
 rand = "0.8.5"
-aes = "0.8.4"
-cbc = "0.1.2"
+aes = { version = "0.8.4", optional = true }
+cbc = { version = "0.1.2", optional = true }
 getrandom = "0.4.2"
 zeroize = "1.8"
 symcrypt = { version = "=0.5.1", optional = true, features = ["sha1"] }
@@ -37,12 +37,13 @@ symcrypt = { version = "=0.5.1", optional = true, features = ["sha1"] }
 libc = { version = "0.2", optional = true }
 
 [features]
-default = [ "unix-file", "md5" ]
+default = [ "unix-file", "md5", "rustcrypto-backend" ]
 
 # Connection features
 unix-file = [ "nix" ]
 serial = [ "dep:serialport" ]
 ami-usb = [ "dep:libc" ]
+rustcrypto-backend = [ "dep:aes", "dep:cbc", "dep:hmac", "dep:sha1", "dep:sha2" ]
 symcrypt-backend = [ "dep:symcrypt" ]
 kontron-fwum-update = [ "ipmi-rs-core/kontron-fwum-update" ]
 md5 = [ "dep:md5" ]
@@ -50,6 +51,11 @@ hpm-update = [ "md5", "ipmi-rs-core/hpm-update" ]
 group-extensions = [ "ipmi-rs-core/group-extensions" ]
 
 [dev-dependencies]
+aes = "0.8.4"
+cbc = "0.1.2"
+hmac = "0.12.1"
+sha1 = "0.10.6"
+sha2 = "0.10.9"
 pretty_env_logger = "0.5"
 indicatif = "0.17"
 clap = { version = "4.3", features = [ "derive" ]}

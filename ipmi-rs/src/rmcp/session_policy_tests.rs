@@ -10,7 +10,7 @@ use sha2::Sha256;
 
 use super::{
     checksum::Checksum, v1_5, ActivationError, CipherSuite, CipherSuiteListError,
-    CipherSuitePolicy, IpmiConnection, OpenSessionResponseErrorStatusCode,
+    CipherSuitePolicy, CryptoProvider, IpmiConnection, OpenSessionResponseErrorStatusCode,
     ParseSessionResponseError, PrivilegeLevel, Rmcp, RmcpHeader, SessionConfig,
     V2_0ActivationError, ValidateSessionResponseError,
 };
@@ -247,6 +247,7 @@ fn mock_bmc(
 }
 
 fn exercise(
+    provider: CryptoProvider,
     policy: CipherSuitePolicy,
     records: Option<Vec<u8>>,
     probe_error: bool,
@@ -266,6 +267,7 @@ fn exercise(
         SessionConfig::new(Some(USERNAME), Some(PASSWORD))
             .with_kg(KG)
             .with_privilege(privilege)
+            .with_provider(provider)
             .with_cipher_suite_policy(policy),
     );
     if result.is_ok() {
@@ -286,37 +288,44 @@ fn exercise(
 fn best_available_prefers_17_then_3_with_distinct_kg_and_non_admin_roles() {
     let records = [THREE, SEVENTEEN, THREE, SEVENTEEN].concat();
     assert_eq!(records.len(), 20);
-    assert!(exercise(
-        CipherSuitePolicy::BestAvailable,
-        Some(records),
-        false,
-        PrivilegeLevel::User,
-        Some(CipherSuite::Id17),
-        OpenReply::Valid,
-    )
-    .is_ok());
-    assert!(exercise(
-        CipherSuitePolicy::BestAvailable,
-        Some(THREE.to_vec()),
-        false,
-        PrivilegeLevel::Operator,
-        Some(CipherSuite::Id3),
-        OpenReply::Valid,
-    )
-    .is_ok());
+    for &provider in CryptoProvider::enabled_for_tests() {
+        assert!(exercise(
+            provider,
+            CipherSuitePolicy::BestAvailable,
+            Some(records.clone()),
+            false,
+            PrivilegeLevel::User,
+            Some(CipherSuite::Id17),
+            OpenReply::Valid,
+        )
+        .is_ok());
+        assert!(exercise(
+            provider,
+            CipherSuitePolicy::BestAvailable,
+            Some(THREE.to_vec()),
+            false,
+            PrivilegeLevel::Operator,
+            Some(CipherSuite::Id3),
+            OpenReply::Valid,
+        )
+        .is_ok());
+    }
 }
 
 #[test]
 fn exact_suite_and_privilege_do_not_query_or_downgrade() {
-    assert!(exercise(
-        CipherSuitePolicy::Exact(CipherSuite::Id3),
-        None,
-        false,
-        PrivilegeLevel::User,
-        Some(CipherSuite::Id3),
-        OpenReply::Valid,
-    )
-    .is_ok());
+    for &provider in CryptoProvider::enabled_for_tests() {
+        assert!(exercise(
+            provider,
+            CipherSuitePolicy::Exact(CipherSuite::Id3),
+            None,
+            false,
+            PrivilegeLevel::User,
+            Some(CipherSuite::Id3),
+            OpenReply::Valid,
+        )
+        .is_ok());
+    }
     let mut rmcp = Rmcp::new("127.0.0.1:1", Duration::from_secs(1)).unwrap();
     assert!(matches!(
         rmcp.activate_with_session_config(
@@ -329,101 +338,110 @@ fn exact_suite_and_privilege_do_not_query_or_downgrade() {
 
 #[test]
 fn best_available_fails_closed_on_unavailable_or_invalid_discovery() {
-    for (records, probe_error, expected) in [
-        (SEVENTEEN.to_vec(), true, "probe"),
-        (vec![0xc0, 1, 1, 0, 0], false, "unsupported"),
-        (vec![0xc0, 17, 1, 4, 1], false, "mismatch"),
-        (vec![0xc0, 3, 1], false, "truncated"),
-    ] {
-        let result = exercise(
-            CipherSuitePolicy::BestAvailable,
-            Some(records),
-            probe_error,
-            PrivilegeLevel::User,
-            None,
-            OpenReply::Valid,
-        );
-        assert!(
-            match expected {
-                "probe" => matches!(result, Err(ActivationError::GetChannelCipherSuites(_))),
-                "unsupported" => matches!(result, Err(ActivationError::NoSupportedCipherSuite)),
-                "mismatch" => matches!(
-                    result,
-                    Err(ActivationError::InvalidCipherSuiteList(
-                        CipherSuiteListError::MismatchedAlgorithms(CipherSuite::Id17)
-                    ))
-                ),
-                _ => matches!(
-                    result,
-                    Err(ActivationError::InvalidCipherSuiteList(
-                        CipherSuiteListError::IncompleteRecord
-                    ))
-                ),
-            },
-            "unexpected activation result: {result:?}"
-        );
+    for &provider in CryptoProvider::enabled_for_tests() {
+        for (records, probe_error, expected) in [
+            (SEVENTEEN.to_vec(), true, "probe"),
+            (vec![0xc0, 1, 1, 0, 0], false, "unsupported"),
+            (vec![0xc0, 17, 1, 4, 1], false, "mismatch"),
+            (vec![0xc0, 3, 1], false, "truncated"),
+        ] {
+            let result = exercise(
+                provider,
+                CipherSuitePolicy::BestAvailable,
+                Some(records),
+                probe_error,
+                PrivilegeLevel::User,
+                None,
+                OpenReply::Valid,
+            );
+            assert!(
+                match expected {
+                    "probe" => matches!(result, Err(ActivationError::GetChannelCipherSuites(_))),
+                    "unsupported" => matches!(result, Err(ActivationError::NoSupportedCipherSuite)),
+                    "mismatch" => matches!(
+                        result,
+                        Err(ActivationError::InvalidCipherSuiteList(
+                            CipherSuiteListError::MismatchedAlgorithms(CipherSuite::Id17)
+                        ))
+                    ),
+                    _ => matches!(
+                        result,
+                        Err(ActivationError::InvalidCipherSuiteList(
+                            CipherSuiteListError::IncompleteRecord
+                        ))
+                    ),
+                },
+                "unexpected activation result: {result:?}"
+            );
+        }
     }
 }
 
 #[test]
 fn peer_privilege_and_algorithm_substitution_rejected_before_rakp() {
-    for reply in [
-        OpenReply::WrongPrivilege,
-        OpenReply::WrongAlgorithm,
-        OpenReply::WrongSuite,
-    ] {
-        let result = exercise(
-            CipherSuitePolicy::BestAvailable,
-            Some([THREE, SEVENTEEN].concat()),
-            false,
-            PrivilegeLevel::User,
-            Some(CipherSuite::Id17),
-            reply,
-        );
-        assert!(
-            matches!(
-                (reply, result),
-                (
-                    OpenReply::WrongPrivilege,
-                    Err(ActivationError::V2_0(
-                        V2_0ActivationError::OpenSessionResponseValidate(
-                            ValidateSessionResponseError::PrivilegeLevelMismatch
-                        )
-                    ))
-                ) | (
-                    OpenReply::WrongAlgorithm | OpenReply::WrongSuite,
-                    Err(ActivationError::V2_0(
-                        V2_0ActivationError::OpenSessionResponseValidate(
-                            ValidateSessionResponseError::NegotiatedCipherSuiteMismatch { .. }
-                        )
-                    ))
-                )
-            ),
-            "peer substitution must be rejected"
-        );
+    for &provider in CryptoProvider::enabled_for_tests() {
+        for reply in [
+            OpenReply::WrongPrivilege,
+            OpenReply::WrongAlgorithm,
+            OpenReply::WrongSuite,
+        ] {
+            let result = exercise(
+                provider,
+                CipherSuitePolicy::BestAvailable,
+                Some([THREE, SEVENTEEN].concat()),
+                false,
+                PrivilegeLevel::User,
+                Some(CipherSuite::Id17),
+                reply,
+            );
+            assert!(
+                matches!(
+                    (reply, result),
+                    (
+                        OpenReply::WrongPrivilege,
+                        Err(ActivationError::V2_0(
+                            V2_0ActivationError::OpenSessionResponseValidate(
+                                ValidateSessionResponseError::PrivilegeLevelMismatch
+                            )
+                        ))
+                    ) | (
+                        OpenReply::WrongAlgorithm | OpenReply::WrongSuite,
+                        Err(ActivationError::V2_0(
+                            V2_0ActivationError::OpenSessionResponseValidate(
+                                ValidateSessionResponseError::NegotiatedCipherSuiteMismatch { .. }
+                            )
+                        ))
+                    )
+                ),
+                "peer substitution must be rejected"
+            );
+        }
     }
 }
 
 #[test]
 fn rejected_preferred_suite_never_retries_suite_three() {
-    let result = exercise(
-        CipherSuitePolicy::BestAvailable,
-        Some([THREE, SEVENTEEN].concat()),
-        false,
-        PrivilegeLevel::Operator,
-        Some(CipherSuite::Id17),
-        OpenReply::RejectSuite,
-    );
-    assert!(matches!(
-        result,
-        Err(ActivationError::V2_0(
-            V2_0ActivationError::OpenSessionResponseParse(
-                ParseSessionResponseError::HaveErrorCode(Ok(
-                    OpenSessionResponseErrorStatusCode::NoMatchingCipherSuite
-                ))
-            )
-        ))
-    ));
+    for &provider in CryptoProvider::enabled_for_tests() {
+        let result = exercise(
+            provider,
+            CipherSuitePolicy::BestAvailable,
+            Some([THREE, SEVENTEEN].concat()),
+            false,
+            PrivilegeLevel::Operator,
+            Some(CipherSuite::Id17),
+            OpenReply::RejectSuite,
+        );
+        assert!(matches!(
+            result,
+            Err(ActivationError::V2_0(
+                V2_0ActivationError::OpenSessionResponseParse(
+                    ParseSessionResponseError::HaveErrorCode(Ok(
+                        OpenSessionResponseErrorStatusCode::NoMatchingCipherSuite
+                    ))
+                )
+            ))
+        ));
+    }
 }
 
 #[test]

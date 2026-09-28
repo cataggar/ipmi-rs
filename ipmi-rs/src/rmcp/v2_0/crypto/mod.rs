@@ -1,4 +1,12 @@
+#[cfg(any(
+    feature = "rustcrypto-backend",
+    all(test, feature = "symcrypt-backend")
+))]
 pub(crate) mod sha1;
+#[cfg(any(
+    feature = "rustcrypto-backend",
+    all(test, feature = "symcrypt-backend")
+))]
 mod sha256;
 
 mod keys;

@@ -266,6 +266,7 @@ impl core::fmt::Debug for SessionConfig<'_> {
 
 impl<'a> SessionConfig<'a> {
     /// Create an RMCP+ configuration requiring administrator and suite 3.
+    /// RustCrypto is the default unless only `symcrypt-backend` is enabled.
     pub fn new(username: Option<&'a str>, password: Option<&'a [u8]>) -> Self {
         Self {
             username,
@@ -273,7 +274,7 @@ impl<'a> SessionConfig<'a> {
             kg: None,
             privilege: PrivilegeLevel::Administrator,
             cipher_suite: CipherSuitePolicy::Exact(CipherSuite::Id3),
-            provider: CryptoProvider::RustCrypto,
+            provider: CryptoProvider::default(),
         }
     }
 
@@ -357,7 +358,8 @@ impl Rmcp {
     /// If `rmcp_plus` is `true`, upgrade the connection to an RMCP+ connection
     /// using cipher suite 3 if the remote host supports RMCP+. Otherwise,
     /// IPMI 1.5 can be used. Use [`Self::activate_with_cipher_suite`] to
-    /// require an exact RMCP+ cipher suite without fallback.
+    /// require an exact RMCP+ cipher suite without fallback. With neither
+    /// crypto backend enabled, only `activate(false, ...)` is available.
     pub fn activate(
         &mut self,
         rmcp_plus: bool,
@@ -367,15 +369,16 @@ impl Rmcp {
         self.activate_with_selection(rmcp_plus, None, SessionConfig::new(username, password))
     }
 
-    /// Activate RMCP+ using exactly `suite`, without falling back to another
-    /// cipher suite or IPMI 1.5. Currently only suites 3 and 17 are supported.
+    /// Activate RMCP+ using exactly `suite` and the default compiled-in
+    /// provider, without falling back to another cipher suite or IPMI 1.5.
+    /// Currently only suites 3 and 17 are supported.
     pub fn activate_with_cipher_suite(
         &mut self,
         suite: CipherSuite,
         username: Option<&str>,
         password: Option<&[u8]>,
     ) -> Result<(), ActivationError> {
-        self.activate_with_provider(suite, CryptoProvider::RustCrypto, username, password)
+        self.activate_with_provider(suite, CryptoProvider::default(), username, password)
     }
 
     /// Require exactly `suite` (3 or 17) and the selected RMCP+ crypto provider.
@@ -420,10 +423,12 @@ impl Rmcp {
             }
         }
 
-        config
-            .provider
-            .ensure_available()
-            .map_err(ActivationError::CryptoBackend)?;
+        if rmcp_plus || suite_policy.is_some() {
+            config
+                .provider
+                .ensure_available()
+                .map_err(ActivationError::CryptoBackend)?;
+        }
 
         if self.active_state.take().is_some() {
             // TODO: shut down currently active state.
@@ -512,25 +517,27 @@ impl IpmiConnection for Rmcp {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(feature = "rustcrypto-backend", feature = "symcrypt-backend")
+))]
 mod session_policy_tests;
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(feature = "rustcrypto-backend", feature = "symcrypt-backend")
+))]
 mod suite17_tests;
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(feature = "rustcrypto-backend", feature = "symcrypt-backend")
+))]
 mod suite17_activation_tests {
     use super::*;
     use std::{net::UdpSocket, thread};
 
     fn providers() -> &'static [CryptoProvider] {
-        #[cfg(feature = "symcrypt-backend")]
-        {
-            &[CryptoProvider::RustCrypto, CryptoProvider::SymCrypt]
-        }
-        #[cfg(not(feature = "symcrypt-backend"))]
-        {
-            &[CryptoProvider::RustCrypto]
-        }
+        CryptoProvider::enabled_for_tests()
     }
 
     #[derive(Clone, Copy)]
@@ -632,19 +639,6 @@ mod suite17_activation_tests {
         assert!(matches!(
             rmcp.activate_with_cipher_suite(CipherSuite::Id16, None, None),
             Err(ActivationError::UnsupportedCipherSuite(CipherSuite::Id16))
-        ));
-        assert!(!rmcp.is_active());
-    }
-
-    #[cfg(not(feature = "symcrypt-backend"))]
-    #[test]
-    fn unavailable_symcrypt_is_rejected_before_any_network_io() {
-        let mut rmcp = Rmcp::new("127.0.0.1:1", Duration::from_millis(100)).unwrap();
-        assert!(matches!(
-            rmcp.activate_with_provider(CipherSuite::Id17, CryptoProvider::SymCrypt, None, None),
-            Err(ActivationError::CryptoBackend(
-                CryptoBackendError::Unavailable
-            ))
         ));
         assert!(!rmcp.is_active());
     }

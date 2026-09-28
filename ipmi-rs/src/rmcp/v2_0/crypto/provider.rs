@@ -1,16 +1,31 @@
+#[cfg(feature = "rustcrypto-backend")]
 use aes::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 
+#[cfg(feature = "rustcrypto-backend")]
 use super::{sha1::Sha1Hmac, sha256::Sha256Hmac};
 
 /// Cryptographic implementation used by an RMCP+ session.
 ///
-/// Selecting `SymCrypt` without the `symcrypt-backend` feature returns an
-/// activation error; it never switches to RustCrypto.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// A provider that was not compiled in returns an activation error; it never
+/// switches to another backend. The default is RustCrypto when enabled, or
+/// SymCrypt when it is the only enabled backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CryptoProvider {
-    #[default]
     RustCrypto,
     SymCrypt,
+}
+
+impl Default for CryptoProvider {
+    fn default() -> Self {
+        if cfg!(all(
+            feature = "symcrypt-backend",
+            not(feature = "rustcrypto-backend")
+        )) {
+            Self::SymCrypt
+        } else {
+            Self::RustCrypto
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,11 +51,34 @@ pub enum CryptoBackendError {
 }
 
 impl CryptoProvider {
+    #[cfg(all(
+        test,
+        any(feature = "rustcrypto-backend", feature = "symcrypt-backend")
+    ))]
+    pub(crate) fn enabled_for_tests() -> &'static [Self] {
+        #[cfg(all(feature = "rustcrypto-backend", feature = "symcrypt-backend"))]
+        {
+            &[Self::RustCrypto, Self::SymCrypt]
+        }
+        #[cfg(all(feature = "rustcrypto-backend", not(feature = "symcrypt-backend")))]
+        {
+            &[Self::RustCrypto]
+        }
+        #[cfg(all(feature = "symcrypt-backend", not(feature = "rustcrypto-backend")))]
+        {
+            &[Self::SymCrypt]
+        }
+        #[cfg(not(any(feature = "rustcrypto-backend", feature = "symcrypt-backend")))]
+        {
+            &[]
+        }
+    }
+
     pub(crate) fn ensure_available(self) -> Result<(), CryptoBackendError> {
         match self {
-            Self::RustCrypto => Ok(()),
+            Self::RustCrypto if cfg!(feature = "rustcrypto-backend") => Ok(()),
             Self::SymCrypt if cfg!(feature = "symcrypt-backend") => Ok(()),
-            Self::SymCrypt => Err(CryptoBackendError::Unavailable),
+            _ => Err(CryptoBackendError::Unavailable),
         }
     }
 
@@ -51,6 +89,7 @@ impl CryptoProvider {
         parts: &[&[u8]],
     ) -> Result<Vec<u8>, CryptoBackendError> {
         match self {
+            #[cfg(feature = "rustcrypto-backend")]
             Self::RustCrypto => Ok(match algorithm {
                 HashAlgorithm::Sha1 => {
                     let mut mac = Sha1Hmac::new(key);
@@ -67,6 +106,11 @@ impl CryptoProvider {
                     mac.finalize().to_vec()
                 }
             }),
+            #[cfg(not(feature = "rustcrypto-backend"))]
+            Self::RustCrypto => {
+                let _ = (algorithm, key, parts);
+                Err(CryptoBackendError::Unavailable)
+            }
             #[cfg(feature = "symcrypt-backend")]
             Self::SymCrypt => {
                 use symcrypt::hmac::{HmacSha1State, HmacSha256State, HmacState};
@@ -104,11 +148,17 @@ impl CryptoProvider {
             return Err(CryptoBackendError::OperationFailed);
         }
         match self {
+            #[cfg(feature = "rustcrypto-backend")]
             Self::RustCrypto => {
                 cbc::Encryptor::<aes::Aes128>::new(&(*key).into(), &(*iv).into())
                     .encrypt_padded_mut::<NoPadding>(data, data.len())
                     .map_err(|_| CryptoBackendError::OperationFailed)?;
                 Ok(())
+            }
+            #[cfg(not(feature = "rustcrypto-backend"))]
+            Self::RustCrypto => {
+                let _ = (key, iv);
+                Err(CryptoBackendError::Unavailable)
             }
             #[cfg(feature = "symcrypt-backend")]
             Self::SymCrypt => {
@@ -134,11 +184,17 @@ impl CryptoProvider {
             return Err(CryptoBackendError::OperationFailed);
         }
         match self {
+            #[cfg(feature = "rustcrypto-backend")]
             Self::RustCrypto => {
                 cbc::Decryptor::<aes::Aes128>::new(&(*key).into(), &(*iv).into())
                     .decrypt_padded_mut::<NoPadding>(data)
                     .map_err(|_| CryptoBackendError::OperationFailed)?;
                 Ok(())
+            }
+            #[cfg(not(feature = "rustcrypto-backend"))]
+            Self::RustCrypto => {
+                let _ = (key, iv);
+                Err(CryptoBackendError::Unavailable)
             }
             #[cfg(feature = "symcrypt-backend")]
             Self::SymCrypt => {

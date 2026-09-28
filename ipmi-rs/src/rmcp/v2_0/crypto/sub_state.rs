@@ -337,7 +337,10 @@ impl SubState {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(feature = "rustcrypto-backend", feature = "symcrypt-backend")
+))]
 mod tests {
 
     use ipmi_rs_core::app::auth::{ConfidentialityAlgorithm, IntegrityAlgorithm};
@@ -353,7 +356,7 @@ mod tests {
     #[test]
     fn write_empty() {
         let mut state = SubState {
-            keys: Keys::from_sik([1u8; _]),
+            keys: Keys::from_sik([1u8; 20]),
             confidentiality_algorithm: ConfidentialityAlgorithm::AesCbc128,
             integrity_algorithm: IntegrityAlgorithm::None,
         };
@@ -375,7 +378,7 @@ mod tests {
     #[test]
     fn read_pad_aligned() {
         let mut state = SubState {
-            keys: Keys::from_sik([1u8; _]),
+            keys: Keys::from_sik([1u8; 20]),
             confidentiality_algorithm: ConfidentialityAlgorithm::AesCbc128,
             integrity_algorithm: IntegrityAlgorithm::HmacSha1_96,
         };
@@ -402,7 +405,7 @@ mod tests {
     #[test]
     fn read_undersized() {
         let state = SubState {
-            keys: Keys::from_sik([1u8; _]),
+            keys: Keys::from_sik([1u8; 20]),
             confidentiality_algorithm: ConfidentialityAlgorithm::AesCbc128,
             integrity_algorithm: IntegrityAlgorithm::HmacSha1_96,
         };
@@ -418,7 +421,7 @@ mod tests {
     #[test]
     fn sha1_hmac_trailer_all_lens() {
         let state = SubState {
-            keys: Keys::from_sik([1u8; _]),
+            keys: Keys::from_sik([1u8; 20]),
             confidentiality_algorithm: ConfidentialityAlgorithm::AesCbc128,
             integrity_algorithm: IntegrityAlgorithm::HmacSha1_96,
         };
@@ -429,14 +432,7 @@ mod tests {
     }
 
     fn providers() -> &'static [CryptoProvider] {
-        #[cfg(feature = "symcrypt-backend")]
-        {
-            &[CryptoProvider::RustCrypto, CryptoProvider::SymCrypt]
-        }
-        #[cfg(not(feature = "symcrypt-backend"))]
-        {
-            &[CryptoProvider::RustCrypto]
-        }
+        CryptoProvider::enabled_for_tests()
     }
 
     fn suite17_state(provider: CryptoProvider) -> SubState {
