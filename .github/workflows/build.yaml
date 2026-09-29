@@ -41,13 +41,16 @@ jobs:
           - "-p ipmi-rs --no-default-features"
           - "-p ipmi-rs --no-default-features -F md5"
           - "-p ipmi-rs --no-default-features -F unix-file"
+          - "-p ipmi-rs --no-default-features -F rustcrypto-backend"
+          - "-p ipmi-rs --no-default-features -F symcrypt-backend"
+          - "-p ipmi-rs --no-default-features -F rustcrypto-backend,symcrypt-backend"
           - "-p ipmi-rs --all-features"
           - "-p ipmi-rs --examples"
           - "-p ipmi-rs --no-default-features --examples"
     steps:
       - uses: actions/checkout@v5
       - name: Install pinned native SymCrypt for feature-enabled check
-        if: matrix.command == '-p ipmi-rs --all-features'
+        if: contains(matrix.command, 'symcrypt-backend') || matrix.command == '-p ipmi-rs --all-features'
         run: bash .github/scripts/setup-symcrypt.sh
       - name: Check a package with specific feature combination.
         run: CARGO_BUILD_WARNINGS=deny cargo check --locked ${{ matrix.command }}
@@ -59,6 +62,58 @@ jobs:
       - uses: actions/checkout@v5
       - name: Check ipmi-rs without Unix transport
         run: cargo check --locked -p ipmi-rs --no-default-features
+      - name: Check RustCrypto-only RMCP
+        run: cargo check --locked -p ipmi-rs --no-default-features -F rustcrypto-backend
+      - name: Install pinned native SymCrypt for Windows RMCP
+        shell: pwsh
+        run: |
+          $asset = 'symcrypt-windows-amd64-release-103.4.2-171f697.zip'
+          $expected = 'AC0E68EEF962AC0F4ECD726A55BAE2C9F2A3280589E66BED4CDB7C711B364101'
+          $archive = Join-Path $env:RUNNER_TEMP $asset
+          Invoke-WebRequest "https://github.com/microsoft/SymCrypt/releases/download/v103.4.2/$asset" -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $expected) {
+            throw 'Native SymCrypt archive SHA-256 mismatch'
+          }
+          $native = Join-Path $env:RUNNER_TEMP 'native-symcrypt'
+          Expand-Archive $archive -DestinationPath $native
+          $libPath = Join-Path $native 'dll'
+          if (-not (Test-Path (Join-Path $libPath 'symcrypt.lib')) -or
+              -not (Test-Path (Join-Path $libPath 'symcrypt.dll'))) {
+            throw 'Native SymCrypt library files are missing'
+          }
+          "SYMCRYPT_LIB_PATH=$libPath" >> $env:GITHUB_ENV
+          $libPath >> $env:GITHUB_PATH
+      - name: Check SymCrypt-only RMCP
+        run: cargo check --locked -p ipmi-rs --no-default-features -F symcrypt-backend
+      - name: Check both RMCP backends
+        run: cargo check --locked -p ipmi-rs --no-default-features -F rustcrypto-backend,symcrypt-backend
+      - name: Test SymCrypt-only crypto vectors and packets with native library
+        run: "cargo test --locked -p ipmi-rs --no-default-features -F symcrypt-backend --lib crypto::"
+
+  check-crypto-dependencies:
+    runs-on: ubuntu-latest
+    name: Check RMCP normal dependencies
+    steps:
+      - uses: actions/checkout@v5
+      - name: Assert each backend's normal dependency graph
+        run: |
+          set -euo pipefail
+          symcrypt=$(cargo tree --locked -p ipmi-rs --no-default-features -F symcrypt-backend --edges normal --prefix none)
+          grep -Eq '^symcrypt v' <<< "$symcrypt"
+          if grep -Eq '^(aes|cbc|hmac|sha1|sha2) v' <<< "$symcrypt"; then
+            echo 'RustCrypto crate in SymCrypt-only normal dependencies' >&2
+            exit 1
+          fi
+          rustcrypto=$(cargo tree --locked -p ipmi-rs --no-default-features -F rustcrypto-backend --edges normal --prefix none)
+          if grep -Eq '^symcrypt v' <<< "$rustcrypto"; then
+            echo 'SymCrypt crate in RustCrypto-only normal dependencies' >&2
+            exit 1
+          fi
+          neither=$(cargo tree --locked -p ipmi-rs --no-default-features --edges normal --prefix none)
+          if grep -Eq '^(aes|cbc|hmac|sha1|sha2|symcrypt) v' <<< "$neither"; then
+            echo 'RMCP crypto crate in no-backend normal dependencies' >&2
+            exit 1
+          fi
 
   test:
     runs-on: ubuntu-latest
@@ -78,11 +133,14 @@ jobs:
           - "-p ipmi-rs --no-default-features"
           - "-p ipmi-rs --no-default-features -F md5"
           - "-p ipmi-rs --no-default-features -F unix-file"
+          - "-p ipmi-rs --no-default-features -F rustcrypto-backend"
+          - "-p ipmi-rs --no-default-features -F symcrypt-backend"
+          - "-p ipmi-rs --no-default-features -F rustcrypto-backend,symcrypt-backend"
           - "-p ipmi-rs --all-features"
     steps:
       - uses: actions/checkout@v5
       - name: Install pinned native SymCrypt for feature-enabled tests
-        if: matrix.command == '-p ipmi-rs --all-features'
+        if: contains(matrix.command, 'symcrypt-backend') || matrix.command == '-p ipmi-rs --all-features'
         run: bash .github/scripts/setup-symcrypt.sh
       - name: Check a package with specific feature combination.
         run: cargo test --locked ${{ matrix.command }}
@@ -106,6 +164,6 @@ jobs:
 
   ci-success:
     runs-on: ubuntu-latest
-    needs: [check-format, check, check-windows-rmcp, test, clippy]
+    needs: [check-format, check, check-windows-rmcp, check-crypto-dependencies, test, clippy]
     steps:
       - run: true

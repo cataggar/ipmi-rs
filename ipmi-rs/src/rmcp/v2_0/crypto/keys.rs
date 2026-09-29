@@ -36,7 +36,7 @@ impl Keys {
             k2: Vec::new(),
             k3: Vec::new(),
             aes_key: [0; 16],
-            provider: CryptoProvider::RustCrypto,
+            provider: CryptoProvider::default(),
             hash: HashAlgorithm::Sha1,
         }
     }
@@ -62,9 +62,12 @@ impl Keys {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(
+        test,
+        any(feature = "rustcrypto-backend", feature = "symcrypt-backend")
+    ))]
     pub fn from_sik(sik: [u8; 20]) -> Self {
-        Self::derive(CryptoProvider::RustCrypto, HashAlgorithm::Sha1, &sik).unwrap()
+        Self::derive(CryptoProvider::default(), HashAlgorithm::Sha1, &sik).unwrap()
     }
 
     pub fn aes_key(&self) -> &[u8; 16] {

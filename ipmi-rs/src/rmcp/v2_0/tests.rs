@@ -199,9 +199,9 @@ fn suite17_bridged_reply_is_authenticated() {
         );
         assert_eq!(state.recv().unwrap().data(), &[0xa5]);
     }
-    run(CryptoProvider::RustCrypto);
-    #[cfg(feature = "symcrypt-backend")]
-    run(CryptoProvider::SymCrypt);
+    for &provider in CryptoProvider::enabled_for_tests() {
+        run(provider);
+    }
 }
 
 #[test]
@@ -630,9 +630,9 @@ fn encrypted_suite17_sol_and_ipmi_for(provider: CryptoProvider) {
 
 #[test]
 fn encrypted_suite17_sol_and_ipmi_share_authenticated_session() {
-    encrypted_suite17_sol_and_ipmi_for(CryptoProvider::RustCrypto);
-    #[cfg(feature = "symcrypt-backend")]
-    encrypted_suite17_sol_and_ipmi_for(CryptoProvider::SymCrypt);
+    for &provider in CryptoProvider::enabled_for_tests() {
+        encrypted_suite17_sol_and_ipmi_for(provider);
+    }
 }
 
 #[test]
@@ -1503,7 +1503,7 @@ fn complete_rakp_sha1_aes_activation_and_request_over_udp() {
         b"local test password",
         None,
         CipherSuite::Id3,
-        CryptoProvider::RustCrypto,
+        CryptoProvider::default(),
     )
     .unwrap();
     let response = state.send_recv(&mut request()).unwrap();
@@ -1541,7 +1541,7 @@ fn network_activation_rejects_wrong_open_session_payload() {
             b"password",
             None,
             CipherSuite::Id3,
-            CryptoProvider::RustCrypto,
+            CryptoProvider::default(),
         ),
         Err(ActivationError::UnexpectedPayloadType(
             PayloadType::RakpMessage2

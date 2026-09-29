@@ -11,7 +11,10 @@ mod messages;
 pub(in crate::rmcp) mod sol;
 pub use sol::{SolFlags, SolFrame, SolFrameError};
 use sol::{SolFlow, MAX_SOL_DATA};
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(feature = "rustcrypto-backend", feature = "symcrypt-backend")
+))]
 mod tests;
 use ipmi_rs_core::app::auth::{
     AuthenticationAlgorithm, CipherSuite, ConfidentialityAlgorithm, IntegrityAlgorithm,

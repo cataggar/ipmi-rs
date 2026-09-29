@@ -172,9 +172,9 @@ fn suite17_rakp_key_and_mac_vectors_for(provider: CryptoProvider) {
 
 #[test]
 fn suite17_rakp_key_and_mac_vectors() {
-    suite17_rakp_key_and_mac_vectors_for(CryptoProvider::RustCrypto);
-    #[cfg(feature = "symcrypt-backend")]
-    suite17_rakp_key_and_mac_vectors_for(CryptoProvider::SymCrypt);
+    for &provider in CryptoProvider::enabled_for_tests() {
+        suite17_rakp_key_and_mac_vectors_for(provider);
+    }
 }
 
 fn suite3_rakp_key_and_mac_vectors_for(provider: CryptoProvider) {
@@ -293,9 +293,9 @@ fn suite3_rakp_key_and_mac_vectors_for(provider: CryptoProvider) {
 
 #[test]
 fn suite3_rakp_key_and_mac_vectors() {
-    suite3_rakp_key_and_mac_vectors_for(CryptoProvider::RustCrypto);
-    #[cfg(feature = "symcrypt-backend")]
-    suite3_rakp_key_and_mac_vectors_for(CryptoProvider::SymCrypt);
+    for &provider in CryptoProvider::enabled_for_tests() {
+        suite3_rakp_key_and_mac_vectors_for(provider);
+    }
 }
 
 #[test]

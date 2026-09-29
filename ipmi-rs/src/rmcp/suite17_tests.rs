@@ -8,7 +8,10 @@ use aes::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, Ke
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use super::{ActivationError, CipherSuite, Rmcp, V2_0ActivationError, ValidateRakpMessage4Error};
+use super::{
+    ActivationError, CipherSuite, CryptoProvider, Rmcp, V2_0ActivationError,
+    ValidateRakpMessage4Error,
+};
 use crate::connection::{IpmiConnection, LogicalUnit, Message, Request, RequestTargetAddress};
 
 const PASSWORD: &[u8] = b"correct horse battery staple";
@@ -202,6 +205,12 @@ fn run_bmc(socket: UdpSocket, wrong_rakp4_id: bool) {
 
 #[test]
 fn required_suite17_completes_handshake_and_encrypted_exchange() {
+    for &provider in CryptoProvider::enabled_for_tests() {
+        completes_handshake_and_encrypted_exchange(provider);
+    }
+}
+
+fn completes_handshake_and_encrypted_exchange(provider: CryptoProvider) {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     socket
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -210,8 +219,12 @@ fn required_suite17_completes_handshake_and_encrypted_exchange() {
     let bmc = thread::spawn(move || run_bmc(socket, false));
 
     let mut rmcp = Rmcp::new(address, Duration::from_secs(2)).unwrap();
-    rmcp.activate_with_cipher_suite(CipherSuite::Id17, Some("ADMIN"), Some(PASSWORD))
-        .unwrap();
+    if provider == CryptoProvider::default() {
+        rmcp.activate_with_cipher_suite(CipherSuite::Id17, Some("ADMIN"), Some(PASSWORD))
+    } else {
+        rmcp.activate_with_provider(CipherSuite::Id17, provider, Some("ADMIN"), Some(PASSWORD))
+    }
+    .unwrap();
     assert!(rmcp.is_active());
     let mut request = Request::new(
         Message::new_raw(6, 1, vec![0xa5]),
@@ -227,6 +240,12 @@ fn required_suite17_completes_handshake_and_encrypted_exchange() {
 
 #[test]
 fn required_suite17_rejects_bmc_id_in_rakp4_console_id_field() {
+    for &provider in CryptoProvider::enabled_for_tests() {
+        rejects_bmc_id_in_rakp4_console_id_field(provider);
+    }
+}
+
+fn rejects_bmc_id_in_rakp4_console_id_field(provider: CryptoProvider) {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     socket
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -235,7 +254,8 @@ fn required_suite17_rejects_bmc_id_in_rakp4_console_id_field() {
     let bmc = thread::spawn(move || run_bmc(socket, true));
 
     let mut rmcp = Rmcp::new(address, Duration::from_secs(2)).unwrap();
-    let result = rmcp.activate_with_cipher_suite(CipherSuite::Id17, Some("ADMIN"), Some(PASSWORD));
+    let result =
+        rmcp.activate_with_provider(CipherSuite::Id17, provider, Some("ADMIN"), Some(PASSWORD));
     bmc.join().unwrap();
     assert!(matches!(
         result,
